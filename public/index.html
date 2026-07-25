@@ -14,7 +14,7 @@
   <link rel="icon" href="/icon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="/icon-192.png" />
   <title>AI语音通话</title>
-  <link rel="stylesheet" href="/styles.css?v=38" />
+  <link rel="stylesheet" href="/styles.css?v=40" />
 </head>
 <body>
   <div class="app">
@@ -64,9 +64,23 @@
         <button type="button" data-q="今天有什么重要新闻？简要说3条。">今日新闻</button>
       </div>
 
+      <div id="imagePreview" class="image-preview hidden" aria-live="polite">
+        <img id="imagePreviewImg" alt="待发送图片预览" />
+        <div class="image-preview-copy">
+          <strong id="imagePreviewName">待发送图片</strong>
+          <small>将作为视觉输入发送给支持图片的模型</small>
+        </div>
+        <button id="btnRemoveImage" class="image-preview-remove" type="button" aria-label="移除图片">×</button>
+      </div>
+
       <div class="input-bar" id="inputBar">
-        <textarea id="input" rows="1" placeholder="发消息或按住说话..." enterkeyhint="send"></textarea>
+        <button id="btnAttach" class="icon-btn attach" type="button" title="添加图片" aria-label="添加图片">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M7.5 6.5v9a4.5 4.5 0 0 0 9 0V5a3 3 0 0 0-6 0v10.5a1.5 1.5 0 0 0 3 0V7h2v8.5a3.5 3.5 0 0 1-7 0V5a5 5 0 0 1 10 0v10.5a6.5 6.5 0 0 1-13 0v-9h2z"/></svg>
+        </button>
+        <input id="imageInput" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden />
+        <textarea id="input" rows="1" placeholder="发消息、贴图片或按住说话..." enterkeyhint="send"></textarea>
         <button id="btnHold" class="icon-btn mic" type="button" title="按住说话" aria-label="按住说话"><span class="mic-dot" aria-hidden="true"></span></button>
+        <button id="btnStop" class="icon-btn stop-speech hidden" type="button" title="停止生成或朗读" aria-label="停止生成或朗读"><span class="stop-square" aria-hidden="true"></span><span>停止</span></button>
         <button id="btnSend" class="icon-btn send" type="button" title="发送" aria-label="发送">发送</button>
       </div>
     </section>
@@ -234,6 +248,7 @@
                   </div>
                 </div>
                 <small class="field-help">从下拉列表选择；也可以在下拉框内输入并添加自定义模型。</small>
+                <small id="llmCapabilityHint" class="field-help capability-hint"></small>
               </div>
               <label class="field">
                 <span class="field-label">LLM 接口类型</span>
@@ -441,6 +456,13 @@
             <div class="switch-list">
               <label class="switch-row">
                 <span>
+                  <strong>启用函数工具调用 Tools</strong>
+                  <small>由模型选择搜索、天气、时间、计算器或本地提醒；关闭后沿用普通聊天</small>
+                </span>
+                <input id="toolCallingEnabled" type="checkbox" class="switch-input" />
+              </label>
+              <label class="switch-row">
+                <span>
                   <strong>启用联网搜索</strong>
                   <small>开关和提供方会立即生效；想强制联网时，可以直接说“搜一下/帮我查一下”</small>
                 </span>
@@ -516,6 +538,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=40" type="module"></script>
+  <script src="/app.js?v=46" type="module"></script>
 </body>
 </html>

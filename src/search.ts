@@ -81,20 +81,27 @@ function normalizeSearchQuery(userText: string): string {
   if (/比特币|btc/i.test(q)) return `${q} 今日 实时 价格`;
   return q;
 }
-function isWeatherQuery(query: string): boolean {
+export function isWeatherQuery(query: string): boolean {
   return /天气|气温|下雨|下雪|降雨|降雪|空气质量|台风|雾霾|weather/i.test(String(query || ""));
+}
+
+export function isRealtimeQuery(userText: string): boolean {
+  const q = clean(userText);
+  if (!q) return false;
+  if (isWeatherQuery(q)) return true;
+  return /新闻|头条|热点|热搜|最新|实时|股价|股票行情|行情|价格|汇率|油价|金价|银价|黄金|白银|比特币|btc|eth|比分|赛程|航班|火车|高铁|路况|限行|放假|门票|影讯|开奖|疫情/i.test(q);
 }
 function normalizeWeatherSpeech(text: string): string {
   return clean(text)
     .replace(/(今天|今日|明天|后天)的天[。.!！?？]*$/g, "$1的天气")
     .replace(/(今天|今日|明天|后天)天[。.!！?？]*$/g, "$1天气");
 }
-function extractWeatherLocation(query: string): string {
+export function extractWeatherLocation(query: string): string {
   let q = normalizeWeatherSpeech(stripSearchCommandWords(query));
   q = q.replace(/(今天|今日|明天|后天|现在|当前|实时|最近|这会儿|此刻)/g, "");
   q = q.replace(/(的)?(天气预报|天气|气温|温度|下雨吗|会下雨吗|下雨|下雪吗|会下雪吗|下雪|降雨|降雪|空气质量|台风|雾霾|预报)/g, "");
   q = q.replace(/(怎么样|如何|怎样|多少|几度|有雨吗|冷不冷|热不热)/g, "");
-  q = q.replace(/[，,。.!！?？：:\s]/g, "").trim();
+  q = q.replace(/[，,。.!！?？：:\s]/g, "").replace(/(?:呢|呀|啊|吧|嘛|吗|么)+$/g, "").trim();
   return q.slice(0, 40);
 }
 function pickWeatherDesc(current: any): string {

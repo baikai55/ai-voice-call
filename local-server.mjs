@@ -117,6 +117,8 @@ function resolveConfig(client = {}) {
     maxTokens: Math.max(Number(client.maxTokens || env("LLM_MAX_TOKENS") || 512), 256),
     temperature: Number((client.temperature ?? env("LLM_TEMPERATURE", "0.7")) || 0.7),
     ttsEnabled: client.ttsEnabled !== false,
+    toolCallingEnabled: client.toolCallingEnabled !== false,
+    timeZone: pick(client.timeZone, "Asia/Hong_Kong"),
     webSearchEnabled: client.webSearchEnabled !== false && env("WEB_SEARCH_ENABLED", "true") !== "false",
     searchProvider: pick(client.searchProvider, env("SEARCH_PROVIDER"), "auto"),
     searchApiKey: pick(client.searchApiKey),
@@ -225,6 +227,48 @@ function mergeStreamText(current, incoming, cumulative = false) {
   }
   return { reply: reply + text, delta: text };
 }
+function extractTextContent(content) {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => {
+    if (typeof part === "string") return part;
+    if (!part || typeof part !== "object") return "";
+    return typeof part.text === "string" ? part.text : "";
+  }).join(" ").trim();
+}
+function sanitizeMessageContent(content) {
+  if (typeof content === "string") return content.slice(0, 4000);
+  if (!Array.isArray(content)) return "";
+  const parts = [];
+  for (const part of content.slice(0, 8)) {
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text" && typeof part.text === "string") {
+      parts.push({ type: "text", text: part.text.slice(0, 4000) });
+      continue;
+    }
+    const imageUrl = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+    if (part.type === "image_url" && typeof imageUrl === "string" && /^data:image\/(?:jpeg|png|webp|gif);base64,/i.test(imageUrl) && imageUrl.length <= 6 * 1024 * 1024) {
+      parts.push({ type: "image_url", image_url: { url: imageUrl, detail: "low" } });
+    }
+  }
+  return parts;
+}
+function messageHasImage(content) {
+  return Array.isArray(content) && content.some((part) => part?.type === "image_url" && (typeof part.image_url === "string" || typeof part.image_url?.url === "string"));
+}
+function messagesHaveVision(messages) {
+  return (Array.isArray(messages) ? messages : []).some((message) => message?.role === "user" && messageHasImage(message.content));
+}
+function appendVisionQueryAnchor(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const lastVisionUser = [...list].reverse().find((message) => message?.role === "user" && messageHasImage(message.content));
+  if (!lastVisionUser) return list;
+  const query = extractTextContent(lastVisionUser.content) || "请分析上一条消息中的图片。";
+  return [...list, { role: "user", content: query }];
+}
+function isNoUserQueryError(message) {
+  return /no user query found in messages/i.test(String(message || ""));
+}
 function cleanAssistantReply(text, messages = []) {
   const original = String(text || "")
     .replace(/\<think>[\s\S]*?\<\/think>/gi, "")
@@ -244,7 +288,7 @@ function cleanAssistantReply(text, messages = []) {
   for (const prompt of new Set(systemPrompts)) cleaned = cleaned.split(prompt).join("\n");
 
   const lastUser = [...(Array.isArray(messages) ? messages : [])].reverse().find((message) => message?.role === "user");
-  const userText = String(lastUser?.content || "").trim();
+  const userText = extractTextContent(lastUser?.content);
   if (userText) {
     for (const marker of [
       `用户说：“${userText}”`,
@@ -289,17 +333,18 @@ function extractChatText(data) {
   }
   return "";
 }
-function llmKinds(cfg) {
-  return [preferredLlmKind(cfg)];
+function llmKinds(cfg, messages = []) {
+  return [messagesHaveVision(messages) ? "chat" : preferredLlmKind(cfg)];
 }
 function chatPayloadVariants(cfg, messages, stream = false) {
   const first = buildChatPayload(cfg, messages, stream, {
     enable_thinking: false,
-    thinking_budget: 0,
     chat_template_kwargs: { enable_thinking: false },
   });
   const minimal = buildChatPayload(cfg, messages, stream);
-  return [first, minimal];
+  const variants = [first, minimal];
+  if (messagesHaveVision(messages)) variants.push(buildChatPayload(cfg, appendVisionQueryAnchor(messages), stream));
+  return variants;
 }
 function payloadVariants(cfg, messages, kind, stream = false) {
   return kind === "chat"
@@ -310,7 +355,7 @@ async function chatCompletions(cfg, messages) {
   const headers = { authorization: `Bearer ${cfg.llm.apiKey}`, "content-type": "application/json" };
   console.log("[llm] config", publicLlmConfig(cfg));
   let lastErr = "LLM failed";
-  for (const kind of llmKinds(cfg)) {
+  for (const kind of llmKinds(cfg, messages)) {
     let fallbackToNextKind = false;
     const endpoint = llmEndpoint(cfg, kind);
     const variants = payloadVariants(cfg, messages, kind, false);
@@ -323,7 +368,7 @@ async function chatCompletions(cfg, messages) {
           lastErr = formatLlmFailure(res.status, pickLlmErrorMessage(res));
           console.log("[llm] fail", kind, res.status, lastErr);
           if (kind === "chat" && shouldFallbackToResponses(cfg, res.status)) { fallbackToNextKind = true; break; }
-          if (res.status === 400 && i < variants.length - 1) continue;
+          if (i < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
           throw new Error(lastErr);
         }
         const textOut = cleanAssistantReply(extractLlmText(res.data, kind), messages);
@@ -344,6 +389,217 @@ async function chatCompletions(cfg, messages) {
     break;
   }
   throw new Error(lastErr);
+}
+const FUNCTION_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "web_search",
+      description: "搜索互联网中的最新信息。适合新闻、价格、政策、比赛、交通、产品资料等需要实时或可核实来源的问题。",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string", description: "简洁、完整的搜索关键词" } },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_weather",
+      description: "查询某个城市或地区的当前天气与短期预报。",
+      parameters: {
+        type: "object",
+        properties: {
+          location: { type: "string", description: "城市或地区，例如香港、深圳、北京市朝阳区" },
+          date: { type: "string", description: "可选，今天、明天、后天或具体日期" },
+        },
+        required: ["location"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description: "查询当前日期、时间、星期和时区。",
+      parameters: {
+        type: "object",
+        properties: { time_zone: { type: "string", description: "IANA 时区，例如 Asia/Hong_Kong、Asia/Shanghai；不填则使用用户时区" } },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "calculate",
+      description: "执行精确的基础数学计算，支持 + - * / % ^ 和括号。",
+      parameters: {
+        type: "object",
+        properties: { expression: { type: "string", description: "只包含数字、运算符和括号的表达式，例如 (128+32)*0.85" } },
+        required: ["expression"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_reminder",
+      description: "创建保存在用户浏览器本地的提醒。相对时间优先传 delay_minutes；绝对时间传带时区的 ISO 8601 due_at。",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "提醒内容" },
+          delay_minutes: { type: "number", description: "从现在起多少分钟后提醒" },
+          due_at: { type: "string", description: "带时区的 ISO 8601 时间，例如 2026-07-26T09:00:00+08:00" },
+        },
+        required: ["title"],
+      },
+    },
+  },
+];
+const TOOL_LABELS = {
+  web_search: "联网搜索",
+  get_weather: "天气",
+  get_current_time: "时间",
+  calculate: "计算器",
+  create_reminder: "提醒",
+};
+function shouldUseFunctionTools(text) {
+  const value = cleanSearchText(text);
+  if (!value) return false;
+  if (/提醒|闹钟|到时叫我|记得叫我|分钟后|小时后/.test(value)) return true;
+  if (/几点|现在时间|当前时间|日期|几号|星期几|今天星期/.test(value)) return true;
+  if (/计算|算一下|等于多少|[0-9][0-9\s.+\-*/%^()]{2,}/.test(value)) return true;
+  return false;
+}
+function parseToolArguments(raw) {
+  if (raw && typeof raw === "object") return raw;
+  const text = String(raw || "").trim();
+  if (!text) return {};
+  try { return JSON.parse(text); } catch { return {}; }
+}
+function normalizeToolCalls(message) {
+  const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+  return calls.slice(0, 8).map((call, index) => ({
+    id: String(call?.id || `call_${Date.now()}_${index}`),
+    type: "function",
+    function: {
+      name: String(call?.function?.name || "").trim(),
+      arguments: typeof call?.function?.arguments === "string" ? call.function.arguments : JSON.stringify(call?.function?.arguments || {}),
+    },
+  })).filter((call) => call.function.name);
+}
+function safeCalculateExpression(expression) {
+  const value = String(expression || "").trim().slice(0, 200);
+  if (!value || !/^[0-9+\-*/%^().\s]+$/.test(value)) throw new Error("表达式只能包含数字、基础运算符和括号");
+  const normalized = value.replace(/\^/g, "**");
+  const result = Function(`"use strict"; return (${normalized});`)();
+  if (typeof result !== "number" || !Number.isFinite(result)) throw new Error("计算结果不是有限数字");
+  return { expression: value, result };
+}
+function normalizeTimeZone(value, fallback = "Asia/Hong_Kong") {
+  const candidate = String(value || fallback || "Asia/Hong_Kong").trim();
+  try {
+    new Intl.DateTimeFormat("zh-CN", { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch {
+    return fallback || "Asia/Hong_Kong";
+  }
+}
+function currentTimeResult(timeZone) {
+  const zone = normalizeTimeZone(timeZone);
+  const now = new Date();
+  return {
+    iso: now.toISOString(),
+    timeZone: zone,
+    local: new Intl.DateTimeFormat("zh-CN", { timeZone: zone, dateStyle: "full", timeStyle: "long", hour12: false }).format(now),
+  };
+}
+async function executeFunctionTool(cfg, call) {
+  const name = call.function.name;
+  const args = parseToolArguments(call.function.arguments);
+  if (name === "web_search") {
+    if (!cfg.webSearchEnabled) return { content: { ok: false, error: "用户已关闭联网搜索" } };
+    const query = String(args.query || "").trim().slice(0, 160);
+    const search = await runWebSearch({ query, provider: cfg.searchProvider, apiKey: cfg.searchApiKey, baseUrl: cfg.searchBaseUrl });
+    return {
+      content: { ok: search.ok, provider: search.provider, query: search.query, items: (search.items || []).slice(0, 6), error: search.error || "" },
+      webSearch: { used: true, explicit: true, provider: search.provider, ok: search.ok, count: search.items?.length || 0, error: search.error || "", titles: (search.items || []).slice(0, 3).map((item) => item.title) },
+    };
+  }
+  if (name === "get_weather") {
+    if (!cfg.webSearchEnabled) return { content: { ok: false, error: "用户已关闭联网搜索" } };
+    const location = String(args.location || "").trim().slice(0, 80);
+    const date = String(args.date || "").trim().slice(0, 40);
+    const search = await runWebSearch({ query: `${location} ${date} 天气`.trim(), provider: "weather", apiKey: cfg.searchApiKey, baseUrl: cfg.searchBaseUrl });
+    return {
+      content: { ok: search.ok, location, date, items: (search.items || []).slice(0, 4), error: search.error || "" },
+      webSearch: { used: true, explicit: true, provider: search.provider, ok: search.ok, count: search.items?.length || 0, error: search.error || "", titles: (search.items || []).slice(0, 3).map((item) => item.title) },
+    };
+  }
+  if (name === "get_current_time") return { content: { ok: true, ...currentTimeResult(args.time_zone || cfg.timeZone) } };
+  if (name === "calculate") return { content: { ok: true, ...safeCalculateExpression(args.expression) } };
+  if (name === "create_reminder") {
+    const title = String(args.title || "提醒").trim().slice(0, 200) || "提醒";
+    const delayMinutes = Number(args.delay_minutes);
+    let dueAt = "";
+    if (Number.isFinite(delayMinutes) && delayMinutes >= 0) dueAt = new Date(Date.now() + Math.min(delayMinutes, 525600) * 60000).toISOString();
+    else if (args.due_at) {
+      const parsed = new Date(String(args.due_at));
+      if (Number.isFinite(parsed.getTime())) dueAt = parsed.toISOString();
+    }
+    if (!dueAt) return { content: { ok: false, error: "缺少有效的 delay_minutes 或 due_at" } };
+    const action = { type: "create_reminder", id: `reminder_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, title, dueAt };
+    return { content: { ok: true, title, dueAt, storage: "browser-local" }, action };
+  }
+  return { content: { ok: false, error: `未知工具: ${name}` } };
+}
+async function fetchChatToolStep(cfg, messages) {
+  const headers = { authorization: `Bearer ${cfg.llm.apiKey}`, "content-type": "application/json" };
+  const endpoint = llmEndpoint(cfg, "chat");
+  const variants = chatPayloadVariants(cfg, messages, false).map((payload) => ({ ...payload, tools: FUNCTION_TOOLS, tool_choice: "auto" }));
+  let lastErr = "LLM tool call failed";
+  for (let index = 0; index < variants.length; index++) {
+    const res = await fetchLlmWithTransientRetry(endpoint, { method: "POST", headers, body: JSON.stringify(variants[index]) }, 15000, cfg);
+    if (!res.ok) {
+      lastErr = formatLlmFailure(res.status, pickLlmErrorMessage(res));
+      if (index < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
+      throw new Error(lastErr);
+    }
+    const message = res.data?.choices?.[0]?.message || {};
+    return { message, text: extractTextContent(message.content), toolCalls: normalizeToolCalls(message) };
+  }
+  throw new Error(lastErr);
+}
+async function chatCompletionsWithTools(cfg, messages) {
+  const working = [...messages];
+  const toolActions = [];
+  const toolUsage = [];
+  let webSearch = null;
+  for (let round = 0; round < 4; round++) {
+    const step = await fetchChatToolStep(cfg, working);
+    if (!step.toolCalls.length) {
+      const reply = cleanAssistantReply(step.text, messages);
+      if (!reply) throw new Error("模型完成工具调用后没有返回文字");
+      return { reply, toolActions, toolUsage, webSearch };
+    }
+    working.push({ role: "assistant", content: step.message.content || "", tool_calls: step.toolCalls });
+    for (const call of step.toolCalls) {
+      let result;
+      try {
+        result = await executeFunctionTool(cfg, call);
+      } catch (err) {
+        result = { content: { ok: false, error: String(err.message || err) } };
+      }
+      toolUsage.push(TOOL_LABELS[call.function.name] || call.function.name);
+      if (result.action) toolActions.push(result.action);
+      if (result.webSearch) webSearch = result.webSearch;
+      working.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result.content) });
+    }
+  }
+  const reply = await chatCompletions(cfg, working);
+  return { reply, toolActions, toolUsage, webSearch };
 }
 function extractResponseText(data) {
   const direct = data?.output_text || data?.text || data?.content || data?.reply;
@@ -433,6 +689,15 @@ function parseSseBlock(block) {
   }
   return { eventName, dataText: dataLines.join("\n").trim() };
 }
+function readStreamChunkWithTimeout(reader, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("LLM stream timeout waiting for output")), timeoutMs);
+    reader.read().then(
+      (result) => { clearTimeout(timer); resolve(result); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
 async function readLlmStreamResponse(res, kind, onDelta) {
   const reader = res.body?.getReader?.();
   if (!reader) {
@@ -470,7 +735,7 @@ async function readLlmStreamResponse(res, kind, onDelta) {
   };
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readStreamChunkWithTimeout(reader, reply ? 20000 : 15000);
       if (done) break;
       const chunk = decoder.decode(value, { stream: true });
       raw = (raw + chunk).slice(-1024 * 1024);
@@ -511,7 +776,7 @@ async function streamChatCompletions(cfg, messages, onDelta) {
   const headers = { authorization: `Bearer ${cfg.llm.apiKey}`, "content-type": "application/json" };
   console.log("[llm] config", publicLlmConfig(cfg));
   let lastErr = "LLM failed";
-  for (const kind of llmKinds(cfg)) {
+  for (const kind of llmKinds(cfg, messages)) {
     let fallbackToNextKind = false;
     const endpoint = llmEndpoint(cfg, kind);
     const variants = payloadVariants(cfg, messages, kind, true);
@@ -519,20 +784,20 @@ async function streamChatCompletions(cfg, messages, onDelta) {
       const payload = variants[i];
       try {
         console.log("[llm] stream", kind, cfg.llm.model, "tokens=", cfg.maxTokens);
-        let res = await fetchLlmStreamOnce(endpoint, { method: "POST", headers, body: JSON.stringify(payload) }, 90000);
+        let res = await fetchLlmStreamOnce(endpoint, { method: "POST", headers, body: JSON.stringify(payload) }, 15000);
         if (!res.ok) {
           let errText = await readFetchError(res);
           if (isTransientAuthError(res.status, errText)) {
             console.log("[llm] transient stream auth error, retry once", { status: res.status, ...publicLlmConfig(cfg) });
             await sleep(800);
-            res = await fetchLlmStreamOnce(endpoint, { method: "POST", headers, body: JSON.stringify(payload) }, 90000);
+            res = await fetchLlmStreamOnce(endpoint, { method: "POST", headers, body: JSON.stringify(payload) }, 15000);
             if (!res.ok) errText = await readFetchError(res);
           }
           if (!res.ok) {
             lastErr = formatLlmFailure(res.status, errText);
             console.log("[llm] stream fail", kind, res.status, lastErr);
             if (kind === "chat" && shouldFallbackToResponses(cfg, res.status)) { fallbackToNextKind = true; break; }
-            if (res.status === 400 && i < variants.length - 1) continue;
+            if (i < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
             throw new Error(lastErr);
           }
         }
@@ -606,6 +871,12 @@ function normalizeSearchQuery(query) {
 function isWeatherQuery(query) {
   return /天气|气温|下雨|下雪|降雨|降雪|空气质量|台风|雾霾|weather/i.test(String(query || ""));
 }
+function isRealtimeQuery(userText) {
+  const q = cleanSearchText(userText);
+  if (!q) return false;
+  if (isWeatherQuery(q)) return true;
+  return /新闻|头条|热点|热搜|最新|实时|股价|股票行情|行情|价格|汇率|油价|金价|银价|黄金|白银|比特币|btc|eth|比分|赛程|航班|火车|高铁|路况|限行|放假|门票|影讯|开奖|疫情/i.test(q);
+}
 function normalizeWeatherSpeech(text) {
   return cleanSearchText(text)
     .replace(/(今天|今日|明天|后天)的天[。.!！?？]*$/g, "$1的天气")
@@ -616,8 +887,67 @@ function extractWeatherLocation(query) {
   q = q.replace(/(今天|今日|明天|后天|现在|当前|实时|最近|这会儿|此刻)/g, "");
   q = q.replace(/(的)?(天气预报|天气|气温|温度|下雨吗|会下雨吗|下雨|下雪吗|会下雪吗|下雪|降雨|降雪|空气质量|台风|雾霾|预报)/g, "");
   q = q.replace(/(怎么样|如何|怎样|多少|几度|有雨吗|冷不冷|热不热)/g, "");
-  q = q.replace(/[，,。.!！?？：:\s]/g, "").trim();
+  q = q.replace(/[，,。.!！?？：:\s]/g, "").replace(/(?:呢|呀|啊|吧|嘛|吗|么)+$/g, "").trim();
   return q.slice(0, 40);
+}
+function extractWeatherTiming(query) {
+  return String(query || "").match(/后天|明天|今天|今日/)?.[0] || "";
+}
+function isLikelyWeatherFollowupLocation(rawText, location) {
+  const raw = cleanSearchText(rawText);
+  const value = String(location || "").trim();
+  if (!raw || raw.length > 30 || value.length < 2) return false;
+  if (/^(这里|那里|这边|那边|本地|附近|谢谢|多谢|好的|好啦|知道了|明白了|不用了|不用|算了|可以|行吧|行了|为什么|怎么了|是吗|真的|没事|没问题)$/.test(value)) return false;
+  return true;
+}
+function contextualSearchIntent(messages) {
+  const userTexts = (Array.isArray(messages) ? messages : [])
+    .filter((message) => message?.role === "user")
+    .map((message) => extractTextContent(message.content))
+    .filter(Boolean);
+  const current = userTexts.at(-1) || "";
+  if (!current) return "";
+  const previousTexts = userTexts.slice(0, -1);
+  let weatherAnchorIndex = -1;
+  for (let index = previousTexts.length - 1; index >= 0; index -= 1) {
+    if (isWeatherQuery(previousTexts[index])) {
+      weatherAnchorIndex = index;
+      break;
+    }
+  }
+  if (weatherAnchorIndex < 0) return current;
+
+  const currentLocation = extractWeatherLocation(current);
+  const currentTiming = extractWeatherTiming(current);
+  const weatherAnchor = previousTexts[weatherAnchorIndex];
+  let previousTiming = extractWeatherTiming(weatherAnchor);
+  let previousLocation = extractWeatherLocation(weatherAnchor);
+  for (const followup of previousTexts.slice(weatherAnchorIndex + 1)) {
+    const followupLocation = extractWeatherLocation(followup);
+    const followupTiming = extractWeatherTiming(followup);
+    if (isLikelyWeatherFollowupLocation(followup, followupLocation)) {
+      previousLocation = followupLocation;
+      if (followupTiming) previousTiming = followupTiming;
+      continue;
+    }
+    if (followupTiming) {
+      previousTiming = followupTiming;
+      continue;
+    }
+    return current;
+  }
+
+  if (isWeatherQuery(current)) {
+    if (!currentLocation && previousLocation) return `${previousLocation} ${currentTiming || previousTiming} 天气`.replace(/\s+/g, " ").trim();
+    return current;
+  }
+  if (isLikelyWeatherFollowupLocation(current, currentLocation)) {
+    return `${currentLocation} ${currentTiming || previousTiming} 天气`.replace(/\s+/g, " ").trim();
+  }
+  if (currentTiming) {
+    return `${previousLocation ? `${previousLocation} ` : ""}${currentTiming} 天气`.replace(/\s+/g, " ").trim();
+  }
+  return current;
 }
 function pickWeatherDesc(current) {
   const raw = current?.lang_zh?.[0]?.value || current?.weatherDesc?.[0]?.value || "";
@@ -767,7 +1097,10 @@ function formatSearchContext(result) {
   return [`【联网搜索结果】查询: ${result.query}（来源: ${result.provider}）`, ...lines, "请先判断搜索结果是否真的相关；相关才引用，不相关就说明暂时查不到。用简体中文、短句回答。不要编造具体数字或实时结论。"].join("\n");
 }
 function sanitizeMessages(messages, systemPrompt, maxTurns) {
-  const rest = (messages || []).filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string").map((m) => ({ role: m.role, content: String(m.content).slice(0, 4000) }));
+  const rest = (messages || [])
+    .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+    .map((m) => ({ role: m.role, content: sanitizeMessageContent(m.content) }))
+    .filter((m) => typeof m.content === "string" ? Boolean(m.content.trim()) : m.content.length > 0);
   const keep = Math.max(2, (maxTurns || 12) * 2);
   return [{ role: "system", content: withReplyOnlyInstruction(systemPrompt) }, ...rest.slice(-keep)];
 }
@@ -797,35 +1130,74 @@ async function prepareChat(body) {
   let messages = Array.isArray(body.messages) ? body.messages : [];
   if (body.message) messages = [...messages, { role: "user", content: String(body.message) }];
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  const userText = String(lastUser?.content || "").trim();
+  const userText = extractTextContent(lastUser?.content);
   if (!userText) { const e = new Error("请输入消息"); e.status = 400; throw e; }
+  const intentText = contextualSearchIntent(messages);
   let systemPrompt = cfg.systemPrompt;
   let directReply = "";
-  const explicitSearch = isExplicitSearchRequest(userText);
-  const useResponsesTools = preferredLlmKind(cfg) === "responses";
+  const explicitSearch = isExplicitSearchRequest(intentText) || isExplicitSearchRequest(userText);
+  const weatherIntent = isWeatherQuery(intentText);
+  const realtimeIntent = isRealtimeQuery(intentText);
+  const autoSearchIntent = shouldAutoSearch(intentText);
+  const serverSearchIntent = realtimeIntent || explicitSearch || (cfg.webSearchEnabled && autoSearchIntent);
+  const hasVision = messagesHaveVision(messages);
+  const useResponsesTools = !hasVision && !serverSearchIntent && preferredLlmKind(cfg) === "responses";
+  const useFunctionTools = !serverSearchIntent && cfg.toolCallingEnabled && preferredLlmKind(cfg) === "chat" && shouldUseFunctionTools(intentText);
+  if (useFunctionTools) {
+    const now = currentTimeResult(cfg.timeZone);
+    systemPrompt = `${systemPrompt}\n\n当前用户时区：${now.timeZone}。当前日期时间：${now.local}（${now.iso}）。需要计算、时间或提醒时，请优先调用提供的函数工具，不要假装已经执行工具。`;
+  }
   let webSearch = useResponsesTools ? { used: true, explicit: explicitSearch, provider: "responses-tools", ok: true, count: 0, error: "", titles: [] } : null;
-  const wantSearch = !useResponsesTools && shouldAutoSearch(userText) && (cfg.webSearchEnabled || explicitSearch);
+  const weatherLocation = weatherIntent ? extractWeatherLocation(intentText) : "";
+  if (weatherIntent && !weatherLocation) {
+    directReply = cfg.webSearchEnabled
+      ? "你想查哪个城市的天气？请告诉我城市，例如“杭州天气”。"
+      : "你想查哪个城市的天气？另外，“启用联网搜索”当前已关闭；打开后我才能查询实时天气，我不会猜温度或降雨概率。";
+    webSearch = { used: false, explicit: explicitSearch, provider: "weather", ok: false, count: 0, error: "missing location", titles: [] };
+  } else if ((realtimeIntent || explicitSearch) && !cfg.webSearchEnabled) {
+    directReply = weatherIntent
+      ? "联网搜索当前已关闭，我不能可靠查询实时天气，也不会猜温度或降雨概率。请先打开“启用联网搜索”。"
+      : "联网搜索当前已关闭，我不能可靠查询实时数据，也不会凭空编造。请先打开“启用联网搜索”。";
+    webSearch = { used: false, explicit: explicitSearch, provider: "disabled", ok: false, count: 0, error: "web search disabled", titles: [] };
+  }
+  const wantSearch = !directReply && !useResponsesTools && !useFunctionTools && cfg.webSearchEnabled && (realtimeIntent || explicitSearch || autoSearchIntent);
   if (wantSearch) {
     try {
-      const search = await runWebSearch({ query: userText, provider: cfg.searchProvider, apiKey: cfg.searchApiKey, baseUrl: cfg.searchBaseUrl });
+      const search = await runWebSearch({ query: intentText, provider: weatherIntent ? "weather" : cfg.searchProvider, apiKey: cfg.searchApiKey, baseUrl: cfg.searchBaseUrl });
       console.log("[search]", search.provider, "ok=", search.ok, "count=", search.items?.length || 0, search.error || "");
       webSearch = { used: true, explicit: explicitSearch, provider: search.provider, ok: search.ok, count: search.items.length, error: search.error || "", titles: search.items.slice(0, 3).map((x) => x.title) };
       directReply = directSearchReply(search);
-      if (!directReply) systemPrompt = `${cfg.systemPrompt}\n\n${formatSearchContext(search)}\n\n重要：上面就是服务端已经获取到的联网结果。不能再说“我不能联网”“无法直接联网”“联网搜索没开放”。`;
+      if (!directReply && !search.ok && (realtimeIntent || explicitSearch)) {
+        directReply = weatherIntent
+          ? `我暂时没查到${weatherLocation || "该城市"}的可靠实时天气，不能给你编温度或降雨概率。请稍后重试。`
+          : "我暂时没查到可靠的实时信息，不会凭空编造数据。请稍后重试。";
+      } else if (!directReply) {
+        systemPrompt = `${cfg.systemPrompt}\n\n${formatSearchContext(search)}\n\n重要：上面就是服务端已经获取到的联网结果。不能再说“我不能联网”“无法直接联网”“联网搜索没开放”，也不能补充搜索结果里没有的实时数字。`;
+      }
     } catch (err) {
       webSearch = { used: true, explicit: explicitSearch, provider: "timeout", ok: false, count: 0, error: String(err.message || err), titles: [] };
-      systemPrompt = `${cfg.systemPrompt}\n\n【联网搜索】暂时不可用。请简要回答并说明实时信息可能不准。不要说“联网搜索功能没开放”。`;
+      if (realtimeIntent || explicitSearch) {
+        directReply = weatherIntent
+          ? `我暂时没查到${weatherLocation || "该城市"}的可靠实时天气，不能给你编温度或降雨概率。请稍后重试。`
+          : "我暂时没查到可靠的实时信息，不会凭空编造数据。请稍后重试。";
+      } else {
+        systemPrompt = `${cfg.systemPrompt}\n\n【联网搜索】暂时不可用。请简要回答并明确说明无法核实；不要编造实时数据。`;
+      }
     }
   }
   const finalMessages = sanitizeMessages(messages, systemPrompt, cfg.maxHistoryTurns);
-  return { cfg, messages, userText, explicitSearch, useResponsesTools, finalMessages, webSearch, directReply };
+  return { cfg, messages, userText, intentText, explicitSearch, useResponsesTools, useFunctionTools, finalMessages, webSearch, directReply };
 }
 async function handleChat(body) {
   const prepared = await prepareChat(body);
   if (prepared.directReply) return { ok: true, reply: prepared.directReply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: prepared.webSearch };
+  if (prepared.useFunctionTools) {
+    const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages);
+    return { ok: true, reply: result.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: result.webSearch, toolActions: result.toolActions, toolUsage: result.toolUsage };
+  }
   const reply = await chatCompletions(prepared.cfg, prepared.finalMessages);
-  if (prepared.useResponsesTools && shouldAutoSearch(prepared.userText) && looksLikeNoWebReply(reply)) {
-    const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.userText, prepared.explicitSearch);
+  if (prepared.useResponsesTools && shouldAutoSearch(prepared.intentText) && looksLikeNoWebReply(reply)) {
+    const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch);
     return { ok: true, reply: fallback.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: fallback.webSearch };
   }
   return { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: prepared.webSearch };
@@ -844,23 +1216,36 @@ async function handleChatStream(body, res) {
     "x-accel-buffering": "no",
   });
   let reply = "";
+  writeSse(res, "ready", { ok: true });
   try {
     let doneWebSearch = prepared.webSearch;
+    let doneToolActions = [];
+    let doneToolUsage = [];
     if (prepared.directReply) {
       reply = prepared.directReply;
       writeSse(res, "delta", { text: reply });
-    } else if (prepared.useResponsesTools && shouldAutoSearch(prepared.userText)) {
+    } else if (prepared.useFunctionTools) {
+      const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages);
+      reply = result.reply;
+      doneWebSearch = result.webSearch;
+      doneToolActions = result.toolActions;
+      doneToolUsage = result.toolUsage;
+      writeSse(res, "delta", { text: reply });
+    } else if (prepared.useResponsesTools && shouldAutoSearch(prepared.intentText)) {
       reply = await chatCompletions(prepared.cfg, prepared.finalMessages);
       if (looksLikeNoWebReply(reply)) {
-        const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.userText, prepared.explicitSearch);
+        const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch);
         reply = fallback.reply;
         doneWebSearch = fallback.webSearch;
       }
       writeSse(res, "delta", { text: reply });
+    } else if (messagesHaveVision(prepared.finalMessages)) {
+      reply = await chatCompletions(prepared.cfg, prepared.finalMessages);
+      writeSse(res, "delta", { text: reply });
     } else {
       reply = await streamChatCompletions(prepared.cfg, prepared.finalMessages, (text) => writeSse(res, "delta", { text }));
     }
-    writeSse(res, "done", { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: doneWebSearch });
+    writeSse(res, "done", { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: doneWebSearch, toolActions: doneToolActions, toolUsage: doneToolUsage });
   } catch (err) {
     writeSse(res, "error", { error: String(err.message || err), partial: err.partial || reply || "" });
   } finally {
@@ -999,7 +1384,7 @@ const requestHandler = async (req, res) => {
     const pathname = url.pathname;
     if (req.method === "OPTIONS") { res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,OPTIONS", "access-control-allow-headers": "content-type,x-client-config,authorization" }); return res.end(); }
     if (pathname === "/api/health") return json(res, 200, { ok: true, service: "ai-voice-call-local", time: new Date().toISOString(), secure: Boolean(req.socket && req.socket.encrypted) });
-    if (pathname === "/api/defaults" && req.method === "GET") return json(res, 200, { ok: true, defaults: { llm: { baseUrl: "https://api.siliconflow.cn/v1", model: "Qwen/Qwen3.5-4B", apiType: "auto", endpoint: "" }, stt: { baseUrl: "https://api.siliconflow.cn/v1", model: "FunAudioLLM/SenseVoiceSmall", apiType: "auto", endpoint: "" }, tts: { baseUrl: "https://api.siliconflow.cn/v1", model: "FnLP/MOSS-TTSD-v0.5", voice: "alloy", apiType: "auto", endpoint: "" }, systemPromptPreset: "general", systemPrompt: DEFAULT_SYSTEM_PROMPT, maxHistoryTurns: 12, maxTokens: 512, temperature: 0.7, ttsEnabled: true, browserTtsFallback: true, autoSpeak: true, webSearchEnabled: true, searchProvider: "auto" } });
+    if (pathname === "/api/defaults" && req.method === "GET") return json(res, 200, { ok: true, defaults: { llm: { baseUrl: "https://api.siliconflow.cn/v1", model: "Qwen/Qwen3.5-4B", apiType: "auto", endpoint: "" }, stt: { baseUrl: "https://api.siliconflow.cn/v1", model: "FunAudioLLM/SenseVoiceSmall", apiType: "auto", endpoint: "" }, tts: { baseUrl: "https://api.siliconflow.cn/v1", model: "FnLP/MOSS-TTSD-v0.5", voice: "alloy", apiType: "auto", endpoint: "" }, systemPromptPreset: "general", systemPrompt: DEFAULT_SYSTEM_PROMPT, maxHistoryTurns: 12, maxTokens: 512, temperature: 0.7, ttsEnabled: true, browserTtsFallback: true, autoSpeak: true, toolCallingEnabled: true, webSearchEnabled: true, searchProvider: "auto" } });
     if (pathname === "/api/chat/stream" && req.method === "POST") {
       const raw = await readBody(req);
       const body = JSON.parse(raw.toString("utf8") || "{}");

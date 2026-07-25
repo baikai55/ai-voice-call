@@ -70,10 +70,19 @@ function inferPromptPreset(prompt, preferred = "general") {
 const DEFAULT_PROVIDER_ID = "provider_default";
 
 const BUILTIN_MODELS = {
-  llm: ["Qwen/Qwen3.5-4B"],
+  llm: ["Qwen/Qwen3.5-4B", "Qwen/Qwen3-8B"],
   stt: ["FunAudioLLM/SenseVoiceSmall"],
   tts: ["FnLP/MOSS-TTSD-v0.5", "mimo-v2.5-tts"],
 };
+
+const MODEL_CAPABILITIES = {
+  "Qwen/Qwen3.5-4B": { tools: true, vision: true, context: "256K" },
+  "Qwen/Qwen3-8B": { tools: true, vision: false, context: "128K" },
+};
+
+const MAX_IMAGE_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGE_EDGE = 1600;
+const REMINDERS_KEY = "ai-voice-call.reminders.v1";
 
 const MODEL_KIND_LABELS = {
   llm: "大模型",
@@ -214,6 +223,7 @@ const DEFAULTS = {
   ttsEnabled: true,
   browserTtsFallback: true,
   autoSpeak: true,
+  toolCallingEnabled: true,
   webSearchEnabled: true,
   searchProvider: "auto",
   searchApiKey: "",
@@ -225,6 +235,13 @@ const el = {
   input: document.getElementById("input"),
   status: document.getElementById("status"),
   btnSend: document.getElementById("btnSend"),
+  btnStop: document.getElementById("btnStop"),
+  btnAttach: document.getElementById("btnAttach"),
+  imageInput: document.getElementById("imageInput"),
+  imagePreview: document.getElementById("imagePreview"),
+  imagePreviewImg: document.getElementById("imagePreviewImg"),
+  imagePreviewName: document.getElementById("imagePreviewName"),
+  btnRemoveImage: document.getElementById("btnRemoveImage"),
   btnHold: document.getElementById("btnHold"),
   btnCall: document.getElementById("btnCall"),
   btnVoice: document.getElementById("btnVoice"),
@@ -308,9 +325,11 @@ const el = {
     maxHistoryTurns: document.getElementById("maxHistoryTurns"),
     maxTokens: document.getElementById("maxTokens"),
     temperature: document.getElementById("temperature"),
+    llmCapabilityHint: document.getElementById("llmCapabilityHint"),
     ttsEnabled: document.getElementById("ttsEnabled"),
     browserTtsFallback: document.getElementById("browserTtsFallback"),
     autoSpeak: document.getElementById("autoSpeak"),
+    toolCallingEnabled: document.getElementById("toolCallingEnabled"),
     webSearchEnabled: document.getElementById("webSearchEnabled"),
     searchProvider: document.getElementById("searchProvider"),
     searchApiKey: document.getElementById("searchApiKey"),
@@ -319,6 +338,7 @@ const el = {
 };
 
 let config = structuredClone(DEFAULTS);
+let settingsFormInitialized = false;
 let currentConversationId = null;
 let messages = [];
 let busy = false;
@@ -330,6 +350,7 @@ let providersDraft = defaultApiProviders();
 let customModelsDraft = normalizeCustomModels();
 let selectedProviderDraftId = DEFAULT_PROVIDER_ID;
 let providerEditorMode = ""; // "" | "add" | "edit"
+let pendingImage = null;
 
 let browserRec = null;
 let browserTranscript = "";
@@ -349,6 +370,8 @@ let callSessionAbort = null;
 let activeSpeechAudio = null;
 let activeSpeechStop = null;
 let browserSpeechStop = null;
+let activeSpeechController = null;
+let activeChatRequest = null;
 
 function deepMerge(base, patch) {
   const out = { ...base, ...patch };
@@ -870,10 +893,204 @@ function setStatus(text) {
   el.status.textContent = text || "";
 }
 
+function messageText(content) {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      return typeof part.text === "string" ? part.text : "";
+    })
+    .join(" ")
+    .trim();
+}
+
+function messageImages(content) {
+  if (!Array.isArray(content)) return [];
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object" || part.type !== "image_url") return "";
+      if (typeof part.image_url === "string") return part.image_url;
+      return typeof part.image_url?.url === "string" ? part.image_url.url : "";
+    })
+    .filter((url) => /^data:image\/(?:jpeg|png|webp|gif);base64,/i.test(url));
+}
+
+function buildUserContent(text, image = null) {
+  const value = String(text || "").trim();
+  if (!image?.url) return value;
+  return [
+    { type: "image_url", image_url: { url: image.url, detail: "low" } },
+    { type: "text", text: value || "请描述并分析这张图片。" },
+  ];
+}
+
+function modelCapabilities(modelId = config.llm?.model) {
+  return MODEL_CAPABILITIES[normalizeModelId(modelId)] || null;
+}
+
+function modelSupportsVision(modelId = config.llm?.model) {
+  return modelCapabilities(modelId)?.vision !== false;
+}
+
+function syncLlmCapabilityHint(modelId = el.fields?.llmModel?.value || config.llm?.model) {
+  const hint = el.fields?.llmCapabilityHint;
+  if (!hint) return;
+  const caps = modelCapabilities(modelId);
+  if (!caps) {
+    hint.textContent = "自定义模型的 Tools / 视觉能力由供应商决定。";
+    return;
+  }
+  hint.textContent = `能力：Tools ${caps.tools ? "支持" : "不支持"} · 视觉 ${caps.vision ? "支持" : "不支持"} · 上下文 ${caps.context}`;
+}
+
+function syncImagePreview() {
+  const visible = Boolean(pendingImage?.url);
+  el.imagePreview?.classList.toggle("hidden", !visible);
+  if (visible) {
+    if (el.imagePreviewImg) el.imagePreviewImg.src = pendingImage.url;
+    if (el.imagePreviewName) el.imagePreviewName.textContent = pendingImage.name || "待发送图片";
+  } else if (el.imagePreviewImg) {
+    el.imagePreviewImg.removeAttribute("src");
+  }
+}
+
+function clearPendingImage() {
+  pendingImage = null;
+  if (el.imageInput) el.imageInput.value = "";
+  syncImagePreview();
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("图片读取失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function loadImage(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("浏览器无法解析这张图片"));
+    image.src = dataUrl;
+  });
+}
+
+function canvasToDataUrl(canvas, type = "image/jpeg", quality = 0.84) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error("图片压缩失败"));
+        return;
+      }
+      fileToDataUrl(blob).then(resolve, reject);
+    }, type, quality);
+  });
+}
+
+async function prepareImageFile(file) {
+  if (!file || !String(file.type || "").startsWith("image/")) throw new Error("请选择 JPG、PNG、WebP 或 GIF 图片");
+  if (file.size > MAX_IMAGE_FILE_BYTES) throw new Error("图片不能超过 10MB");
+  const originalUrl = await fileToDataUrl(file);
+  const image = await loadImage(originalUrl);
+  const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(image.naturalWidth || 1, image.naturalHeight || 1));
+  if (scale === 1 && file.size <= 1.5 * 1024 * 1024) return { name: file.name || "图片", url: originalUrl };
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("浏览器不支持图片压缩");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return { name: file.name || "图片", url: await canvasToDataUrl(canvas) };
+}
+
+async function selectImageFile(file) {
+  if (!modelSupportsVision()) {
+    setStatus(`${config.llm.model} 不支持视觉输入，请切换到 Qwen/Qwen3.5-4B`);
+    return;
+  }
+  setStatus("正在处理图片…");
+  pendingImage = await prepareImageFile(file);
+  syncImagePreview();
+  setStatus("图片已添加，可以输入问题后发送");
+}
+
+function readLocalReminders() {
+  try {
+    const value = JSON.parse(localStorage.getItem(REMINDERS_KEY) || "[]");
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalReminders(reminders) {
+  localStorage.setItem(REMINDERS_KEY, JSON.stringify(reminders.slice(-200)));
+}
+
+async function applyToolActions(actions) {
+  const reminders = readLocalReminders();
+  let created = 0;
+  for (const action of Array.isArray(actions) ? actions : []) {
+    if (action?.type !== "create_reminder") continue;
+    const dueAt = new Date(action.dueAt);
+    if (!Number.isFinite(dueAt.getTime())) continue;
+    reminders.push({
+      id: action.id || `reminder_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      title: String(action.title || "提醒").slice(0, 200),
+      dueAt: dueAt.toISOString(),
+      createdAt: new Date().toISOString(),
+      notified: false,
+    });
+    created += 1;
+  }
+  if (created) {
+    writeLocalReminders(reminders);
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+    checkDueReminders();
+  }
+  return created;
+}
+
+function showReminder(reminder) {
+  const title = String(reminder.title || "提醒");
+  if ("Notification" in window && Notification.permission === "granted") {
+    try { new Notification("小豆提醒", { body: title, icon: "/icon-192.png" }); } catch {}
+  }
+  appendMessage("system", `提醒：${title}`);
+  setStatus(`提醒：${title}`);
+  if (config.autoSpeak) browserSpeak(`提醒你：${title}`).catch(() => {});
+}
+
+function checkDueReminders() {
+  const reminders = readLocalReminders();
+  const now = Date.now();
+  let changed = false;
+  for (const reminder of reminders) {
+    if (reminder.notified) continue;
+    const dueTime = new Date(reminder.dueAt).getTime();
+    if (!Number.isFinite(dueTime) || dueTime > now) continue;
+    reminder.notified = true;
+    changed = true;
+    showReminder(reminder);
+  }
+  if (changed) writeLocalReminders(reminders);
+}
+
 function syncInteractionState() {
   const composerLocked = busy || callActive;
   if (el.btnSend) el.btnSend.disabled = composerLocked;
   if (el.btnHold) el.btnHold.disabled = composerLocked;
+  if (el.btnAttach) el.btnAttach.disabled = composerLocked;
   if (el.input) el.input.disabled = callActive;
   if (el.btnCall) el.btnCall.disabled = busy && !callActive;
 }
@@ -902,7 +1119,24 @@ function appendMessage(role, content, index = null) {
 
   const bubble = document.createElement("div");
   bubble.className = `msg ${role}`;
-  bubble.textContent = content;
+  const images = messageImages(content);
+  if (images.length) {
+    const imageWrap = document.createElement("div");
+    imageWrap.className = "msg-images";
+    for (const url of images) {
+      const image = document.createElement("img");
+      image.className = "msg-image";
+      image.src = url;
+      image.alt = "用户发送的图片";
+      image.loading = "lazy";
+      imageWrap.appendChild(image);
+    }
+    bubble.appendChild(imageWrap);
+  }
+  const textNode = document.createElement("div");
+  textNode.className = "msg-text";
+  textNode.textContent = messageText(content);
+  bubble.appendChild(textNode);
 
   const actions = document.createElement("div");
   actions.className = "msg-actions";
@@ -977,11 +1211,12 @@ async function retryMessageAt(index) {
   if (!item) return;
 
   if (item.role === "user") {
-    const content = String(item.content || "").trim();
+    const content = messageText(item.content);
+    const imageUrl = messageImages(item.content)[0] || "";
     messages = messages.slice(0, index);
     await saveHistory();
     renderChat();
-    await sendText(content);
+    await sendText(content, { image: imageUrl ? { name: "重发图片", url: imageUrl } : null });
     return;
   }
 
@@ -1031,7 +1266,7 @@ function cleanClientAssistantReply(text, requestMessages = []) {
   for (const prompt of prompts) cleaned = cleaned.split(prompt).join("\n");
 
   const lastUser = [...requestMessages].reverse().find((message) => message?.role === "user");
-  const userText = String(lastUser?.content || "").trim();
+  const userText = messageText(lastUser?.content);
   if (userText) {
     for (const marker of [
       `用户说：“${userText}”`,
@@ -1078,7 +1313,7 @@ async function requestChatJson(requestMessages, signal = null) {
     if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
     const reply = cleanClientAssistantReply(data.reply, requestMessages);
     if (!reply) throw new Error("模型没有返回文字，请换模型或稍后再试");
-    return { reply, webSearch: data.webSearch || null };
+    return { reply, webSearch: data.webSearch || null, toolActions: data.toolActions || [], toolUsage: data.toolUsage || [] };
   } finally {
     clearTimeout(chatTimer);
     signal?.removeEventListener("abort", abortFromSession);
@@ -1098,7 +1333,7 @@ function parseSseEventBlock(block) {
 }
 
 function assistantBubble(row) {
-  return row?.querySelector?.(".msg.assistant") || row;
+  return row?.querySelector?.(".msg.assistant .msg-text") || row?.querySelector?.(".msg.assistant") || row;
 }
 
 function setAssistantText(row, text) {
@@ -1110,9 +1345,17 @@ function setAssistantText(row, text) {
 async function requestChatStreamWithFallback(requestMessages, row, signal = null) {
   let reply = "";
   let webSearch = null;
+  let toolActions = [];
+  let toolUsage = [];
   let sawDelta = false;
   const controller = new AbortController();
   const chatTimer = setTimeout(() => controller.abort(), 120000);
+  let outputTimer = setTimeout(() => controller.abort(), 18000);
+  const clearOutputTimer = () => {
+    if (!outputTimer) return;
+    clearTimeout(outputTimer);
+    outputTimer = null;
+  };
   const abortFromSession = () => controller.abort();
   if (signal?.aborted) controller.abort();
   else signal?.addEventListener("abort", abortFromSession, { once: true });
@@ -1138,6 +1381,7 @@ async function requestChatStreamWithFallback(requestMessages, row, signal = null
       if (eventName === "delta") {
         const text = String(data.text || "");
         if (text) {
+          clearOutputTimer();
           const merged = mergeAssistantStreamText(reply, text);
           reply = merged.reply;
           if (merged.delta) {
@@ -1148,14 +1392,18 @@ async function requestChatStreamWithFallback(requestMessages, row, signal = null
         return;
       }
       if (eventName === "done") {
+        clearOutputTimer();
         if (data.reply) {
           reply = cleanClientAssistantReply(data.reply, requestMessages);
           setAssistantText(row, reply);
         }
         webSearch = data.webSearch || null;
+        toolActions = Array.isArray(data.toolActions) ? data.toolActions : [];
+        toolUsage = Array.isArray(data.toolUsage) ? data.toolUsage : [];
         return;
       }
       if (eventName === "error") {
+        clearOutputTimer();
         const err = new Error(data.error || "流式生成失败");
         err.partial = data.partial || reply;
         throw err;
@@ -1177,9 +1425,12 @@ async function requestChatStreamWithFallback(requestMessages, row, signal = null
     if (buffer.trim()) handleBlock(buffer);
     reply = cleanClientAssistantReply(reply, requestMessages);
     if (!reply) throw Object.assign(new Error("模型没有返回文字，请换模型或稍后再试"), { beforeDelta: !sawDelta });
-    return { reply, webSearch, streamed: true };
+    return { reply, webSearch, toolActions, toolUsage, streamed: true };
   } catch (err) {
-    if (signal?.aborted) throw err;
+    if (signal?.aborted) {
+      err.partial = cleanClientAssistantReply(err.partial || reply || "", requestMessages);
+      throw err;
+    }
     if (sawDelta || err.partial) {
       err.partial = cleanClientAssistantReply(err.partial || reply || "", requestMessages);
       throw err;
@@ -1189,6 +1440,7 @@ async function requestChatStreamWithFallback(requestMessages, row, signal = null
     setAssistantText(row, data.reply);
     return { ...data, streamed: false };
   } finally {
+    clearOutputTimer();
     clearTimeout(chatTimer);
     signal?.removeEventListener("abort", abortFromSession);
   }
@@ -1221,11 +1473,14 @@ async function regenerateAssistant() {
   const assistantIndex = messages.length;
   messages.push({ role: "assistant", content: "" });
   const row = appendMessage("assistant", "…", assistantIndex);
+  const chatRequest = beginChatGeneration();
 
   try {
-    const data = await requestChatStreamWithFallback(requestMessages, row);
+    const data = await requestChatStreamWithFallback(requestMessages, row, chatRequest.controller.signal);
+    finishChatGeneration(chatRequest);
     messages[assistantIndex].content = data.reply;
     await saveHistory();
+    await applyToolActions(data.toolActions || []);
     let speakResult = { mode: "off" };
     if (config.autoSpeak) {
       setStatus("正在朗读…");
@@ -1233,17 +1488,19 @@ async function regenerateAssistant() {
     }
     setStatus(readyStatusAfterSpeak(speakResult));
   } catch (err) {
+    const stoppedByUser = chatRequest.userStopped;
     const partial = String(err.partial || "").trim();
     if (partial) {
       messages[assistantIndex].content = partial;
       setAssistantText(row, partial);
       await saveHistory();
-      setStatus(`生成中断：${explainFetchError(err)}`);
+      setStatus(stoppedByUser ? "已停止生成，已保留当前内容" : `生成中断：${explainFetchError(err)}`);
     } else {
       removeAssistantPlaceholder(row, assistantIndex);
-      setStatus(`重试失败：${explainFetchError(err)}`);
+      setStatus(stoppedByUser ? "已停止生成" : `重试失败：${explainFetchError(err)}`);
     }
   } finally {
+    finishChatGeneration(chatRequest);
     busy = false;
     syncInteractionState();
   }
@@ -1269,11 +1526,13 @@ function resolveRuntimeService(service, role) {
 
 function readLiveSearchSettings() {
   const f = el.fields || {};
+  const useForm = settingsFormInitialized;
   return {
-    webSearchEnabled: f.webSearchEnabled ? f.webSearchEnabled.checked : Boolean(config.webSearchEnabled),
-    searchProvider: f.searchProvider ? (f.searchProvider.value || "auto") : (config.searchProvider || "auto"),
-    searchApiKey: f.searchApiKey ? f.searchApiKey.value.trim() : (config.searchApiKey || ""),
-    searchBaseUrl: f.searchBaseUrl ? f.searchBaseUrl.value.trim() : (config.searchBaseUrl || ""),
+    toolCallingEnabled: useForm && f.toolCallingEnabled ? f.toolCallingEnabled.checked : config.toolCallingEnabled !== false,
+    webSearchEnabled: useForm && f.webSearchEnabled ? f.webSearchEnabled.checked : config.webSearchEnabled !== false,
+    searchProvider: useForm && f.searchProvider ? (f.searchProvider.value || "auto") : (config.searchProvider || "auto"),
+    searchApiKey: useForm && f.searchApiKey ? f.searchApiKey.value.trim() : (config.searchApiKey || ""),
+    searchBaseUrl: useForm && f.searchBaseUrl ? f.searchBaseUrl.value.trim() : (config.searchBaseUrl || ""),
   };
 }
 
@@ -1314,6 +1573,8 @@ function apiConfigPayload() {
     maxTokens: clampNumber(runtimeConfig.maxTokens, 512, 256, 1024),
     temperature: Number(runtimeConfig.temperature) || 0.7,
     ttsEnabled: Boolean(runtimeConfig.ttsEnabled),
+    toolCallingEnabled: runtimeConfig.toolCallingEnabled !== false,
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Hong_Kong",
     webSearchEnabled: Boolean(liveSearch.webSearchEnabled),
     searchProvider: liveSearch.searchProvider || "auto",
     searchApiKey: liveSearch.searchApiKey || "",
@@ -1419,6 +1680,7 @@ function renderModelManager(kind) {
       ${removable ? `<button class="model-option-remove" type="button" data-remove-model-kind="${kind}" data-model-value="${escapeHtml(modelId)}" aria-label="删除 ${escapeHtml(modelId)}">×</button>` : ""}
     </div>`;
   }).join("");
+  if (kind === "llm") syncLlmCapabilityHint(current);
 }
 
 function closeAllModelMenus(exceptKind = "") {
@@ -1676,11 +1938,14 @@ function fillSettingsForm() {
   f.ttsEnabled.checked = Boolean(config.ttsEnabled);
   f.browserTtsFallback.checked = Boolean(config.browserTtsFallback);
   f.autoSpeak.checked = Boolean(config.autoSpeak);
+  if (f.toolCallingEnabled) f.toolCallingEnabled.checked = config.toolCallingEnabled !== false;
   syncVoiceToggle();
   if (f.webSearchEnabled) f.webSearchEnabled.checked = config.webSearchEnabled !== false;
   if (f.searchProvider) f.searchProvider.value = config.searchProvider || "auto";
   if (f.searchApiKey) f.searchApiKey.value = config.searchApiKey || "";
   if (f.searchBaseUrl) f.searchBaseUrl.value = config.searchBaseUrl || "";
+  syncLlmCapabilityHint(config.llm.model);
+  settingsFormInitialized = true;
 }
 
 function readSettingsForm() {
@@ -1717,6 +1982,7 @@ function readSettingsForm() {
     ttsEnabled: f.ttsEnabled.checked,
     browserTtsFallback: f.browserTtsFallback.checked,
     autoSpeak: f.autoSpeak.checked,
+    toolCallingEnabled: f.toolCallingEnabled ? f.toolCallingEnabled.checked : true,
     webSearchEnabled: f.webSearchEnabled ? f.webSearchEnabled.checked : true,
     searchProvider: f.searchProvider ? (f.searchProvider.value || "auto") : "auto",
     searchApiKey: f.searchApiKey ? f.searchApiKey.value.trim() : "",
@@ -2028,13 +2294,69 @@ async function finishBrowserSpeechAndSend() {
   await sendText(text);
 }
 
+function syncStopControl() {
+  const generatingText = Boolean(activeChatRequest);
+  const showStop = Boolean(generatingText || activeSpeechController) && !callActive;
+  el.btnStop?.classList.toggle("hidden", !showStop);
+  el.btnSend?.classList.toggle("hidden", showStop);
+  if (el.btnStop) {
+    const label = generatingText ? "停止生成" : "停止朗读";
+    el.btnStop.title = label;
+    el.btnStop.setAttribute("aria-label", label);
+  }
+}
+
+function beginChatGeneration(parentSignal = null) {
+  const controller = new AbortController();
+  const request = {
+    controller,
+    parentSignal,
+    userStopped: false,
+    finished: false,
+    abortFromParent: null,
+  };
+  request.abortFromParent = () => {
+    controller.abort();
+    if (activeChatRequest === request) activeChatRequest = null;
+    syncStopControl();
+  };
+  activeChatRequest = request;
+  if (parentSignal?.aborted) request.abortFromParent();
+  else parentSignal?.addEventListener("abort", request.abortFromParent, { once: true });
+  syncStopControl();
+  return request;
+}
+
+function finishChatGeneration(request) {
+  if (!request || request.finished) return;
+  request.finished = true;
+  request.parentSignal?.removeEventListener("abort", request.abortFromParent);
+  if (activeChatRequest === request) activeChatRequest = null;
+  syncStopControl();
+}
+
+function stopActiveTextGeneration() {
+  const request = activeChatRequest;
+  if (!request) return false;
+  request.userStopped = true;
+  request.controller.abort();
+  activeChatRequest = null;
+  syncStopControl();
+  return true;
+}
+
 function stopActiveSpeech() {
+  const hadActiveSpeech = Boolean(activeSpeechController || activeSpeechStop || browserSpeechStop);
+  activeSpeechController?.abort();
+  activeSpeechController = null;
   if (activeSpeechStop) activeSpeechStop();
   activeSpeechStop = null;
   activeSpeechAudio = null;
   if (browserSpeechStop) browserSpeechStop();
   browserSpeechStop = null;
   try { window.speechSynthesis?.cancel(); } catch {}
+  syncStopControl();
+  return hadActiveSpeech;
 }
 
 function browserSpeak(text, { signal = null } = {}) {
@@ -2109,50 +2431,66 @@ function playAudioBlobToEnd(blob, { signal = null } = {}) {
 async function speakText(text, { force = false, signal = null } = {}) {
   if (!force && !config.autoSpeak) return { mode: "off" };
   if (signal?.aborted) return { mode: "stopped" };
-  let onlineError = "";
-  if (config.ttsEnabled) {
-    try {
-      const controller = new AbortController();
-      const ttsTimer = setTimeout(() => controller.abort(), 20000);
-      const abortFromSession = () => controller.abort();
-      signal?.addEventListener("abort", abortFromSession, { once: true });
-      let res;
+  stopActiveSpeech();
+  const speechController = new AbortController();
+  const abortFromCaller = () => speechController.abort();
+  const speechSignal = speechController.signal;
+  activeSpeechController = speechController;
+  signal?.addEventListener("abort", abortFromCaller, { once: true });
+  syncStopControl();
+
+  try {
+    let onlineError = "";
+    if (config.ttsEnabled) {
       try {
-        res = await fetch("/api/tts", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ text, config: apiConfigPayload() }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(ttsTimer);
-        signal?.removeEventListener("abort", abortFromSession);
+        const controller = new AbortController();
+        const ttsTimer = setTimeout(() => controller.abort(), 20000);
+        const abortFromSpeech = () => controller.abort();
+        speechSignal.addEventListener("abort", abortFromSpeech, { once: true });
+        try {
+          const res = await fetch("/api/tts", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ text, config: apiConfigPayload() }),
+            signal: controller.signal,
+          });
+          if (speechSignal.aborted) return { mode: "stopped" };
+          if (res.ok) {
+            const blob = await res.blob();
+            if (speechSignal.aborted) return { mode: "stopped" };
+            await playAudioBlobToEnd(blob, { signal: speechSignal });
+            return { mode: "online" };
+          }
+          const data = await res.json().catch(() => ({}));
+          onlineError = data.error || `HTTP ${res.status}`;
+          console.warn("在线 TTS 失败", { status: res.status, ...data });
+        } finally {
+          clearTimeout(ttsTimer);
+          speechSignal.removeEventListener("abort", abortFromSpeech);
+        }
+      } catch (err) {
+        if (speechSignal.aborted) return { mode: "stopped" };
+        onlineError = err && err.name === "AbortError" ? "TTS 请求超时" : explainFetchError(err);
+        console.warn("在线 TTS 失败", err);
       }
-      if (res.ok) {
-        const blob = await res.blob();
-        await playAudioBlobToEnd(blob, { signal });
-        return { mode: "online" };
-      }
-      const data = await res.json().catch(() => ({}));
-      onlineError = data.error || `HTTP ${res.status}`;
-      console.warn("在线 TTS 失败", { status: res.status, ...data });
-    } catch (err) {
-      if (signal?.aborted) return { mode: "stopped" };
-      onlineError = err && err.name === "AbortError" ? "TTS 请求超时" : explainFetchError(err);
-      console.warn("在线 TTS 失败", err);
     }
+    if (config.browserTtsFallback || force) {
+      const ok = await browserSpeak(text, { signal: speechSignal });
+      if (speechSignal.aborted) return { mode: "stopped" };
+      if (onlineError) return { mode: ok ? "browser" : "browser-failed", error: onlineError };
+      return { mode: ok ? "browser" : "browser-failed" };
+    }
+    if (onlineError) return { mode: "failed", error: onlineError };
+    return { mode: "skipped" };
+  } finally {
+    signal?.removeEventListener("abort", abortFromCaller);
+    if (activeSpeechController === speechController) activeSpeechController = null;
+    syncStopControl();
   }
-  if (config.browserTtsFallback || force) {
-    const ok = await browserSpeak(text, { signal });
-    if (signal?.aborted) return { mode: "stopped" };
-    if (onlineError) return { mode: ok ? "browser" : "browser-failed", error: onlineError };
-    return { mode: ok ? "browser" : "browser-failed" };
-  }
-  if (onlineError) return { mode: "failed", error: onlineError };
-  return { mode: "skipped" };
 }
 
 function readyStatusAfterSpeak(result) {
+  if (result?.mode === "stopped") return "已停止朗读";
   if (result?.mode === "browser" && result.error) return `在线 TTS 失败，已用浏览器朗读：${result.error}`;
   if (result?.mode === "browser-failed" && result.error) return `在线 TTS 失败，浏览器朗读也失败：${result.error}`;
   if (result?.mode === "browser-failed") return "浏览器朗读失败，请检查系统语音设置";
@@ -2162,7 +2500,8 @@ function readyStatusAfterSpeak(result) {
 
 async function sendText(text, options = {}) {
   const content = (text || "").trim();
-  if (!content || busy) return false;
+  const image = options.image || pendingImage;
+  if ((!content && !image?.url) || busy) return false;
   const callMode = options.callMode === true;
   const sessionGeneration = Number(options.callGeneration || 0);
   const sessionSignal = callMode ? callSessionAbort?.signal : null;
@@ -2172,13 +2511,19 @@ async function sendText(text, options = {}) {
     setSettingsStatus("请先填写本地 API Key");
     return false;
   }
+  if (image?.url && !modelSupportsVision()) {
+    setStatus(`${config.llm.model} 不支持视觉输入，请切换到 Qwen/Qwen3.5-4B`);
+    return false;
+  }
 
   busy = true;
   syncInteractionState();
   await ensureConversationReady();
-  messages.push({ role: "user", content });
-  appendMessage("user", content, messages.length - 1);
+  const userContent = buildUserContent(content, image);
+  messages.push({ role: "user", content: userContent });
+  appendMessage("user", userContent, messages.length - 1);
   el.input.value = "";
+  if (image === pendingImage) clearPendingImage();
   await saveHistory();
   setStatus("正在思考…");
 
@@ -2187,22 +2532,27 @@ async function sendText(text, options = {}) {
   messages.push({ role: "assistant", content: "" });
   const row = appendMessage("assistant", "…", assistantIndex);
   let succeeded = false;
+  const chatRequest = beginChatGeneration(sessionSignal);
 
   try {
     if (callMode && callStillActive()) setCallStatus("AI 正在思考…", "thinking");
     const data = await requestChatStreamWithFallback(
       requestMessages,
       row,
-      sessionSignal,
+      chatRequest.controller.signal,
     );
+    finishChatGeneration(chatRequest);
     messages[assistantIndex].content = data.reply;
     await saveHistory();
+    await applyToolActions(data.toolActions || []);
     if (callMode && callStillActive()) setCallTranscript(`AI：${data.reply}`);
     if (!callMode || callStillActive()) {
       if (data.webSearch && data.webSearch.used) {
         const ws = data.webSearch;
         const flag = ws.ok ? `已联网(${ws.provider}, ${ws.count}条)` : `联网无结果(${ws.provider})`;
         setStatus(flag + "，可以继续聊");
+      } else if (data.toolUsage?.length) {
+        setStatus(`已调用工具：${data.toolUsage.join("、")}`);
       } else {
         setStatus("可以继续聊");
       }
@@ -2231,21 +2581,23 @@ async function sendText(text, options = {}) {
       await saveHistory();
       return false;
     }
+    const stoppedByUser = chatRequest.userStopped;
     const partial = String(err.partial || "").trim();
     if (partial) {
       messages[assistantIndex].content = partial;
       setAssistantText(row, partial);
       await saveHistory();
-      setStatus(`生成中断：${explainFetchError(err)}`);
+      setStatus(stoppedByUser ? "已停止生成，已保留当前内容" : `生成中断：${explainFetchError(err)}`);
     } else {
       removeAssistantPlaceholder(row, assistantIndex);
-      setStatus(`发送失败：${explainFetchError(err)}`);
+      setStatus(stoppedByUser ? "已停止生成" : `发送失败：${explainFetchError(err)}`);
     }
     if (callMode && callStillActive()) {
       setCallStatus("回复失败，准备重试聆听", "error");
       setCallTranscript(explainFetchError(err));
     }
   } finally {
+    finishChatGeneration(chatRequest);
     busy = false;
     syncInteractionState();
     if (callMode && callStillActive() && !callMuted) scheduleCallListening(sessionGeneration, 450);
@@ -2930,7 +3282,7 @@ function bindMessageActions() {
       if (!item) return;
 
       if (act === "copy") {
-        await copyMessageText(item.content);
+        await copyMessageText(messageText(item.content));
         actBtn.classList.add("done");
         const label = actBtn.querySelector(".msg-act-label");
         if (label) {
@@ -3085,6 +3437,15 @@ el.btnSend.addEventListener("click", (e) => {
     return;
   }
   sendText(el.input.value);
+});
+
+el.btnStop?.addEventListener("click", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  const stoppedText = stopActiveTextGeneration();
+  const stoppedSpeech = stopActiveSpeech();
+  if (stoppedText) setStatus("正在停止生成…");
+  else if (stoppedSpeech) setStatus("已停止朗读");
 });
 
 el.input.addEventListener("keydown", (e) => {
@@ -3273,13 +3634,37 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest("[data-model-picker]")) closeAllModelMenus();
 });
 
-["webSearchEnabled", "searchProvider", "searchApiKey", "searchBaseUrl"].forEach((key) => {
+["toolCallingEnabled", "webSearchEnabled", "searchProvider", "searchApiKey", "searchBaseUrl"].forEach((key) => {
   const input = el.fields?.[key];
   if (!input) return;
   const eventName = input.tagName === "SELECT" || input.type === "checkbox" ? "change" : "input";
   input.addEventListener(eventName, () => {
-    applyLiveSearchSettings({ persist: key === "webSearchEnabled" || key === "searchProvider", quiet: false });
+    applyLiveSearchSettings({ persist: key === "toolCallingEnabled" || key === "webSearchEnabled" || key === "searchProvider", quiet: false });
   });
+});
+
+el.btnAttach?.addEventListener("click", () => el.imageInput?.click());
+el.btnRemoveImage?.addEventListener("click", clearPendingImage);
+el.imageInput?.addEventListener("change", async () => {
+  const file = el.imageInput.files?.[0];
+  if (!file) return;
+  try {
+    await selectImageFile(file);
+  } catch (err) {
+    clearPendingImage();
+    setStatus(`图片添加失败：${err.message || err}`);
+  }
+});
+el.input?.addEventListener("paste", async (event) => {
+  const file = [...(event.clipboardData?.files || [])].find((item) => String(item.type || "").startsWith("image/"));
+  if (!file) return;
+  event.preventDefault();
+  try {
+    await selectImageFile(file);
+  } catch (err) {
+    clearPendingImage();
+    setStatus(`图片粘贴失败：${err.message || err}`);
+  }
 });
 
 el.btnSaveSettings.addEventListener("click", async () => {
@@ -3346,6 +3731,7 @@ el.btnReset.addEventListener("click", () => {
     ttsEnabled: serverDefaults?.ttsEnabled ?? DEFAULTS.ttsEnabled,
     browserTtsFallback: serverDefaults?.browserTtsFallback ?? DEFAULTS.browserTtsFallback,
     autoSpeak: DEFAULTS.autoSpeak,
+    toolCallingEnabled: serverDefaults?.toolCallingEnabled ?? DEFAULTS.toolCallingEnabled,
     webSearchEnabled: serverDefaults?.webSearchEnabled ?? DEFAULTS.webSearchEnabled,
     searchProvider: serverDefaults?.searchProvider || DEFAULTS.searchProvider,
   });
@@ -3541,6 +3927,7 @@ async function boot() {
   try {
     await migrateLegacyDatabaseIfNeeded();
     await loadConfigFromStore();
+    fillSettingsForm();
     await initConversationStore();
   } catch (err) {
     console.error(err);
@@ -3550,6 +3937,9 @@ async function boot() {
   syncInteractionState();
   renderChat();
   await initDefaults();
+  fillSettingsForm();
   syncVoiceToggle();
+  checkDueReminders();
+  setInterval(checkDueReminders, 15000);
 }
 boot();

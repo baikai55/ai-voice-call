@@ -5,7 +5,7 @@
  * - Never log API keys
  */
 
-import { formatSearchContext, isExplicitSearchRequest, runWebSearch, shouldAutoSearch } from "./search";
+import { extractWeatherLocation, formatSearchContext, isExplicitSearchRequest, isRealtimeQuery, isWeatherQuery, runWebSearch, shouldAutoSearch } from "./search";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -27,11 +27,24 @@ export interface Env {
   SEARCH_BASE_URL?: string;
 }
 
-type Role = "system" | "user" | "assistant";
+type Role = "system" | "user" | "assistant" | "tool";
+
+type ChatContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string; detail?: "low" | "high" | "auto" } };
+
+interface FunctionToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
 
 interface ChatMessage {
   role: Role;
-  content: string;
+  content: string | ChatContentPart[];
+  tool_calls?: FunctionToolCall[];
+  tool_call_id?: string;
+  name?: string;
 }
 
 interface ClientProviderConfig {
@@ -53,6 +66,8 @@ interface ClientConfig {
   maxTokens?: number;
   temperature?: number;
   ttsEnabled?: boolean;
+  toolCallingEnabled?: boolean;
+  timeZone?: string;
   webSearchEnabled?: boolean;
   searchProvider?: string; // auto | bing-rss | duckduckgo | searxng | tavily | serper
   searchApiKey?: string;
@@ -180,15 +195,25 @@ async function fetchLlmEndpointWithTransientRetry(
   endpointPath: string,
   payload: Record<string, unknown>,
   diag: ReturnType<typeof publicLlmConfig>,
+  timeoutMs = 0,
 ): Promise<{ res: Response; errText: string }> {
-  const doFetch = () => fetch(endpointUrl, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
+  const doFetch = async () => {
+    const controller = timeoutMs > 0 ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+      return await fetch(endpointUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
 
   let res = await doFetch();
   if (res.ok) return { res, errText: "" };
@@ -220,8 +245,9 @@ function ensureV1(baseUrl: string): string {
 
 function sanitizeMessages(messages: ChatMessage[], systemPrompt: string, maxTurns: number): ChatMessage[] {
   const cleaned = (messages || [])
-    .filter((m) => m && (m.role === "user" || m.role === "assistant" || m.role === "system") && typeof m.content === "string")
-    .map((m) => ({ role: m.role, content: String(m.content).slice(0, 4000) }));
+    .filter((m) => m && (m.role === "user" || m.role === "assistant" || m.role === "system"))
+    .map((m) => ({ role: m.role, content: sanitizeMessageContent(m.content) }))
+    .filter((m) => typeof m.content === "string" ? Boolean(m.content.trim()) : m.content.length > 0);
 
   const withoutSystem = cleaned.filter((m) => m.role !== "system");
   const keep = Math.max(2, maxTurns * 2);
@@ -274,6 +300,7 @@ function publicConfig(env: Env) {
       ttsEnabled: asBool(env.TTS_ENABLED, true),
       browserTtsFallback: asBool(env.BROWSER_TTS_FALLBACK, true),
       autoSpeak: true,
+      toolCallingEnabled: true,
       webSearchEnabled: asBool(env.WEB_SEARCH_ENABLED, true),
       systemPromptPreset: "general",
       searchProvider: env.SEARCH_PROVIDER || "auto",
@@ -327,6 +354,8 @@ function resolveProviders(env: Env, config?: ClientConfig) {
     maxTokens: asNumber(config?.maxTokens ?? env.LLM_MAX_TOKENS, 512),
     temperature: asNumber(config?.temperature ?? env.LLM_TEMPERATURE, 0.7),
     ttsEnabled: config?.ttsEnabled ?? asBool(env.TTS_ENABLED, true),
+    toolCallingEnabled: config?.toolCallingEnabled !== false,
+    timeZone: (config?.timeZone || "Asia/Hong_Kong").trim(),
     webSearchEnabled: config?.webSearchEnabled ?? asBool(env.WEB_SEARCH_ENABLED, true),
     searchProvider: (config?.searchProvider || env.SEARCH_PROVIDER || "auto").trim(),
     searchApiKey: (config?.searchApiKey || "").trim(),
@@ -357,6 +386,49 @@ function extractTextContent(content: unknown): string {
     if (typeof obj.content === "string") return obj.content.trim();
   }
   return "";
+}
+
+function sanitizeMessageContent(content: unknown): string | ChatContentPart[] {
+  if (typeof content === "string") return content.slice(0, 4000);
+  if (!Array.isArray(content)) return "";
+  const parts: ChatContentPart[] = [];
+  for (const raw of content.slice(0, 8)) {
+    if (!raw || typeof raw !== "object") continue;
+    const part = raw as Record<string, any>;
+    if (part.type === "text" && typeof part.text === "string") {
+      parts.push({ type: "text", text: part.text.slice(0, 4000) });
+      continue;
+    }
+    const imageUrl = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+    if (part.type === "image_url" && typeof imageUrl === "string" && /^data:image\/(?:jpeg|png|webp|gif);base64,/i.test(imageUrl) && imageUrl.length <= 6 * 1024 * 1024) {
+      parts.push({ type: "image_url", image_url: { url: imageUrl, detail: "low" } });
+    }
+  }
+  return parts;
+}
+
+function messageHasImage(content: unknown): boolean {
+  return Array.isArray(content) && content.some((raw) => {
+    if (!raw || typeof raw !== "object") return false;
+    const part = raw as Record<string, any>;
+    return part.type === "image_url" && (typeof part.image_url === "string" || typeof part.image_url?.url === "string");
+  });
+}
+
+function messagesHaveVision(messages: ChatMessage[]): boolean {
+  return (Array.isArray(messages) ? messages : []).some((message) => message?.role === "user" && messageHasImage(message.content));
+}
+
+function appendVisionQueryAnchor(messages: ChatMessage[]): ChatMessage[] {
+  const list = Array.isArray(messages) ? messages : [];
+  const lastVisionUser = [...list].reverse().find((message) => message?.role === "user" && messageHasImage(message.content));
+  if (!lastVisionUser) return list;
+  const query = extractTextContent(lastVisionUser.content) || "请分析上一条消息中的图片。";
+  return [...list, { role: "user", content: query }];
+}
+
+function isNoUserQueryError(message: unknown): boolean {
+  return /no user query found in messages/i.test(String(message || ""));
 }
 
 function stripThinking(text: string): string {
@@ -437,9 +509,9 @@ function cleanAssistantReply(text: string, messages: ChatMessage[] = []): string
   if (!original) return "";
   let cleaned = original;
   const systemPrompts = messages
-    .filter((message) => message?.role === "system" && typeof message.content === "string")
+    .filter((message) => message?.role === "system")
     .flatMap((message) => {
-      const prompt = message.content.trim();
+      const prompt = extractTextContent(message.content);
       const basePrompt = prompt.replace(REPLY_ONLY_INSTRUCTION, "").trim();
       return [prompt, basePrompt];
     })
@@ -448,7 +520,7 @@ function cleanAssistantReply(text: string, messages: ChatMessage[] = []): string
   for (const prompt of new Set(systemPrompts)) cleaned = cleaned.split(prompt).join("\n");
 
   const lastUser = [...messages].reverse().find((message) => message?.role === "user");
-  const userText = String(lastUser?.content || "").trim();
+  const userText = extractTextContent(lastUser?.content);
   if (userText) {
     for (const marker of [
       `用户说：“${userText}”`,
@@ -483,8 +555,8 @@ function preferredLlmKind(apiType = "auto"): LlmKind {
   return normalizeApiType(apiType, "auto") === "openai-responses" ? "responses" : "chat";
 }
 
-function llmKinds(apiType = "auto"): LlmKind[] {
-  return [preferredLlmKind(apiType)];
+function llmKinds(apiType = "auto", messages: ChatMessage[] = []): LlmKind[] {
+  return [messagesHaveVision(messages) ? "chat" : preferredLlmKind(apiType)];
 }
 
 function shouldFallbackToResponses(apiType: string | undefined, status: number): boolean {
@@ -495,7 +567,7 @@ function splitSystemMessages(messages: ChatMessage[]): { instructions: string; i
   const list = Array.isArray(messages) ? messages : [];
   const instructions = list
     .filter((m) => m.role === "system")
-    .map((m) => m.content)
+    .map((m) => extractTextContent(m.content))
     .join("\n\n")
     .trim();
   const input = list
@@ -553,10 +625,12 @@ function payloadVariants(
     buildChatPayload(model, messages, safeMaxTokens, temperature, stream, {
       // SiliconFlow / Qwen3 knobs (ignored by gateways that don't support them)
       enable_thinking: false,
-      thinking_budget: 0,
       chat_template_kwargs: { enable_thinking: false },
     }),
     buildChatPayload(model, messages, safeMaxTokens, temperature, stream),
+    ...(messagesHaveVision(messages)
+      ? [buildChatPayload(model, appendVisionQueryAnchor(messages), safeMaxTokens, temperature, stream)]
+      : []),
   ];
 }
 
@@ -617,7 +691,7 @@ async function chatCompletions(
   console.log("[llm] config", diag);
   let lastErr = "LLM failed";
 
-  for (const kind of llmKinds(apiType)) {
+  for (const kind of llmKinds(apiType, messages)) {
     let fallbackToNextKind = false;
     const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, false);
     for (let i = 0; i < variants.length; i++) {
@@ -629,7 +703,7 @@ async function chatCompletions(
         lastErr = formatLlmFailure(res.status, first.errText);
         console.log("[llm] fail", kind, res.status, lastErr);
         if (kind === "chat" && shouldFallbackToResponses(apiType, res.status)) { fallbackToNextKind = true; break; }
-        if (res.status === 400 && i < variants.length - 1) continue;
+        if (i < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
         throw new Error(lastErr);
       }
 
@@ -651,6 +725,258 @@ async function chatCompletions(
     break;
   }
   throw new Error(lastErr);
+}
+
+const FUNCTION_TOOLS: Array<Record<string, unknown>> = [
+  {
+    type: "function",
+    function: {
+      name: "web_search",
+      description: "搜索互联网中的最新信息。适合新闻、价格、政策、比赛、交通、产品资料等需要实时或可核实来源的问题。",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string", description: "简洁、完整的搜索关键词" } },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_weather",
+      description: "查询某个城市或地区的当前天气与短期预报。",
+      parameters: {
+        type: "object",
+        properties: {
+          location: { type: "string", description: "城市或地区，例如香港、深圳、北京市朝阳区" },
+          date: { type: "string", description: "可选，今天、明天、后天或具体日期" },
+        },
+        required: ["location"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description: "查询当前日期、时间、星期和时区。",
+      parameters: {
+        type: "object",
+        properties: { time_zone: { type: "string", description: "IANA 时区，例如 Asia/Hong_Kong、Asia/Shanghai；不填则使用用户时区" } },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "calculate",
+      description: "执行精确的基础数学计算，支持 + - * / % ^ 和括号。",
+      parameters: {
+        type: "object",
+        properties: { expression: { type: "string", description: "只包含数字、运算符和括号的表达式，例如 (128+32)*0.85" } },
+        required: ["expression"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_reminder",
+      description: "创建保存在用户浏览器本地的提醒。相对时间优先传 delay_minutes；绝对时间传带时区的 ISO 8601 due_at。",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "提醒内容" },
+          delay_minutes: { type: "number", description: "从现在起多少分钟后提醒" },
+          due_at: { type: "string", description: "带时区的 ISO 8601 时间，例如 2026-07-26T09:00:00+08:00" },
+        },
+        required: ["title"],
+      },
+    },
+  },
+];
+
+const TOOL_LABELS: Record<string, string> = {
+  web_search: "联网搜索",
+  get_weather: "天气",
+  get_current_time: "时间",
+  calculate: "计算器",
+  create_reminder: "提醒",
+};
+
+function shouldUseFunctionTools(text: string): boolean {
+  const value = String(text || "").replace(/\s+/g, " ").trim();
+  if (!value) return false;
+  if (/提醒|闹钟|到时叫我|记得叫我|分钟后|小时后/.test(value)) return true;
+  if (/几点|现在时间|当前时间|日期|几号|星期几|今天星期/.test(value)) return true;
+  if (/计算|算一下|等于多少|[0-9][0-9\s.+\-*/%^()]{2,}/.test(value)) return true;
+  return false;
+}
+
+function parseToolArguments(raw: unknown): Record<string, any> {
+  if (raw && typeof raw === "object") return raw as Record<string, any>;
+  const text = String(raw || "").trim();
+  if (!text) return {};
+  try { return JSON.parse(text) as Record<string, any>; } catch { return {}; }
+}
+
+function normalizeToolCalls(message: any): FunctionToolCall[] {
+  const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+  return calls.slice(0, 8).map((call: any, index: number) => ({
+    id: String(call?.id || `call_${Date.now()}_${index}`),
+    type: "function" as const,
+    function: {
+      name: String(call?.function?.name || "").trim(),
+      arguments: typeof call?.function?.arguments === "string" ? call.function.arguments : JSON.stringify(call?.function?.arguments || {}),
+    },
+  })).filter((call: FunctionToolCall) => call.function.name);
+}
+
+function safeCalculateExpression(expression: unknown): { expression: string; result: number } {
+  const value = String(expression || "").trim().slice(0, 200);
+  if (!value || !/^[0-9+\-*/%^().\s]+$/.test(value)) throw new Error("表达式只能包含数字、基础运算符和括号");
+  const normalized = value.replace(/\^/g, "**");
+  const result = Function(`"use strict"; return (${normalized});`)();
+  if (typeof result !== "number" || !Number.isFinite(result)) throw new Error("计算结果不是有限数字");
+  return { expression: value, result };
+}
+
+function normalizeTimeZone(value: unknown, fallback = "Asia/Hong_Kong"): string {
+  const candidate = String(value || fallback || "Asia/Hong_Kong").trim();
+  try {
+    new Intl.DateTimeFormat("zh-CN", { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch {
+    return fallback || "Asia/Hong_Kong";
+  }
+}
+
+function currentTimeResult(timeZone: unknown): { iso: string; timeZone: string; local: string } {
+  const zone = normalizeTimeZone(timeZone);
+  const now = new Date();
+  return {
+    iso: now.toISOString(),
+    timeZone: zone,
+    local: new Intl.DateTimeFormat("zh-CN", { timeZone: zone, dateStyle: "full", timeStyle: "long", hour12: false }).format(now),
+  };
+}
+
+type ToolExecution = {
+  content: Record<string, unknown>;
+  webSearch?: Record<string, unknown>;
+  action?: Record<string, unknown>;
+};
+
+async function executeFunctionTool(cfg: ReturnType<typeof resolveProviders>, call: FunctionToolCall): Promise<ToolExecution> {
+  const name = call.function.name;
+  const args = parseToolArguments(call.function.arguments);
+  if (name === "web_search") {
+    if (!cfg.webSearchEnabled) return { content: { ok: false, error: "用户已关闭联网搜索" } };
+    const query = String(args.query || "").trim().slice(0, 160);
+    const search = await runWebSearch({ query, provider: cfg.searchProvider, apiKey: cfg.searchApiKey, baseUrl: cfg.searchBaseUrl });
+    return {
+      content: { ok: search.ok, provider: search.provider, query: search.query, items: search.items.slice(0, 6), error: search.error || "" },
+      webSearch: { used: true, explicit: true, provider: search.provider, ok: search.ok, count: search.items.length, error: search.error || "", titles: search.items.slice(0, 3).map((item) => item.title) },
+    };
+  }
+  if (name === "get_weather") {
+    if (!cfg.webSearchEnabled) return { content: { ok: false, error: "用户已关闭联网搜索" } };
+    const location = String(args.location || "").trim().slice(0, 80);
+    const date = String(args.date || "").trim().slice(0, 40);
+    const search = await runWebSearch({ query: `${location} ${date} 天气`.trim(), provider: "weather", apiKey: cfg.searchApiKey, baseUrl: cfg.searchBaseUrl });
+    return {
+      content: { ok: search.ok, location, date, items: search.items.slice(0, 4), error: search.error || "" },
+      webSearch: { used: true, explicit: true, provider: search.provider, ok: search.ok, count: search.items.length, error: search.error || "", titles: search.items.slice(0, 3).map((item) => item.title) },
+    };
+  }
+  if (name === "get_current_time") return { content: { ok: true, ...currentTimeResult(args.time_zone || cfg.timeZone) } };
+  if (name === "calculate") return { content: { ok: true, ...safeCalculateExpression(args.expression) } };
+  if (name === "create_reminder") {
+    const title = String(args.title || "提醒").trim().slice(0, 200) || "提醒";
+    const delayMinutes = Number(args.delay_minutes);
+    let dueAt = "";
+    if (Number.isFinite(delayMinutes) && delayMinutes >= 0) dueAt = new Date(Date.now() + Math.min(delayMinutes, 525600) * 60000).toISOString();
+    else if (args.due_at) {
+      const parsed = new Date(String(args.due_at));
+      if (Number.isFinite(parsed.getTime())) dueAt = parsed.toISOString();
+    }
+    if (!dueAt) return { content: { ok: false, error: "缺少有效的 delay_minutes 或 due_at" } };
+    const action = { type: "create_reminder", id: `reminder_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, title, dueAt };
+    return { content: { ok: true, title, dueAt, storage: "browser-local" }, action };
+  }
+  return { content: { ok: false, error: `未知工具: ${name}` } };
+}
+
+async function fetchChatToolStep(
+  cfg: ReturnType<typeof resolveProviders>,
+  messages: ChatMessage[],
+): Promise<{ message: any; text: string; toolCalls: FunctionToolCall[] }> {
+  const safeMaxTokens = Math.max(cfg.maxTokens || 0, 512);
+  const diag = publicLlmConfig(cfg.llm.baseUrl, cfg.llm.model, cfg.llm.apiType, cfg.llm.apiKey, cfg.llm.endpoint);
+  const variants = payloadVariants("chat", cfg.llm.model, messages, safeMaxTokens, cfg.temperature, false)
+    .map((payload) => ({ ...payload, tools: FUNCTION_TOOLS, tool_choice: "auto" }));
+  let lastErr = "LLM tool call failed";
+  for (let index = 0; index < variants.length; index++) {
+    const first = await fetchLlmEndpointWithTransientRetry(
+      llmEndpoint(cfg.llm.baseUrl, cfg.llm.apiType, cfg.llm.endpoint, "chat"),
+      cfg.llm.apiKey,
+      "chat/completions",
+      variants[index],
+      diag,
+      15000,
+    );
+    if (!first.res.ok) {
+      lastErr = formatLlmFailure(first.res.status, first.errText);
+      if (index < variants.length - 1 && (first.res.status === 400 || isNoUserQueryError(lastErr))) continue;
+      throw new Error(lastErr);
+    }
+    const data = await first.res.json() as any;
+    const message = data?.choices?.[0]?.message || {};
+    return { message, text: extractTextContent(message.content), toolCalls: normalizeToolCalls(message) };
+  }
+  throw new Error(lastErr);
+}
+
+async function chatCompletionsWithTools(
+  cfg: ReturnType<typeof resolveProviders>,
+  messages: ChatMessage[],
+): Promise<{ reply: string; toolActions: Record<string, unknown>[]; toolUsage: string[]; webSearch: Record<string, unknown> | null }> {
+  const working: ChatMessage[] = [...messages];
+  const toolActions: Record<string, unknown>[] = [];
+  const toolUsage: string[] = [];
+  let webSearch: Record<string, unknown> | null = null;
+  for (let round = 0; round < 4; round++) {
+    const step = await fetchChatToolStep(cfg, working);
+    if (!step.toolCalls.length) {
+      const reply = cleanAssistantReply(step.text, messages);
+      if (!reply) throw new Error("模型完成工具调用后没有返回文字");
+      return { reply, toolActions, toolUsage, webSearch };
+    }
+    working.push({ role: "assistant", content: step.message.content || "", tool_calls: step.toolCalls });
+    for (const call of step.toolCalls) {
+      let result: ToolExecution;
+      try {
+        result = await executeFunctionTool(cfg, call);
+      } catch (err: any) {
+        result = { content: { ok: false, error: String(err?.message || err) } };
+      }
+      toolUsage.push(TOOL_LABELS[call.function.name] || call.function.name);
+      if (result.action) toolActions.push(result.action);
+      if (result.webSearch) webSearch = result.webSearch;
+      working.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result.content) });
+    }
+  }
+  const reply = await chatCompletions(
+    cfg.llm.baseUrl,
+    cfg.llm.apiKey,
+    cfg.llm.model,
+    working,
+    cfg.maxTokens,
+    cfg.temperature,
+    cfg.llm.apiType,
+    cfg.llm.endpoint,
+  );
+  return { reply, toolActions, toolUsage, webSearch };
 }
 
 function extractStreamDelta(data: any, kind: LlmKind, eventName = ""): string {
@@ -683,6 +1009,29 @@ function parseSseBlock(block: string): { eventName: string; dataText: string } {
     else if (line.trimStart().startsWith("{")) dataLines.push(line.trim());
   }
   return { eventName, dataText: dataLines.join("\n").trim() };
+}
+
+function readStreamChunkWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("LLM stream timeout waiting for output")), timeoutMs);
+    reader.read().then(
+      (result) => { clearTimeout(timer); resolve(result); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+async function fetchLlmStreamOnce(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function readLlmStreamResponse(res: Response, kind: LlmKind, onDelta: (text: string) => void): Promise<string> {
@@ -719,7 +1068,7 @@ async function readLlmStreamResponse(res: Response, kind: LlmKind, onDelta: (tex
     }
   };
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readStreamChunkWithTimeout(reader, reply ? 20000 : 15000);
     if (done) break;
     const chunk = decoder.decode(value, { stream: true });
     raw = (raw + chunk).slice(-1024 * 1024);
@@ -759,35 +1108,35 @@ async function streamChatCompletions(
   console.log("[llm] config", diag);
   let lastErr = "LLM failed";
 
-  for (const kind of llmKinds(apiType)) {
+  for (const kind of llmKinds(apiType, messages)) {
     let fallbackToNextKind = false;
     const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, true);
     for (let i = 0; i < variants.length; i++) {
       const payload = variants[i];
       const endpointUrl = llmEndpoint(baseUrl, apiType, endpoint, kind);
       console.log("[llm] stream", kind, model, "tokens=", safeMaxTokens);
-      let res = await fetch(endpointUrl, {
+      let res = await fetchLlmStreamOnce(endpointUrl, {
         method: "POST",
         headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
         body: JSON.stringify(payload),
-      });
+      }, 15000);
       if (!res.ok) {
         let errText = await readError(res);
         if (isTransientAuthError(res.status, errText)) {
           console.log("[llm] transient stream auth error, retry once", { status: res.status, endpointPath: endpointPath(kind), ...diag });
           await sleep(800);
-          res = await fetch(endpointUrl, {
+          res = await fetchLlmStreamOnce(endpointUrl, {
             method: "POST",
             headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
             body: JSON.stringify(payload),
-          });
+          }, 15000);
           if (!res.ok) errText = await readError(res);
         }
         if (!res.ok) {
           lastErr = formatLlmFailure(res.status, errText);
           console.log("[llm] stream fail", kind, res.status, lastErr);
           if (kind === "chat" && shouldFallbackToResponses(apiType, res.status)) { fallbackToNextKind = true; break; }
-          if (res.status === 400 && i < variants.length - 1) continue;
+          if (i < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
           throw new Error(lastErr);
         }
       }
@@ -1030,6 +1379,68 @@ function directSearchReply(search: any): string {
   return "";
 }
 
+function extractWeatherTiming(query: string): string {
+  return String(query || "").match(/后天|明天|今天|今日/)?.[0] || "";
+}
+
+function isLikelyWeatherFollowupLocation(rawText: string, location: string): boolean {
+  const raw = String(rawText || "").replace(/\s+/g, " ").trim();
+  const value = String(location || "").trim();
+  if (!raw || raw.length > 30 || value.length < 2) return false;
+  if (/^(这里|那里|这边|那边|本地|附近|谢谢|多谢|好的|好啦|知道了|明白了|不用了|不用|算了|可以|行吧|行了|为什么|怎么了|是吗|真的|没事|没问题)$/.test(value)) return false;
+  return true;
+}
+
+function contextualSearchIntent(messages: ChatMessage[]): string {
+  const userTexts = (Array.isArray(messages) ? messages : [])
+    .filter((message) => message?.role === "user")
+    .map((message) => extractTextContent(message.content))
+    .filter(Boolean);
+  const current = userTexts.at(-1) || "";
+  if (!current) return "";
+  const previousTexts = userTexts.slice(0, -1);
+  let weatherAnchorIndex = -1;
+  for (let index = previousTexts.length - 1; index >= 0; index -= 1) {
+    if (isWeatherQuery(previousTexts[index])) {
+      weatherAnchorIndex = index;
+      break;
+    }
+  }
+  if (weatherAnchorIndex < 0) return current;
+
+  const currentLocation = extractWeatherLocation(current);
+  const currentTiming = extractWeatherTiming(current);
+  const weatherAnchor = previousTexts[weatherAnchorIndex];
+  let previousTiming = extractWeatherTiming(weatherAnchor);
+  let previousLocation = extractWeatherLocation(weatherAnchor);
+  for (const followup of previousTexts.slice(weatherAnchorIndex + 1)) {
+    const followupLocation = extractWeatherLocation(followup);
+    const followupTiming = extractWeatherTiming(followup);
+    if (isLikelyWeatherFollowupLocation(followup, followupLocation)) {
+      previousLocation = followupLocation;
+      if (followupTiming) previousTiming = followupTiming;
+      continue;
+    }
+    if (followupTiming) {
+      previousTiming = followupTiming;
+      continue;
+    }
+    return current;
+  }
+
+  if (isWeatherQuery(current)) {
+    if (!currentLocation && previousLocation) return `${previousLocation} ${currentTiming || previousTiming} 天气`.replace(/\s+/g, " ").trim();
+    return current;
+  }
+  if (isLikelyWeatherFollowupLocation(current, currentLocation)) {
+    return `${currentLocation} ${currentTiming || previousTiming} 天气`.replace(/\s+/g, " ").trim();
+  }
+  if (currentTiming) {
+    return `${previousLocation ? `${previousLocation} ` : ""}${currentTiming} 天气`.replace(/\s+/g, " ").trim();
+  }
+  return current;
+}
+
 function looksLikeNoWebReply(text: string): boolean {
   const s = String(text || "").replace(/\s+/g, " ").trim();
   if (!s) return false;
@@ -1084,8 +1495,10 @@ type PreparedChat = {
   cfg: ReturnType<typeof resolveProviders>;
   messages: ChatMessage[];
   userText: string;
+  intentText: string;
   explicitSearch: boolean;
   useResponsesTools: boolean;
+  useFunctionTools: boolean;
   finalMessages: ChatMessage[];
   webSearch: Record<string, unknown> | null;
   directReply: string;
@@ -1100,39 +1513,77 @@ async function prepareChat(body: ChatRequestBody, env: Env): Promise<PreparedCha
   let messages = Array.isArray(body.messages) ? body.messages : [];
   const single = (body.message || "").trim();
   if (single) messages = [...messages, { role: "user", content: single }];
-  if (!messages.some((m) => m.role === "user" && m.content.trim())) return badRequest("请输入消息");
+  if (!messages.some((m) => m.role === "user" && extractTextContent(m.content))) return badRequest("请输入消息");
 
-  const lastUser = [...messages].reverse().find((m) => m.role === "user" && m.content.trim());
-  const userText = (lastUser?.content || "").trim();
+  const lastUser = [...messages].reverse().find((m) => m.role === "user" && extractTextContent(m.content));
+  const userText = extractTextContent(lastUser?.content);
+  const intentText = contextualSearchIntent(messages);
 
   let systemPrompt = cfg.systemPrompt;
   let directReply = "";
-  const explicitSearch = isExplicitSearchRequest(userText);
-  const useResponsesTools = preferredLlmKind(cfg.llm.apiType) === "responses";
+  const explicitSearch = isExplicitSearchRequest(intentText) || isExplicitSearchRequest(userText);
+  const weatherIntent = isWeatherQuery(intentText);
+  const realtimeIntent = isRealtimeQuery(intentText);
+  const autoSearchIntent = shouldAutoSearch(intentText);
+  const serverSearchIntent = realtimeIntent || explicitSearch || (Boolean(cfg.webSearchEnabled) && autoSearchIntent);
+  const hasVision = messagesHaveVision(messages);
+  const useResponsesTools = !hasVision && !serverSearchIntent && preferredLlmKind(cfg.llm.apiType) === "responses";
+  const useFunctionTools = !serverSearchIntent && cfg.toolCallingEnabled && preferredLlmKind(cfg.llm.apiType) === "chat" && shouldUseFunctionTools(intentText);
+  if (useFunctionTools) {
+    const now = currentTimeResult(cfg.timeZone);
+    systemPrompt = `${systemPrompt}\n\n当前用户时区：${now.timeZone}。当前日期时间：${now.local}（${now.iso}）。需要计算、时间或提醒时，请优先调用提供的函数工具，不要假装已经执行工具。`;
+  }
   let webSearch: Record<string, unknown> | null = useResponsesTools
     ? { used: true, explicit: explicitSearch, provider: "responses-tools", ok: true, count: 0, error: "", titles: [] }
     : null;
-  const wantSearch = !useResponsesTools && shouldAutoSearch(userText) && (Boolean(cfg.webSearchEnabled) || explicitSearch);
+  const weatherLocation = weatherIntent ? extractWeatherLocation(intentText) : "";
+  if (weatherIntent && !weatherLocation) {
+    directReply = cfg.webSearchEnabled
+      ? "你想查哪个城市的天气？请告诉我城市，例如“杭州天气”。"
+      : "你想查哪个城市的天气？另外，“启用联网搜索”当前已关闭；打开后我才能查询实时天气，我不会猜温度或降雨概率。";
+    webSearch = { used: false, explicit: explicitSearch, provider: "weather", ok: false, count: 0, error: "missing location", titles: [] };
+  } else if ((realtimeIntent || explicitSearch) && !cfg.webSearchEnabled) {
+    directReply = weatherIntent
+      ? "联网搜索当前已关闭，我不能可靠查询实时天气，也不会猜温度或降雨概率。请先打开“启用联网搜索”。"
+      : "联网搜索当前已关闭，我不能可靠查询实时数据，也不会凭空编造。请先打开“启用联网搜索”。";
+    webSearch = { used: false, explicit: explicitSearch, provider: "disabled", ok: false, count: 0, error: "web search disabled", titles: [] };
+  }
+  const wantSearch = !directReply && !useResponsesTools && !useFunctionTools && Boolean(cfg.webSearchEnabled) && (realtimeIntent || explicitSearch || autoSearchIntent);
 
   if (wantSearch) {
-    const search = await runWebSearch({
-      query: userText,
-      provider: cfg.searchProvider,
-      apiKey: cfg.searchApiKey,
-      baseUrl: cfg.searchBaseUrl,
-    });
-    webSearch = {
-      used: true,
-      explicit: explicitSearch,
-      provider: search.provider,
-      ok: search.ok,
-      count: search.items.length,
-      error: search.error || "",
-      titles: search.items.slice(0, 3).map((x: { title: string }) => x.title),
-    };
-    directReply = directSearchReply(search);
-    if (!directReply) {
-      systemPrompt = `${cfg.systemPrompt}\n\n${formatSearchContext(search)}\n\n重要：上面就是服务端已经获取到的联网结果。不能再说“我不能联网”“无法直接联网”“联网搜索没开放”。`;
+    try {
+      const search = await runWebSearch({
+        query: intentText,
+        provider: weatherIntent ? "weather" : cfg.searchProvider,
+        apiKey: cfg.searchApiKey,
+        baseUrl: cfg.searchBaseUrl,
+      });
+      webSearch = {
+        used: true,
+        explicit: explicitSearch,
+        provider: search.provider,
+        ok: search.ok,
+        count: search.items.length,
+        error: search.error || "",
+        titles: search.items.slice(0, 3).map((x: { title: string }) => x.title),
+      };
+      directReply = directSearchReply(search);
+      if (!directReply && !search.ok && (realtimeIntent || explicitSearch)) {
+        directReply = weatherIntent
+          ? `我暂时没查到${weatherLocation || "该城市"}的可靠实时天气，不能给你编温度或降雨概率。请稍后重试。`
+          : "我暂时没查到可靠的实时信息，不会凭空编造数据。请稍后重试。";
+      } else if (!directReply) {
+        systemPrompt = `${cfg.systemPrompt}\n\n${formatSearchContext(search)}\n\n重要：上面就是服务端已经获取到的联网结果。不能再说“我不能联网”“无法直接联网”“联网搜索没开放”，也不能补充搜索结果里没有的实时数字。`;
+      }
+    } catch (err: any) {
+      webSearch = { used: true, explicit: explicitSearch, provider: "timeout", ok: false, count: 0, error: String(err?.message || err), titles: [] };
+      if (realtimeIntent || explicitSearch) {
+        directReply = weatherIntent
+          ? `我暂时没查到${weatherLocation || "该城市"}的可靠实时天气，不能给你编温度或降雨概率。请稍后重试。`
+          : "我暂时没查到可靠的实时信息，不会凭空编造数据。请稍后重试。";
+      } else {
+        systemPrompt = `${cfg.systemPrompt}\n\n【联网搜索】暂时不可用。请简要回答并明确说明无法核实；不要编造实时数据。`;
+      }
     }
   }
 
@@ -1140,8 +1591,10 @@ async function prepareChat(body: ChatRequestBody, env: Env): Promise<PreparedCha
     cfg,
     messages,
     userText,
+    intentText,
     explicitSearch,
     useResponsesTools,
+    useFunctionTools,
     finalMessages: sanitizeMessages(messages, systemPrompt, cfg.maxHistoryTurns),
     webSearch,
     directReply,
@@ -1161,6 +1614,10 @@ async function handleChat(req: Request, env: Env): Promise<Response> {
   if (prepared.directReply) {
     return json({ ok: true, reply: prepared.directReply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: prepared.webSearch });
   }
+  if (prepared.useFunctionTools) {
+    const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages);
+    return json({ ok: true, reply: result.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: result.webSearch, toolActions: result.toolActions, toolUsage: result.toolUsage });
+  }
   const reply = await chatCompletions(
     prepared.cfg.llm.baseUrl,
     prepared.cfg.llm.apiKey,
@@ -1171,8 +1628,8 @@ async function handleChat(req: Request, env: Env): Promise<Response> {
     prepared.cfg.llm.apiType,
     prepared.cfg.llm.endpoint,
   );
-  if (prepared.useResponsesTools && shouldAutoSearch(prepared.userText) && looksLikeNoWebReply(reply)) {
-    const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.userText, prepared.explicitSearch);
+  if (prepared.useResponsesTools && shouldAutoSearch(prepared.intentText) && looksLikeNoWebReply(reply)) {
+    const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch);
     return json({ ok: true, reply: fallback.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: fallback.webSearch });
   }
 
@@ -1198,11 +1655,21 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
     async start(controller) {
       let reply = "";
       let doneWebSearch = prepared.webSearch;
+      let doneToolActions: Record<string, unknown>[] = [];
+      let doneToolUsage: string[] = [];
       try {
+        controller.enqueue(encodeSse("ready", { ok: true }));
         if (prepared.directReply) {
           reply = prepared.directReply;
           controller.enqueue(encodeSse("delta", { text: reply }));
-        } else if (prepared.useResponsesTools && shouldAutoSearch(prepared.userText)) {
+        } else if (prepared.useFunctionTools) {
+          const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages);
+          reply = result.reply;
+          doneWebSearch = result.webSearch;
+          doneToolActions = result.toolActions;
+          doneToolUsage = result.toolUsage;
+          controller.enqueue(encodeSse("delta", { text: reply }));
+        } else if (prepared.useResponsesTools && shouldAutoSearch(prepared.intentText)) {
           reply = await chatCompletions(
             prepared.cfg.llm.baseUrl,
             prepared.cfg.llm.apiKey,
@@ -1214,10 +1681,22 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
             prepared.cfg.llm.endpoint,
           );
           if (looksLikeNoWebReply(reply)) {
-            const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.userText, prepared.explicitSearch);
+            const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch);
             reply = fallback.reply;
             doneWebSearch = fallback.webSearch;
           }
+          controller.enqueue(encodeSse("delta", { text: reply }));
+        } else if (messagesHaveVision(prepared.finalMessages)) {
+          reply = await chatCompletions(
+            prepared.cfg.llm.baseUrl,
+            prepared.cfg.llm.apiKey,
+            prepared.cfg.llm.model,
+            prepared.finalMessages,
+            prepared.cfg.maxTokens,
+            prepared.cfg.temperature,
+            prepared.cfg.llm.apiType,
+            prepared.cfg.llm.endpoint,
+          );
           controller.enqueue(encodeSse("delta", { text: reply }));
         } else {
           reply = await streamChatCompletions(
@@ -1235,7 +1714,7 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
             },
           );
         }
-        controller.enqueue(encodeSse("done", { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: doneWebSearch }));
+        controller.enqueue(encodeSse("done", { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: doneWebSearch, toolActions: doneToolActions, toolUsage: doneToolUsage }));
       } catch (err: any) {
         controller.enqueue(encodeSse("error", { error: String(err?.message || err), partial: reply }));
       } finally {

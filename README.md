@@ -1,6 +1,6 @@
 # AI语音通话 (ai-voice-call)
 
-大字号中文 AI 语音/文字聊天应用：适合日常聊天、工作助理、学习辅导、长辈友好等场景。支持免按住连续语音通话、按住说话、自动朗读、本地配置、导入/导出配置，可本地运行，也可部署到 Cloudflare Workers + Assets。
+大字号中文 AI 语音/文字聊天应用：适合日常聊天、工作助理、学习辅导、长辈友好等场景。支持免按住连续语音通话、按住说话、视觉图片输入、函数工具调用、自动朗读、本地配置、导入/导出配置，可本地运行，也可部署到 Cloudflare Workers + Assets。
 
 ## 核心原则
 
@@ -19,6 +19,8 @@
 - 本地配置保存、导入、导出
 - IndexedDB 本地历史对话
 - 可选联网搜索：天气、新闻、今天、最新、价格等实时问题会先搜索再回答
+- OpenAI 兼容 Function Calling：联网搜索、天气、当前时间、计算器、本地提醒
+- 视觉输入：选择或粘贴图片后，通过 `image_url` 多模态消息发送给支持视觉的模型
 
 ## 快速开始
 
@@ -92,6 +94,12 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
 
 聊天接口已支持流式输出：前端优先请求 `/api/chat/stream`，后端会代理供应商的 `/v1/chat/completions` 或 `/v1/responses` 流；如果流式在输出前失败，会自动回退到原来的 `/api/chat` 非流式请求。TTS 仍等完整回复生成后再朗读。
 
+选择 `Qwen/Qwen3.5-4B` 时，页面会显示 `Tools / 视觉 / 256K` 能力提示。点输入框左侧回形针或直接粘贴图片即可添加视觉输入；图片会压缩到最长边 1600px，并按 OpenAI 兼容的 `image_url` + `detail: low` 格式发送。`Qwen/Qwen3-8B` 会显示不支持视觉并阻止发送图片；自定义模型是否支持图片由实际供应商决定。
+
+开启「联网 -> 函数工具调用 Tools」后，天气、新闻、价格、时间、计算和提醒类问题会给模型提供 5 个 `function` 工具。后端按标准 `tool_calls -> 执行函数 -> role: tool + tool_call_id -> 最终回答` 循环执行；普通聊天仍保持原来的流式输出。工具调用轮次需要等待函数结果，因此最终回答会在工具执行完成后一次写入流。
+
+提醒会保存在当前浏览器 `localStorage`，页面打开时每 15 秒检查一次；浏览器允许通知时会显示系统通知，否则会在聊天页面显示并朗读。它不是云端推送，关闭浏览器后不能保证准时触发。
+
 小米 MiMo TTS 供应商示例：Base URL 填 `https://api.xiaomimimo.com/v1`，TTS Model 填 `mimo-v2.5-tts`，TTS 接口类型选 `小米 MiMo TTS`（或保持 `自动识别`）。Voice / 音色可选 `mimo_default`、`冰糖`、`茉莉`、`苏打`、`白桦`、`Mia`、`Chloe`、`Milo`、`Dean`，也可以直接输入服务商支持的自定义 voice id。Voice 留空或填 `alloy` 时会自动按小米接口转成 `mimo_default`。
 
 LLM / STT / TTS 模型使用下拉框选择。展开下拉框后可以输入任意服务商模型 ID 并点击 **添加**；自定义模型的 `×` 删除按钮位于对应下拉选项右侧，不占用设置表单布局。自定义模型列表会随配置一起导入、导出。
@@ -125,6 +133,7 @@ LLM / STT / TTS 模型使用下拉框选择。展开下拉框后可以输入任�
 | 自动朗读 `autoSpeak` | `true` | 语音聊天默认开启 |
 | TTS `ttsEnabled` | `true` | 优先使用服务端 TTS |
 | 浏览器朗读兜底 | `true` | TTS 接口失败时仍可朗读 |
+| 函数工具调用 | `true` | 搜索、天气、时间、计算器、本地提醒 |
 | 联网搜索 | `true` | 实时问题自动搜索 |
 | 搜索提供方 | `auto` | 不填 Key 也可先用免费搜索 |
 
@@ -202,6 +211,7 @@ LLM / STT / TTS 模型使用下拉框选择。展开下拉框后可以输入任�
   "ttsEnabled": true,
   "browserTtsFallback": true,
   "autoSpeak": true,
+  "toolCallingEnabled": true,
   "webSearchEnabled": true,
   "searchProvider": "auto",
   "searchApiKey": "",

@@ -135,9 +135,22 @@ export function createConversationRecord(messages = []) {
 }
 
 export function deriveTitle(messages) {
-  const first = (messages || []).find((m) => m.role === "user" && String(m.content || "").trim());
+  const first = (messages || []).find((m) => m.role === "user" && messageText(m.content));
   if (!first) return "新对话";
-  return String(first.content).replace(/\s+/g, " ").trim().slice(0, 24);
+  return (messageText(first.content) || "图片对话").replace(/\s+/g, " ").trim().slice(0, 24);
+}
+
+function messageText(content) {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      return typeof part.text === "string" ? part.text : "";
+    })
+    .join(" ")
+    .trim();
 }
 
 async function readAllFromLegacyDb(name) {
