@@ -1,0 +1,21 @@
+{
+  "name": "ai-voice-call",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI语音通话 - 大字号中文语音/文字聊天（ASR + LLM + TTS），本地配置与历史，Cloudflare Workers ready",
+  "type": "module",
+  "scripts": {
+    "dev": "node local-server.mjs",
+    "dev:local": "node local-server.mjs",
+    "dev:wrangler": "wrangler dev --ip 0.0.0.0 --port 8787",
+    "start": "node local-server.mjs",
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit",
+    "lan-ip": "node scripts/print-lan-ip.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260722.1",
+    "typescript": "^5.8.2",
+    "wrangler": "^4.114.0"
+  }
+}

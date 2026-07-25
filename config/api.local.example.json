@@ -1,0 +1,32 @@
+{
+  "app": "ai-voice-call",
+  "version": 1,
+  "llm": {
+    "baseUrl": "",
+    "apiKey": "",
+    "model": ""
+  },
+  "stt": {
+    "baseUrl": "",
+    "apiKey": "",
+    "model": "FunAudioLLM/SenseVoiceSmall"
+  },
+  "tts": {
+    "baseUrl": "",
+    "apiKey": "",
+    "model": "FnLP/MOSS-TTSD-v0.5",
+    "voice": "alloy"
+  },
+  "systemPromptPreset": "general",
+  "systemPrompt": "",
+  "maxHistoryTurns": 12,
+  "maxTokens": 512,
+  "temperature": 0.7,
+  "ttsEnabled": true,
+  "browserTtsFallback": true,
+  "autoSpeak": true,
+  "webSearchEnabled": true,
+  "searchProvider": "auto",
+  "searchApiKey": "",
+  "searchBaseUrl": ""
+}

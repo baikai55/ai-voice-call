@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#ffffff" />
+  <title>AI语音通话</title>
+  <link rel="stylesheet" href="/styles.css?v=25" />
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <div class="top-left">
+        <button id="btnNewChat" class="icon-btn top-btn" type="button" title="新对话" aria-label="新对话">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 5a1 1 0 0 1 1 1v5h5a1 1 0 1 1 0 2h-5v5a1 1 0 1 1-2 0v-5H6a1 1 0 1 1 0-2h5V6a1 1 0 0 1 1-1z"/></svg>
+          <span class="btn-text">新对话</span>
+        </button>
+        <button id="btnHistory" class="icon-btn top-btn" type="button" title="历史对话" aria-label="历史对话">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 4a8 8 0 1 1-7.07 4.1 1 1 0 1 1 1.76.96A6 6 0 1 0 12 6V4zm-1 4a1 1 0 0 1 1-1h.01a1 1 0 0 1 1 1v3.38l2.3 1.38a1 1 0 1 1-1 1.74l-2.8-1.68A1 1 0 0 1 11 11V8zM4.3 6.7a1 1 0 0 1 0-1.4l2-2a1 1 0 1 1 1.4 1.4l-2 2a1 1 0 0 1-1.4 0z"/></svg>
+          <span class="btn-text">历史</span>
+        </button>
+      </div>
+      <div class="top-title">
+        <h1 id="chatTitle">AI语音通话</h1>
+        <p id="chatSub" class="sub">配置与对话都保存在本机数据库</p>
+      </div>
+      <div class="top-actions">
+        <button id="btnVoice" class="icon-btn voice-toggle on" type="button" title="语音朗读：开（点击关闭）" aria-label="关闭语音朗读" aria-pressed="true">
+          <svg class="voice-svg" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <path class="voice-body" d="M4 9.5h2.8l4.2-3.6v12.2L6.8 14.5H4a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1z"></path>
+            <path class="voice-wave voice-wave-1" d="M15.2 8.4a4.2 4.2 0 0 1 0 7.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path>
+            <path class="voice-wave voice-wave-2" d="M17.8 6a7 7 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path>
+            <path class="voice-slash" d="M4.2 4.2l15.6 15.6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"></path>
+          </svg>
+        </button>
+        <button id="btnSettings" class="icon-btn top-btn" type="button" title="本地配置" aria-label="本地配置">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94a7.4 7.4 0 0 0 .05-.94 7.4 7.4 0 0 0-.05-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.2 7.2 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.8a.5.5 0 0 0-.5.42l-.36 2.54c-.58.23-1.12.54-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.7 8.48a.5.5 0 0 0 .12.64l2.03 1.58c-.03.31-.05.62-.05.94s.02.63.05.94L2.82 14.16a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.4.31.6.22l2.39-.96c.5.4 1.05.72 1.63.94l.36 2.54c.05.24.26.42.5.42h3.8c.24 0 .45-.18.5-.42l.36-2.54c.58-.22 1.13-.54 1.63-.94l2.39.96c.22.09.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg>
+          <span class="btn-text">设置</span>
+        </button>
+      </div>
+    </header>
+
+    <main id="chat" class="chat" aria-live="polite"></main>
+
+    <section class="composer">
+      <div class="quick" aria-label="快捷提问">
+        <button type="button" data-q="今天天气怎么样？">天气</button>
+        <button type="button" data-q="陪我聊聊天，解解闷。">解闷</button>
+        <button type="button" data-q="微信视频通话怎么打？一步一步教我。">教手机</button>
+        <button type="button" data-q="给我讲一个温和的短故事。">讲故事</button>
+        <button type="button" data-q="今天有什么重要新闻？简要说3条。">今日新闻</button>
+      </div>
+
+      <div class="input-bar" id="inputBar">
+        <textarea id="input" rows="1" placeholder="发消息或按住说话..." enterkeyhint="send"></textarea>
+        <button id="btnHold" class="icon-btn mic" type="button" title="按住说话" aria-label="按住说话"><span class="mic-dot" aria-hidden="true"></span></button>
+        <button id="btnSend" class="icon-btn send" type="button" title="发送" aria-label="发送">发送</button>
+      </div>
+      <p id="status" class="status">正在准备…</p>
+    </section>
+  </div>
+
+    <div id="historyModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
+    <div class="modal-card history-sheet">
+      <div class="history-head">
+        <div>
+          <p class="settings-kicker">本地数据库</p>
+          <h2 id="historyTitle">历史对话</h2>
+          <p class="settings-desc">对话保存在本机 IndexedDB，可随时切换或删除。</p>
+        </div>
+        <button id="btnCloseHistory" class="icon-close" type="button" aria-label="关闭历史">×</button>
+      </div>
+      <div class="history-toolbar">
+        <button id="btnNewChatFromHistory" class="btn primary" type="button">新建对话</button>
+      </div>
+      <div id="historyList" class="history-list" aria-label="历史对话列表"></div>
+    </div>
+  </div>
+
+  <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="modal-card settings-sheet">
+      <div class="settings-head">
+        <div class="settings-head-text">
+          <p class="settings-kicker">本地配置</p>
+          <h2 id="settingsTitle">API 与功能设置</h2>
+        </div>
+        <button id="btnCloseSettings" class="icon-close" type="button" aria-label="关闭设置">×</button>
+      </div>
+
+      <div class="settings-tabs" role="tablist" aria-label="设置分组">
+        <button type="button" class="settings-tab active" role="tab" aria-selected="true" data-tab="llm">模型</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="voice">语音</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="chat">对话</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="search">搜索</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="backup">备份</button>
+      </div>
+
+      <div class="settings-body">
+        <section class="settings-panel active" data-panel="llm" role="tabpanel">
+          <article class="settings-card">
+            <div class="card-head">
+              <div>
+                <h3>大模型 LLM</h3>
+                <p>聊天回复使用的接口与模型</p>
+              </div>
+              <span class="card-badge">必填</span>
+            </div>
+            <div class="field-grid">
+              <label class="field">
+                <span class="field-label">Base URL</span>
+                <input id="llmBaseUrl" placeholder="https://api.siliconflow.cn/v1" />
+              </label>
+              <label class="field">
+                <span class="field-label">Model</span>
+                <input id="llmModel" placeholder="Qwen/Qwen3.5-4B" />
+              </label>
+              <label class="field full">
+                <span class="field-label">API Key</span>
+                <div class="secret-input">
+                  <input id="llmApiKey" type="password" placeholder="sk-..." autocomplete="off" />
+                  <button type="button" class="eye-btn" data-eye-for="llmApiKey" aria-label="显示或隐藏密钥" title="显示/隐藏">👁</button>
+                </div>
+              </label>
+            </div>
+          </article>
+        </section>
+
+        <section class="settings-panel" data-panel="voice" role="tabpanel" hidden>
+          <article class="settings-card">
+            <div class="card-head">
+              <div>
+                <h3>语音识别 STT</h3>
+                <p>按住说话时转文字。可留空，默认跟随 LLM</p>
+              </div>
+              <span class="card-badge soft">可选</span>
+            </div>
+            <div class="field-grid">
+              <label class="field">
+                <span class="field-label">Base URL</span>
+                <input id="sttBaseUrl" placeholder="可留空，默认跟 LLM" />
+              </label>
+              <label class="field">
+                <span class="field-label">Model</span>
+                <input id="sttModel" placeholder="FunAudioLLM/SenseVoiceSmall" />
+              </label>
+              <label class="field full">
+                <span class="field-label">API Key</span>
+                <div class="secret-input">
+                  <input id="sttApiKey" type="password" placeholder="可留空，默认跟 LLM" autocomplete="off" />
+                  <button type="button" class="eye-btn" data-eye-for="sttApiKey" aria-label="显示或隐藏密钥" title="显示/隐藏">👁</button>
+                </div>
+              </label>
+            </div>
+          </article>
+
+          <article class="settings-card">
+            <div class="card-head">
+              <div>
+                <h3>语音合成 TTS</h3>
+                <p>自动朗读回复。可留空，默认跟随 LLM</p>
+              </div>
+              <span class="card-badge soft">可选</span>
+            </div>
+            <div class="field-grid">
+              <label class="field">
+                <span class="field-label">Base URL</span>
+                <input id="ttsBaseUrl" placeholder="可留空，默认跟 LLM" />
+              </label>
+              <label class="field">
+                <span class="field-label">Model</span>
+                <input id="ttsModel" placeholder="FnLP/MOSS-TTSD-v0.5 或 mimo-v2.5-tts" />
+              </label>
+              <label class="field">
+                <span class="field-label">Voice</span>
+                <input id="ttsVoice" placeholder="alloy" />
+              </label>
+              <label class="field full">
+                <span class="field-label">API Key</span>
+                <div class="secret-input">
+                  <input id="ttsApiKey" type="password" placeholder="可留空，默认跟 LLM" autocomplete="off" />
+                  <button type="button" class="eye-btn" data-eye-for="ttsApiKey" aria-label="显示或隐藏密钥" title="显示/隐藏">👁</button>
+                </div>
+              </label>
+            </div>
+            <div class="switch-list">
+              <label class="switch-row">
+                <span>
+                  <strong>启用服务端 TTS</strong>
+                  <small>用接口生成语音再播放</small>
+                </span>
+                <input id="ttsEnabled" type="checkbox" class="switch-input" />
+              </label>
+              <label class="switch-row">
+                <span>
+                  <strong>失败时用浏览器朗读</strong>
+                  <small>服务端 TTS 失败后回退系统语音</small>
+                </span>
+                <input id="browserTtsFallback" type="checkbox" class="switch-input" />
+              </label>
+              <label class="switch-row">
+                <span>
+                  <strong>自动朗读回复</strong>
+                  <small>助手说完后自动播报</small>
+                </span>
+                <input id="autoSpeak" type="checkbox" class="switch-input" />
+              </label>
+            </div>
+          </article>
+        </section>
+
+        <section class="settings-panel" data-panel="chat" role="tabpanel" hidden>
+          <article class="settings-card">
+            <div class="card-head">
+              <div>
+                <h3>对话风格</h3>
+                <p>控制人设、记忆长度与回答风格</p>
+              </div>
+            </div>
+            <div class="field-grid">
+              <label class="field full">
+                <span class="field-label">场景模板</span>
+                <select id="systemPromptPreset">
+                  <option value="general">通用助手</option>
+                  <option value="companion">陪伴聊天</option>
+                  <option value="parent">长辈友好</option>
+                  <option value="work">工作助理</option>
+                  <option value="study">学习辅导</option>
+                  <option value="concise">简洁模式</option>
+                  <option value="custom">自定义</option>
+                </select>
+                <small class="field-help">选择模板会填入下方人设；你可以继续手动修改，修改后按自定义保存。</small>
+              </label>
+              <label class="field full">
+                <span class="field-label">系统人设</span>
+                <textarea id="systemPrompt" rows="6" placeholder="写下你希望 AI 扮演的角色、语气和回答长度..."></textarea>
+              </label>
+              <label class="field">
+                <span class="field-label">历史轮数</span>
+                <input id="maxHistoryTurns" type="number" min="2" max="30" />
+              </label>
+              <label class="field">
+                <span class="field-label">最大回复长度</span>
+                <input id="maxTokens" type="number" min="256" max="1024" />
+              </label>
+              <label class="field">
+                <span class="field-label">温度</span>
+                <input id="temperature" type="number" min="0" max="1.5" step="0.1" />
+              </label>
+            </div>
+          </article>
+        </section>
+
+        <section class="settings-panel" data-panel="search" role="tabpanel" hidden>
+          <article class="settings-card">
+            <div class="card-head">
+              <div>
+                <h3>联网搜索</h3>
+                <p>天气、新闻、价格等实时问题可先搜索再回答</p>
+              </div>
+            </div>
+            <div class="switch-list">
+              <label class="switch-row">
+                <span>
+                  <strong>启用联网搜索</strong>
+                  <small>识别到实时信息时自动搜索</small>
+                </span>
+                <input id="webSearchEnabled" type="checkbox" class="switch-input" />
+              </label>
+            </div>
+            <div class="field-grid">
+              <label class="field">
+                <span class="field-label">搜索提供方</span>
+                <select id="searchProvider">
+                  <option value="auto">自动（免费优先）</option>
+                  <option value="duckduckgo">DuckDuckGo 免费</option>
+                  <option value="searxng">SearXNG</option>
+                  <option value="tavily">Tavily（需Key）</option>
+                  <option value="serper">Serper（需Key）</option>
+                </select>
+              </label>
+              <label class="field full">
+                <span class="field-label">搜索 API Key（可选）</span>
+                <div class="secret-input">
+                  <input id="searchApiKey" type="password" placeholder="Tavily/Serper 等，可留空先用免费搜索" autocomplete="off" />
+                  <button type="button" class="eye-btn" data-eye-for="searchApiKey" aria-label="显示或隐藏密钥" title="显示/隐藏">👁</button>
+                </div>
+              </label>
+              <label class="field full">
+                <span class="field-label">SearXNG 地址（可选）</span>
+                <input id="searchBaseUrl" placeholder="https://searx.be" />
+              </label>
+            </div>
+          </article>
+        </section>
+
+        <section class="settings-panel" data-panel="backup" role="tabpanel" hidden>
+          <article class="settings-card">
+            <div class="card-head">
+              <div>
+                <h3>导入 / 导出</h3>
+                <p>方便换手机或备份本地配置。完整导出含 Key，请勿外传。</p>
+              </div>
+            </div>
+            <div class="action-tiles">
+              <button id="btnImport" class="action-tile" type="button">
+                <strong>导入配置</strong>
+                <span>选择之前导出的 JSON</span>
+              </button>
+              <button id="btnExport" class="action-tile" type="button">
+                <strong>导出（含 Key）</strong>
+                <span>完整备份，等同密码本</span>
+              </button>
+              <button id="btnExportSafe" class="action-tile" type="button">
+                <strong>导出（不含 Key）</strong>
+                <span>可分享模型与地址</span>
+              </button>
+              <button id="btnReset" class="action-tile danger" type="button">
+                <strong>恢复默认</strong>
+                <span>尽量保留当前 API Key</span>
+              </button>
+            </div>
+          </article>
+        </section>
+      </div>
+
+      <div class="settings-footer">
+        <p id="settingsStatus" class="settings-status">配置只保存在本机浏览器，可导入/导出。</p>
+        <div class="settings-footer-actions">
+          <button id="btnTest" class="btn" type="button">测试连接</button>
+          <button id="btnSaveSettings" class="btn primary" type="button">保存到本地</button>
+        </div>
+      </div>
+
+      <input id="importFile" type="file" accept="application/json,.json" hidden />
+    </div>
+  </div>
+
+  <script src="/app.js?v=25" type="module"></script>
+</body>
+</html>
+
