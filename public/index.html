@@ -90,23 +90,36 @@
     <div class="call-panel-inner">
       <div class="call-head">
         <div>
-          <p class="call-kicker">AI 实时对话</p>
+          <p class="call-kicker">AI 语音与视觉对话</p>
           <h2 id="callTitle">语音通话</h2>
         </div>
         <time id="callTimer" class="call-timer">00:00</time>
       </div>
 
-      <div id="callOrb" class="call-orb" aria-hidden="true">
-        <span class="call-orb-ring call-orb-ring-one"></span>
-        <span class="call-orb-ring call-orb-ring-two"></span>
-        <span class="call-orb-core">
-          <svg viewBox="0 0 24 24" width="46" height="46" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a1 1 0 1 1 2 0 7 7 0 0 1-6 6.92V21h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-3.08A7 7 0 0 1 5 11a1 1 0 1 1 2 0 5 5 0 0 0 10 0z"/></svg>
-        </span>
+      <div id="callVisualStage" class="call-visual-stage">
+        <div id="callOrb" class="call-orb" aria-hidden="true">
+          <span class="call-orb-ring call-orb-ring-one"></span>
+          <span class="call-orb-ring call-orb-ring-two"></span>
+          <span class="call-orb-core">
+            <svg viewBox="0 0 24 24" width="46" height="46" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a1 1 0 1 1 2 0 7 7 0 0 1-6 6.92V21h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-3.08A7 7 0 0 1 5 11a1 1 0 1 1 2 0 5 5 0 0 0 10 0z"/></svg>
+          </span>
+        </div>
+        <div id="callCameraPreview" class="call-camera-preview" aria-label="摄像头实时预览" hidden>
+          <video id="callCameraVideo" autoplay muted playsinline></video>
+          <span class="call-camera-corner corner-top-left" aria-hidden="true"></span>
+          <span class="call-camera-corner corner-top-right" aria-hidden="true"></span>
+          <span class="call-camera-corner corner-bottom-left" aria-hidden="true"></span>
+          <span class="call-camera-corner corner-bottom-right" aria-hidden="true"></span>
+          <button id="btnCallCameraFlip" class="call-camera-flip" type="button" aria-label="切换前后摄像头" title="切换前后摄像头">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M7.5 7H16l-1.7-1.7 1.4-1.4L19.8 8l-4.1 4.1-1.4-1.4L16 9H7.5A3.5 3.5 0 0 0 4 12.5V14H2v-1.5A5.5 5.5 0 0 1 7.5 7zm9 10H8l1.7 1.7-1.4 1.4L4.2 16l4.1-4.1 1.4 1.4L8 15h8.5a3.5 3.5 0 0 0 3.5-3.5V10h2v1.5a5.5 5.5 0 0 1-5.5 5.5z"/></svg>
+          </button>
+          <span class="call-camera-note">按“识别”或说“看看这个”</span>
+        </div>
       </div>
 
       <div class="call-copy">
         <p id="callStatus" class="call-status" aria-live="polite">正在接通…</p>
-        <p id="callTranscript" class="call-transcript">接通后直接说话，停顿时会自动发送。</p>
+        <p id="callTranscript" class="call-transcript">接通后直接说话，也可以打开摄像头识别物品。</p>
       </div>
 
       <div class="call-actions">
@@ -115,6 +128,18 @@
             <svg viewBox="0 0 24 24" width="25" height="25"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a1 1 0 1 1 2 0 7 7 0 0 1-6 6.92V21h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-3.08A7 7 0 0 1 5 11a1 1 0 1 1 2 0 5 5 0 0 0 10 0z"/></svg>
           </span>
           <span id="callMuteLabel">静音</span>
+        </button>
+        <button id="btnCallCamera" class="call-control" type="button" aria-label="打开摄像头" aria-pressed="false">
+          <span class="call-control-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="25" height="25"><path fill="currentColor" d="M4 5h11a2 2 0 0 1 2 2v2.2l3.1-2.1A1.2 1.2 0 0 1 22 8.1v7.8a1.2 1.2 0 0 1-1.9 1L17 14.8V17a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2zm0 2v10h11V7H4zm13 4.6v.8l3 2V9.6l-3 2z"/></svg>
+          </span>
+          <span id="callCameraLabel">摄像头</span>
+        </button>
+        <button id="btnCallIdentify" class="call-control identify" type="button" aria-label="识别当前画面" disabled>
+          <span class="call-control-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="25" height="25"><path fill="currentColor" d="M4 3h5v2H5v4H3V4a1 1 0 0 1 1-1zm11 0h5a1 1 0 0 1 1 1v5h-2V5h-4V3zM3 15h2v4h4v2H4a1 1 0 0 1-1-1v-5zm16 0h2v5a1 1 0 0 1-1 1h-5v-2h4v-4zM8 8h8v8H8V8zm2 2v4h4v-4h-4z"/></svg>
+          </span>
+          <span>识别</span>
         </button>
         <button id="btnHangup" class="call-control hangup" type="button" aria-label="挂断语音通话">
           <span class="call-control-icon" aria-hidden="true">
@@ -538,6 +563,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=46" type="module"></script>
+  <script src="/app.js?v=47" type="module"></script>
 </body>
 </html>

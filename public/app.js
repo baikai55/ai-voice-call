@@ -246,12 +246,19 @@ const el = {
   btnCall: document.getElementById("btnCall"),
   btnVoice: document.getElementById("btnVoice"),
   callPanel: document.getElementById("callPanel"),
+  callVisualStage: document.getElementById("callVisualStage"),
   callOrb: document.getElementById("callOrb"),
+  callCameraPreview: document.getElementById("callCameraPreview"),
+  callCameraVideo: document.getElementById("callCameraVideo"),
   callStatus: document.getElementById("callStatus"),
   callTranscript: document.getElementById("callTranscript"),
   callTimer: document.getElementById("callTimer"),
   btnCallMute: document.getElementById("btnCallMute"),
   callMuteLabel: document.getElementById("callMuteLabel"),
+  btnCallCamera: document.getElementById("btnCallCamera"),
+  callCameraLabel: document.getElementById("callCameraLabel"),
+  btnCallIdentify: document.getElementById("btnCallIdentify"),
+  btnCallCameraFlip: document.getElementById("btnCallCameraFlip"),
   btnHangup: document.getElementById("btnHangup"),
   btnNewChat: document.getElementById("btnNewChat"),
   btnHistory: document.getElementById("btnHistory"),
@@ -367,6 +374,10 @@ let callTimerId = null;
 let callListenTimer = null;
 let callCapture = null;
 let callSessionAbort = null;
+let callCameraStream = null;
+let callCameraFacingMode = "environment";
+let callCameraBusy = false;
+let callCameraAnalyzing = false;
 let activeSpeechAudio = null;
 let activeSpeechStop = null;
 let browserSpeechStop = null;
@@ -1093,6 +1104,7 @@ function syncInteractionState() {
   if (el.btnAttach) el.btnAttach.disabled = composerLocked;
   if (el.input) el.input.disabled = callActive;
   if (el.btnCall) el.btnCall.disabled = busy && !callActive;
+  syncCallCameraUi();
 }
 
 function setSettingsStatus(text) {
@@ -2179,6 +2191,22 @@ function micPermissionHint(err) {
   return "无法开麦：" + msg;
 }
 
+function cameraPermissionHint(err) {
+  const name = err?.name || "";
+  const msg = String(err?.message || err || "");
+  if (name === "NotAllowedError" || /permission|denied|not allowed/i.test(msg)) {
+    return isWeChatBrowser()
+      ? "摄像头权限被拒绝。请在系统浏览器打开，并允许摄像头权限"
+      : "摄像头权限被拒绝，请在浏览器设置里允许摄像头";
+  }
+  if (name === "NotFoundError") return "未找到可用摄像头";
+  if (name === "NotReadableError") return "摄像头被占用，请关闭其他相机或视频应用";
+  if (name === "OverconstrainedError") return "当前设备不支持所选摄像头，请尝试切换镜头";
+  if (isInsecureContext()) return "当前地址不能使用摄像头，请改用 https://电脑IP:8788";
+  if (!ensureMediaDevices()) return "当前浏览器不支持摄像头，请使用 Chrome 或 Safari";
+  return "无法打开摄像头：" + msg;
+}
+
 function supportsBrowserSpeech() {
   return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
 }
@@ -2776,6 +2804,246 @@ function setCallLevel(level) {
   el.callPanel.style.setProperty("--call-level", normalized.toFixed(3));
 }
 
+function syncCallCameraUi() {
+  const cameraOn = Boolean(callCameraStream);
+  const visionSupported = modelSupportsVision();
+  if (el.callOrb) el.callOrb.hidden = cameraOn;
+  if (el.callCameraPreview) {
+    el.callCameraPreview.hidden = !cameraOn;
+    el.callCameraPreview.classList.toggle("front-facing", cameraOn && callCameraFacingMode === "user");
+  }
+  if (el.btnCallCamera) {
+    el.btnCallCamera.classList.toggle("camera-on", cameraOn);
+    el.btnCallCamera.setAttribute("aria-pressed", cameraOn ? "true" : "false");
+    el.btnCallCamera.setAttribute("aria-label", cameraOn ? "关闭摄像头" : "打开摄像头");
+    el.btnCallCamera.disabled = !callActive || callCameraBusy || (!cameraOn && busy);
+  }
+  if (el.callCameraLabel) el.callCameraLabel.textContent = cameraOn ? "关闭相机" : "摄像头";
+  if (el.btnCallIdentify) {
+    el.btnCallIdentify.disabled = !callActive || !cameraOn || !visionSupported || busy || callCameraBusy || callCameraAnalyzing;
+  }
+  if (el.btnCallCameraFlip) {
+    el.btnCallCameraFlip.disabled = !callActive || !cameraOn || busy || callCameraBusy || callCameraAnalyzing;
+  }
+}
+
+function waitForCallCameraReady(video, timeoutMs = 5000) {
+  if (video?.videoWidth && video?.videoHeight && video.readyState >= 2) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (!video) {
+      reject(new Error("找不到摄像头预览组件"));
+      return;
+    }
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      video.removeEventListener("loadedmetadata", onReady);
+      video.removeEventListener("canplay", onReady);
+      fn(value);
+    };
+    const onReady = () => {
+      if (video.videoWidth && video.videoHeight) finish(resolve);
+    };
+    const timer = setTimeout(() => finish(reject, new Error("摄像头画面准备超时")), timeoutMs);
+    video.addEventListener("loadedmetadata", onReady);
+    video.addEventListener("canplay", onReady);
+  });
+}
+
+async function requestCallCameraStream(facingMode) {
+  const constraints = {
+    audio: false,
+    video: {
+      facingMode: { ideal: facingMode },
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    },
+  };
+  try {
+    return await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (err) {
+    if (err?.name !== "OverconstrainedError") throw err;
+    return navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+  }
+}
+
+function stopCallCamera({ quiet = false } = {}) {
+  const stream = callCameraStream;
+  callCameraStream = null;
+  if (stream) {
+    try { stream.getTracks().forEach((track) => track.stop()); } catch {}
+  }
+  if (el.callCameraVideo) {
+    try { el.callCameraVideo.pause(); } catch {}
+    el.callCameraVideo.srcObject = null;
+  }
+  syncCallCameraUi();
+  if (!quiet && callActive) {
+    setCallStatus(callMuted ? "麦克风已静音" : "请说话，我在听", callMuted ? "muted" : "hearing");
+    setCallTranscript("摄像头已关闭，语音通话仍在继续");
+  }
+}
+
+async function openCallCamera(facingMode = callCameraFacingMode) {
+  if (!callActive || callCameraBusy) return false;
+  if (!modelSupportsVision()) {
+    const message = `${config.llm.model} 不支持视觉输入，请切换到 Qwen/Qwen3.5-4B`;
+    setCallStatus("当前模型不能识别画面", "error");
+    setCallTranscript(message);
+    setStatus(message);
+    return false;
+  }
+  if (isInsecureContext() || !ensureMediaDevices()) {
+    const message = cameraPermissionHint(new Error("camera unavailable"));
+    setCallStatus("无法打开摄像头", "error");
+    setCallTranscript(message);
+    setStatus(message);
+    return false;
+  }
+
+  const resumeListening = !callMuted && !busy;
+  clearCallListenTimer();
+  closeCallCapture({ discard: true });
+  callCameraBusy = true;
+  syncCallCameraUi();
+  setCallStatus("正在打开摄像头…", "connecting");
+  setCallTranscript(facingMode === "user" ? "正在切换到前置摄像头" : "正在切换到后置摄像头");
+  stopCallCamera({ quiet: true });
+  let stream = null;
+  try {
+    stream = await requestCallCameraStream(facingMode);
+    if (!callActive) {
+      stream.getTracks().forEach((track) => track.stop());
+      return false;
+    }
+    callCameraStream = stream;
+    const track = stream.getVideoTracks()[0];
+    const actualFacing = String(track?.getSettings?.().facingMode || facingMode);
+    callCameraFacingMode = actualFacing === "user" ? "user" : facingMode;
+    if (el.callCameraVideo) {
+      el.callCameraVideo.srcObject = stream;
+      try { await el.callCameraVideo.play(); } catch {}
+      await waitForCallCameraReady(el.callCameraVideo);
+    }
+    track?.addEventListener?.("ended", () => {
+      if (callCameraStream !== stream) return;
+      stopCallCamera({ quiet: true });
+      if (callActive) {
+        setCallStatus("摄像头已停止", "error");
+        setCallTranscript("摄像头可能被系统或其他应用关闭");
+      }
+    });
+    syncCallCameraUi();
+    setCallStatus(callMuted ? "麦克风已静音" : "请说话，我在听", callMuted ? "muted" : "hearing");
+    setCallTranscript("摄像头已开启。按“识别”，或直接说“看看这个是什么”");
+    return true;
+  } catch (err) {
+    if (stream) {
+      try { stream.getTracks().forEach((track) => track.stop()); } catch {}
+    }
+    callCameraStream = null;
+    const message = cameraPermissionHint(err);
+    setCallStatus("无法打开摄像头", "error");
+    setCallTranscript(message);
+    setStatus(message);
+    return false;
+  } finally {
+    callCameraBusy = false;
+    syncCallCameraUi();
+    if (resumeListening && callActive && !callMuted && !busy && !callCapture) {
+      scheduleCallListening(callGeneration, 350);
+    }
+  }
+}
+
+async function toggleCallCamera() {
+  if (!callActive || callCameraBusy) return;
+  if (callCameraStream) {
+    stopCallCamera();
+    return;
+  }
+  await openCallCamera(callCameraFacingMode || "environment");
+}
+
+async function flipCallCamera() {
+  if (!callActive || !callCameraStream || callCameraBusy || busy) return;
+  const nextFacing = callCameraFacingMode === "user" ? "environment" : "user";
+  await openCallCamera(nextFacing);
+}
+
+async function captureCallCameraFrame() {
+  const video = el.callCameraVideo;
+  if (!callCameraStream || !video) throw new Error("请先打开摄像头");
+  await waitForCallCameraReady(video);
+  const sourceWidth = Number(video.videoWidth || 0);
+  const sourceHeight = Number(video.videoHeight || 0);
+  if (!sourceWidth || !sourceHeight) throw new Error("摄像头暂时没有可用画面");
+  const scale = Math.min(1, 1280 / Math.max(sourceWidth, sourceHeight));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+  canvas.height = Math.max(1, Math.round(sourceHeight * scale));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("浏览器不支持摄像头截帧");
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return {
+    name: `摄像头画面-${new Date().toLocaleTimeString("zh-CN", { hour12: false })}.jpg`,
+    url: await canvasToDataUrl(canvas, "image/jpeg", 0.78),
+  };
+}
+
+function isCallVisualRequest(text) {
+  const value = String(text || "").replace(/\s+/g, "").trim();
+  if (!value) return false;
+  return /(这是什么|这是谁|上面写了什么|读一下上面的字|识别一下|认一下这个)|(看看|看一下|看下|帮我看).{0,10}(这个|画面|镜头|摄像头|东西|物品|文字|上面|手里|眼前|面前)/.test(value);
+}
+
+async function analyzeCallCamera(prompt = "", generation = callGeneration) {
+  if (!callActive || callGeneration !== generation || busy || callCameraAnalyzing) return false;
+  if (!modelSupportsVision()) {
+    const message = `${config.llm.model} 不支持视觉输入，请切换到 Qwen/Qwen3.5-4B`;
+    setCallStatus("当前模型不能识别画面", "error");
+    setCallTranscript(message);
+    return false;
+  }
+  if (!callCameraStream) {
+    setCallStatus("请先打开摄像头", "error");
+    setCallTranscript("点下方“摄像头”，允许权限后再识别画面");
+    return false;
+  }
+
+  clearCallListenTimer();
+  closeCallCapture({ discard: true });
+  callCameraAnalyzing = true;
+  syncCallCameraUi();
+  setCallStatus("正在截取画面…", "thinking");
+  setCallTranscript("请保持摄像头稳定");
+  let handedToChat = false;
+  try {
+    const image = await captureCallCameraFrame();
+    if (!callActive || callGeneration !== generation) return false;
+    callCameraAnalyzing = false;
+    syncCallCameraUi();
+    setCallStatus("AI 正在识别画面…", "thinking");
+    setCallTranscript("正在分析物体、文字和界面");
+    const query = String(prompt || "").trim() || "请识别摄像头当前画面中的物体、文字或界面，并用适合语音播报的简短中文回答。";
+    handedToChat = true;
+    return await sendText(query, { image, callMode: true, callGeneration: generation });
+  } catch (err) {
+    if (!callActive || callGeneration !== generation) return false;
+    setCallStatus("画面识别失败", "error");
+    setCallTranscript(explainFetchError(err));
+    return false;
+  } finally {
+    callCameraAnalyzing = false;
+    syncCallCameraUi();
+    if (!handedToChat && callActive && callGeneration === generation && !callMuted && !busy && !callCapture) {
+      scheduleCallListening(generation, 650);
+    }
+  }
+}
+
 function formatCallDuration(totalSeconds) {
   const seconds = Math.max(0, Math.floor(totalSeconds));
   const minutes = Math.floor(seconds / 60);
@@ -2857,6 +3125,20 @@ async function transcribeCallAudio(blob, generation) {
     setCallTranscript(`你：${text}`);
     busy = false;
     syncInteractionState();
+    if (isCallVisualRequest(text)) {
+      if (!callCameraStream) {
+        const notice = "摄像头还没有打开。请点下方的摄像头按钮，允许权限后再让我看。";
+        setCallStatus("请先打开摄像头", "error");
+        setCallTranscript(notice);
+        try {
+          await speakText(notice, { force: true, signal: callSessionAbort?.signal });
+        } catch {}
+        return;
+      }
+      handedToChat = true;
+      await analyzeCallCamera(text, generation);
+      return;
+    }
     handedToChat = true;
     await sendText(text, { callMode: true, callGeneration: generation });
   } catch (err) {
@@ -2985,6 +3267,10 @@ async function startVoiceCall() {
     return;
   }
   await ensureConversationReady();
+  stopCallCamera({ quiet: true });
+  callCameraFacingMode = "environment";
+  callCameraBusy = false;
+  callCameraAnalyzing = false;
   callActive = true;
   callMuted = false;
   callGeneration += 1;
@@ -3002,11 +3288,12 @@ async function startVoiceCall() {
   el.btnCallMute?.setAttribute("aria-pressed", "false");
   if (el.callMuteLabel) el.callMuteLabel.textContent = "静音";
   if (el.callTimer) el.callTimer.textContent = "00:00";
+  syncCallCameraUi();
   callTimerId = setInterval(updateCallTimer, 1000);
   syncInteractionState();
   setStatus("语音通话中");
   setCallStatus("正在接通…", "connecting");
-  setCallTranscript("接通后直接说话，停顿时会自动发送。");
+  setCallTranscript("接通后直接说话，也可以打开摄像头识别物品。");
   scheduleCallListening(callGeneration, 250);
 }
 
@@ -3022,6 +3309,9 @@ function endVoiceCall(reason = "通话已结束") {
   callSessionAbort?.abort();
   callSessionAbort = null;
   closeCallCapture({ discard: true });
+  callCameraBusy = false;
+  callCameraAnalyzing = false;
+  stopCallCamera({ quiet: true });
   stopActiveSpeech();
   document.body.classList.remove("in-call");
   el.callPanel?.classList.add("hidden");
@@ -3429,6 +3719,15 @@ if (el.btnCall) {
 }
 el.btnHangup?.addEventListener("click", () => endVoiceCall());
 el.btnCallMute?.addEventListener("click", toggleCallMute);
+el.btnCallCamera?.addEventListener("click", async () => {
+  await toggleCallCamera();
+});
+el.btnCallCameraFlip?.addEventListener("click", async () => {
+  await flipCallCamera();
+});
+el.btnCallIdentify?.addEventListener("click", async () => {
+  await analyzeCallCamera("请识别摄像头当前画面中的物体、文字或界面，并用适合语音播报的简短中文回答。", callGeneration);
+});
 
 el.btnSend.addEventListener("click", (e) => {
   if (isHoldingTalk()) {
