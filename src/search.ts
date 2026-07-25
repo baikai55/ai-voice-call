@@ -56,6 +56,120 @@ export function shouldAutoSearch(userText: string): boolean {
   return false;
 }
 
+
+export function isExplicitSearchRequest(userText: string): boolean {
+  const q = clean(userText);
+  return [/搜一下/, /搜索/, /帮我搜/, /查一下/, /查一查/, /帮我查/, /联网/, /网上/, /上网/, /百度/, /谷歌/i, /google/i].some((re) => re.test(q));
+}
+
+function stripSearchCommandWords(text: string): string {
+  let q = clean(text);
+  q = q.replace(/^(请|麻烦|帮我|你帮我|给我|可以帮我)?\s*(联网|上网|网上|百度|谷歌|google)?\s*(搜一下|搜索一下|搜索|查一下|查一查|查询一下|查询|查查|搜搜|看一下|看看)\s*/i, "");
+  q = q.replace(/^(请|麻烦|帮我|你帮我|给我|可以帮我)?\s*(搜|查)\s*/i, "");
+  q = q.replace(/^(一下|一下一下)\s*/, "");
+  return clean(q).replace(/^[，,。.!！?？：:\s]+|[，,。.!！?？：:\s]+$/g, "");
+}
+
+function normalizeSearchQuery(userText: string): string {
+  let q = stripSearchCommandWords(userText).slice(0, 120);
+  if (!q) q = clean(userText).slice(0, 120);
+  q = q.replace(/(今天|今日|明天|后天)的天[。.!！?？]*$/g, "$1的天气");
+  q = q.replace(/(今天|今日|明天|后天)天[。.!！?？]*$/g, "$1天气");
+  if (/天气|气温|下雨|下雪|降雨|降雪|空气质量|台风|雾霾/.test(q)) return `${q} 实时天气 天气预报 气温 降水`;
+  if (/黄金|金价/.test(q)) return `${q} 今日 实时 金价 人民币 国际金价`;
+  if (/白银|银价/.test(q)) return `${q} 今日 实时 银价`;
+  if (/比特币|btc/i.test(q)) return `${q} 今日 实时 价格`;
+  return q;
+}
+function isWeatherQuery(query: string): boolean {
+  return /天气|气温|下雨|下雪|降雨|降雪|空气质量|台风|雾霾|weather/i.test(String(query || ""));
+}
+function normalizeWeatherSpeech(text: string): string {
+  return clean(text)
+    .replace(/(今天|今日|明天|后天)的天[。.!！?？]*$/g, "$1的天气")
+    .replace(/(今天|今日|明天|后天)天[。.!！?？]*$/g, "$1天气");
+}
+function extractWeatherLocation(query: string): string {
+  let q = normalizeWeatherSpeech(stripSearchCommandWords(query));
+  q = q.replace(/(今天|今日|明天|后天|现在|当前|实时|最近|这会儿|此刻)/g, "");
+  q = q.replace(/(的)?(天气预报|天气|气温|温度|下雨吗|会下雨吗|下雨|下雪吗|会下雪吗|下雪|降雨|降雪|空气质量|台风|雾霾|预报)/g, "");
+  q = q.replace(/(怎么样|如何|怎样|多少|几度|有雨吗|冷不冷|热不热)/g, "");
+  q = q.replace(/[，,。.!！?？：:\s]/g, "").trim();
+  return q.slice(0, 40);
+}
+function pickWeatherDesc(current: any): string {
+  const raw = current?.lang_zh?.[0]?.value || current?.weatherDesc?.[0]?.value || "";
+  const key = String(raw).trim().toLowerCase();
+  const map: Record<string, string> = { sunny: "晴", clear: "晴", "partly cloudy": "局部多云", cloudy: "多云", overcast: "阴", mist: "薄雾", fog: "雾", haze: "霾", "smoky haze": "烟霾", "light rain": "小雨", "moderate rain": "中雨", "heavy rain": "大雨" };
+  return map[key] || raw;
+}
+async function searchWeather(query: string): Promise<SearchResult> {
+  const location = extractWeatherLocation(query);
+  if (!location) return { ok: false, provider: "weather", query, items: [], error: "missing location" };
+  const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1&lang=zh`;
+  const res = await fetchWithTimeout(url, { headers: { accept: "application/json", "user-agent": "ai-voice-call/0.1" } });
+  if (!res.ok) return { ok: false, provider: "weather", query: location, items: [], error: `HTTP ${res.status}` };
+  const data = await res.json() as any;
+  const current = data?.current_condition?.[0] || {};
+  const dayIndex = /后天/.test(query) ? 2 : /明天/.test(query) ? 1 : 0;
+  const dayLabel = dayIndex === 2 ? "后天" : dayIndex === 1 ? "明天" : "今日";
+  const today = data?.weather?.[dayIndex] || data?.weather?.[0] || {};
+  const area = data?.nearest_area?.[0]?.areaName?.[0]?.value || location;
+  if (!current.temp_C && !today.maxtempC) return { ok: false, provider: "weather", query: location, items: [], error: "empty weather" };
+  const desc = pickWeatherDesc(current);
+  const rainChances = (today.hourly || []).map((h: any) => Number(h.chanceofrain || 0)).filter((n: number) => Number.isFinite(n));
+  const maxRain = rainChances.length ? Math.max(...rainChances) : null;
+  const parts: string[] = [];
+  if (dayIndex === 0 && desc) parts.push(`天气 ${desc}`);
+  if (dayIndex === 0 && current.temp_C) parts.push(`当前 ${current.temp_C}℃`);
+  if (dayIndex === 0 && current.FeelsLikeC) parts.push(`体感 ${current.FeelsLikeC}℃`);
+  if (today.mintempC || today.maxtempC) parts.push(`${dayLabel} ${today.mintempC || "?"}-${today.maxtempC || "?"}℃`);
+  if (current.humidity) parts.push(`湿度 ${current.humidity}%`);
+  if (current.windspeedKmph) parts.push(`风速 ${current.windspeedKmph}km/h`);
+  if (maxRain != null) parts.push(`${dayLabel}最高降雨概率约 ${maxRain}%`);
+  if (today.uvIndex) parts.push(`UV ${today.uvIndex}`);
+  return {
+    ok: true,
+    provider: "weather",
+    query: location,
+    items: [{
+      title: `${area}天气`,
+      snippet: `${parts.join("，")}。数据来自 wttr.in / WorldWeatherOnline，可能与本地官方气象略有差异。`,
+      url: `https://wttr.in/${encodeURIComponent(location)}`,
+      source: "weather",
+    }],
+  };
+}
+
+function decodeXml(text: string): string {
+  return clean(String(text || "")
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'"));
+}
+
+async function searchBingRss(query: string): Promise<SearchResult> {
+  const url = `https://cn.bing.com/search?q=${encodeURIComponent(query)}&format=rss`;
+  const res = await fetchWithTimeout(url, {
+    headers: { accept: "application/rss+xml, application/xml, text/xml", "user-agent": "Mozilla/5.0 ai-voice-call/0.1" },
+  });
+  if (!res.ok) return { ok: false, query, items: [], provider: "bing-rss", error: `HTTP ${res.status}` };
+  const xml = await res.text();
+  const blocks = xml.match(/<item>[\s\S]*?<\/item>/gi) || [];
+  const items: SearchItem[] = [];
+  for (const block of blocks.slice(0, 6)) {
+    const title = decodeXml(/<title>([\s\S]*?)<\/title>/i.exec(block)?.[1] || "结果");
+    const snippet = decodeXml(/<description>([\s\S]*?)<\/description>/i.exec(block)?.[1] || "").replace(/<[^>]+>/g, "");
+    const link = decodeXml(/<link>([\s\S]*?)<\/link>/i.exec(block)?.[1] || "");
+    if (!title && !snippet) continue;
+    items.push({ title: truncate(title, 80), snippet: truncate(snippet, 220), url: link, source: "bing-rss" });
+  }
+  return { ok: items.length > 0, query, items, provider: "bing-rss" };
+}
+
 async function searchDuckDuckGo(query: string): Promise<SearchResult> {
   const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
   const res = await fetchWithTimeout(url, {
@@ -189,7 +303,8 @@ export async function runWebSearch(opts: {
   apiKey?: string;
   baseUrl?: string;
 }): Promise<SearchResult> {
-  const query = clean(opts.query).slice(0, 120);
+  const rawQuery = String(opts.query || "");
+  const query = normalizeSearchQuery(rawQuery);
   if (!query) return { ok: false, query: "", items: [], provider: "none", error: "empty query" };
 
   const provider = (opts.provider || "auto").toLowerCase();
@@ -197,10 +312,12 @@ export async function runWebSearch(opts: {
   const baseUrl = (opts.baseUrl || "").trim();
 
   const candidates: Array<() => Promise<SearchResult>> = [];
+  if ((provider === "auto" || provider === "weather") && (isWeatherQuery(rawQuery) || isWeatherQuery(query))) candidates.push(() => searchWeather(rawQuery));
 
   if (provider === "tavily" && key) candidates.push(() => searchTavily(query, key));
   if (provider === "serper" && key) candidates.push(() => searchSerper(query, key));
   if (provider === "searxng") candidates.push(() => searchSearx(query, baseUrl || "https://searx.be"));
+  if (provider === "bing" || provider === "bing-rss") candidates.push(() => searchBingRss(query));
   if (provider === "duckduckgo") candidates.push(() => searchDuckDuckGo(query));
 
   if (provider === "auto") {
@@ -209,6 +326,7 @@ export async function runWebSearch(opts: {
       if (key.startsWith("tvly-")) candidates.push(() => searchTavily(query, key));
       else candidates.push(() => searchSerper(query, key));
     }
+    candidates.push(() => searchBingRss(query));
     candidates.push(() => searchDuckDuckGo(query));
     candidates.push(() => searchSearx(query, baseUrl || "https://searx.be"));
   }
@@ -247,7 +365,7 @@ export async function runWebSearch(opts: {
 
 export function formatSearchContext(result: SearchResult): string {
   if (!result.items.length) {
-    return `【联网搜索】未找到与“${result.query}”相关的可靠结果（provider=${result.provider}${result.error ? ", " + result.error : ""}）。请基于常识谨慎回答，并说明信息可能过时。`;
+    return `【联网搜索】已尝试查询“${result.query}”，但没有拿到可用结果（provider=${result.provider}${result.error ? ", " + result.error : ""}）。如果问题依赖最新信息，请直接说明暂时查不到；不要编造实时数据，也不要说“联网搜索功能没开放”。`;
   }
   const lines = result.items.map((it, i) => {
     const link = it.url ? ` 链接: ${it.url}` : "";

@@ -15,6 +15,7 @@ import {
 
 const STORAGE_KEY = "ai-voice-call.config.v1";
 const HISTORY_KEY = "ai-voice-call.history.v1";
+const INSTALL_TIP_DISMISS_KEY = "ai-voice-call.installTip.dismissed.v1";
 const LEGACY_STORAGE_KEYS = [
   "ai-voice-call.config.v1", // current first
   "parent-chat-cf.config.v1",
@@ -66,22 +67,107 @@ function inferPromptPreset(prompt, preferred = "general") {
   return "custom";
 }
 
+const DEFAULT_PROVIDER_ID = "provider_default";
+
+const TTS_VOICE_PRESETS = [
+  "mimo_default",
+  "冰糖",
+  "茉莉",
+  "苏打",
+  "白桦",
+  "Mia",
+  "Chloe",
+  "Milo",
+  "Dean",
+  "alloy",
+];
+
+function setTtsVoiceFormValue(voice) {
+  const f = el.fields;
+  const value = String(voice || "").trim() || DEFAULTS.tts.voice;
+  if (!f.ttsVoicePreset || !f.ttsVoice) {
+    if (f.ttsVoice) f.ttsVoice.value = value;
+    return;
+  }
+  if (TTS_VOICE_PRESETS.includes(value)) {
+    f.ttsVoicePreset.value = value;
+    f.ttsVoice.value = value;
+    f.ttsVoice.classList.add("hidden");
+    return;
+  }
+  f.ttsVoicePreset.value = "custom";
+  f.ttsVoice.value = value;
+  f.ttsVoice.classList.remove("hidden");
+}
+
+function syncTtsVoiceCustomInput(focus = false) {
+  const f = el.fields;
+  if (!f.ttsVoicePreset || !f.ttsVoice) return;
+  if (f.ttsVoicePreset.value === "custom") {
+    if (TTS_VOICE_PRESETS.includes(f.ttsVoice.value.trim())) f.ttsVoice.value = "";
+    f.ttsVoice.classList.remove("hidden");
+    if (focus) f.ttsVoice.focus();
+    return;
+  }
+  f.ttsVoice.value = f.ttsVoicePreset.value;
+  f.ttsVoice.classList.add("hidden");
+}
+
+function readTtsVoiceFormValue() {
+  const f = el.fields;
+  if (!f.ttsVoicePreset) return f.ttsVoice?.value.trim() || "";
+  return f.ttsVoicePreset.value === "custom"
+    ? f.ttsVoice?.value.trim() || ""
+    : f.ttsVoicePreset.value;
+}
+
+function createProviderId() {
+  return `provider_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeProvider(partial = {}) {
+  return {
+    id: String(partial?.id || createProviderId()),
+    name: String(partial?.name || "未命名供应商").trim() || "未命名供应商",
+    baseUrl: String(partial?.baseUrl || "").trim(),
+    apiKey: String(partial?.apiKey || "").trim(),
+  };
+}
+
+function defaultApiProviders() {
+  return [
+    makeProvider({
+      id: DEFAULT_PROVIDER_ID,
+      name: "默认供应商",
+      baseUrl: "https://api.siliconflow.cn/v1",
+      apiKey: "",
+    }),
+  ];
+}
+
 const DEFAULTS = {
+  apiProviders: defaultApiProviders(),
   llm: {
+    providerId: DEFAULT_PROVIDER_ID,
     baseUrl: "https://api.siliconflow.cn/v1",
     apiKey: "",
     model: "Qwen/Qwen3.5-4B",
+    apiType: "auto",
   },
   stt: {
+    providerId: "",
     baseUrl: "",
     apiKey: "",
     model: "FunAudioLLM/SenseVoiceSmall",
+    apiType: "auto",
   },
   tts: {
+    providerId: "",
     baseUrl: "",
     apiKey: "",
     model: "FnLP/MOSS-TTSD-v0.5",
     voice: "alloy",
+    apiType: "auto",
   },
   systemPromptPreset: "general",
   systemPrompt: SYSTEM_PROMPT_PRESETS.general.prompt,
@@ -123,17 +209,33 @@ const el = {
   btnReset: document.getElementById("btnReset"),
   importFile: document.getElementById("importFile"),
   settingsStatus: document.getElementById("settingsStatus"),
+  installTip: document.getElementById("installTip"),
+  btnInstallApp: document.getElementById("btnInstallApp"),
+  btnInstallDismiss: document.getElementById("btnInstallDismiss"),
   fields: {
-    llmBaseUrl: document.getElementById("llmBaseUrl"),
+    apiProviderPicker: document.getElementById("apiProviderPicker"),
+    apiProviderList: document.getElementById("apiProviderList"),
+    providerEditor: document.getElementById("providerEditor"),
+    providerEditId: document.getElementById("providerEditId"),
+    providerName: document.getElementById("providerName"),
+    providerBaseUrl: document.getElementById("providerBaseUrl"),
+    providerApiKey: document.getElementById("providerApiKey"),
+    btnAddProvider: document.getElementById("btnAddProvider"),
+    btnEditSelectedProvider: document.getElementById("btnEditSelectedProvider"),
+    btnDeleteSelectedProvider: document.getElementById("btnDeleteSelectedProvider"),
+    btnSaveProvider: document.getElementById("btnSaveProvider"),
+    btnCancelProvider: document.getElementById("btnCancelProvider"),
+    llmProviderId: document.getElementById("llmProviderId"),
     llmModel: document.getElementById("llmModel"),
-    llmApiKey: document.getElementById("llmApiKey"),
-    sttBaseUrl: document.getElementById("sttBaseUrl"),
+    llmApiType: document.getElementById("llmApiType"),
+    sttProviderId: document.getElementById("sttProviderId"),
     sttModel: document.getElementById("sttModel"),
-    sttApiKey: document.getElementById("sttApiKey"),
-    ttsBaseUrl: document.getElementById("ttsBaseUrl"),
+    sttApiType: document.getElementById("sttApiType"),
+    ttsProviderId: document.getElementById("ttsProviderId"),
     ttsModel: document.getElementById("ttsModel"),
+    ttsVoicePreset: document.getElementById("ttsVoicePreset"),
     ttsVoice: document.getElementById("ttsVoice"),
-    ttsApiKey: document.getElementById("ttsApiKey"),
+    ttsApiType: document.getElementById("ttsApiType"),
     systemPromptPreset: document.getElementById("systemPromptPreset"),
     systemPrompt: document.getElementById("systemPrompt"),
     maxHistoryTurns: document.getElementById("maxHistoryTurns"),
@@ -157,6 +259,9 @@ let mediaRecorder = null;
 let recordChunks = [];
 let recording = false;
 let serverDefaults = null;
+let providersDraft = defaultApiProviders();
+let selectedProviderDraftId = DEFAULT_PROVIDER_ID;
+let providerEditorMode = ""; // "" | "add" | "edit"
 
 let browserRec = null;
 let browserTranscript = "";
@@ -170,23 +275,205 @@ function deepMerge(base, patch) {
   out.llm = { ...base.llm, ...(patch?.llm || {}) };
   out.stt = { ...base.stt, ...(patch?.stt || {}) };
   out.tts = { ...base.tts, ...(patch?.tts || {}) };
+  if (Array.isArray(patch?.apiProviders)) {
+    out.apiProviders = patch.apiProviders.map((item) => makeProvider(item));
+  } else if (Array.isArray(base.apiProviders)) {
+    out.apiProviders = base.apiProviders.map((item) => makeProvider(item));
+  } else {
+    out.apiProviders = defaultApiProviders();
+  }
   return out;
 }
 
+function findProviderById(list, id) {
+  if (!id) return null;
+  return (list || []).find((item) => item.id === id) || null;
+}
+
+function ensureProviderList(list) {
+  const cleaned = (Array.isArray(list) ? list : [])
+    .map((item) => makeProvider(item))
+    .filter((item) => item.id);
+  if (!cleaned.length) return defaultApiProviders();
+  const seen = new Set();
+  const unique = [];
+  for (const item of cleaned) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    unique.push(item);
+  }
+  return unique;
+}
+
+function resolveServiceProvider(apiProviders, providerId, fallbackId = "") {
+  return (
+    findProviderById(apiProviders, providerId) ||
+    findProviderById(apiProviders, fallbackId) ||
+    apiProviders[0] ||
+    makeProvider({
+      id: DEFAULT_PROVIDER_ID,
+      name: "默认供应商",
+      baseUrl: "https://api.siliconflow.cn/v1",
+      apiKey: "",
+    })
+  );
+}
+
+function serviceProviderDiffers(service = {}, llmBaseUrl = "", llmApiKey = "") {
+  const baseUrl = String(service?.baseUrl || "").trim();
+  const apiKey = String(service?.apiKey || "").trim();
+  return Boolean((baseUrl && baseUrl !== llmBaseUrl) || (apiKey && apiKey !== llmApiKey));
+}
+
+function providerFromLegacyConfig(raw = {}) {
+  if (Array.isArray(raw.apiProviders) && raw.apiProviders.length) {
+    return {
+      apiProviders: ensureProviderList(raw.apiProviders),
+      llmProviderId: raw.llm?.providerId || DEFAULT_PROVIDER_ID,
+      sttProviderId: raw.stt?.providerId || "",
+      ttsProviderId: raw.tts?.providerId || "",
+    };
+  }
+
+  const llmBaseUrl = String(raw.llm?.baseUrl || DEFAULTS.llm.baseUrl || "").trim();
+  const llmApiKey = String(raw.llm?.apiKey || "").trim();
+  const apiProviders = [
+    makeProvider({
+      id: DEFAULT_PROVIDER_ID,
+      name: "大模型供应商",
+      baseUrl: llmBaseUrl,
+      apiKey: llmApiKey,
+    }),
+  ];
+
+  let sttProviderId = "";
+  if (serviceProviderDiffers(raw.stt, llmBaseUrl, llmApiKey)) {
+    sttProviderId = "provider_stt_legacy";
+    apiProviders.push(makeProvider({
+      id: sttProviderId,
+      name: "语音识别供应商",
+      baseUrl: String(raw.stt?.baseUrl || llmBaseUrl).trim(),
+      apiKey: String(raw.stt?.apiKey || "").trim(),
+    }));
+  }
+
+  let ttsProviderId = "";
+  if (serviceProviderDiffers(raw.tts, llmBaseUrl, llmApiKey)) {
+    ttsProviderId = "provider_tts_legacy";
+    apiProviders.push(makeProvider({
+      id: ttsProviderId,
+      name: "语音合成供应商",
+      baseUrl: String(raw.tts?.baseUrl || llmBaseUrl).trim(),
+      apiKey: String(raw.tts?.apiKey || "").trim(),
+    }));
+  }
+
+  return { apiProviders, llmProviderId: DEFAULT_PROVIDER_ID, sttProviderId, ttsProviderId };
+}
+
+function syncResolvedCredentials(configLike) {
+  const out = configLike;
+  out.apiProviders = ensureProviderList(out.apiProviders);
+  const llmProvider = resolveServiceProvider(out.apiProviders, out.llm?.providerId, DEFAULT_PROVIDER_ID);
+  out.llm = {
+    ...(out.llm || {}),
+    providerId: llmProvider.id,
+    baseUrl: llmProvider.baseUrl,
+    apiKey: llmProvider.apiKey,
+    model: String(out.llm?.model || DEFAULTS.llm.model).trim() || DEFAULTS.llm.model,
+    apiType: normalizeApiType(out.llm?.apiType, DEFAULTS.llm.apiType),
+  };
+
+  const sttSelected = String(out.stt?.providerId || "").trim();
+  if (sttSelected && findProviderById(out.apiProviders, sttSelected)) {
+    const sttProvider = findProviderById(out.apiProviders, sttSelected);
+    out.stt = {
+      ...(out.stt || {}),
+      providerId: sttProvider.id,
+      baseUrl: sttProvider.baseUrl,
+      apiKey: sttProvider.apiKey,
+      model: String(out.stt?.model || DEFAULTS.stt.model).trim() || DEFAULTS.stt.model,
+      apiType: normalizeApiType(out.stt?.apiType, DEFAULTS.stt.apiType),
+    };
+  } else {
+    out.stt = {
+      ...(out.stt || {}),
+      providerId: "",
+      baseUrl: "",
+      apiKey: "",
+      model: String(out.stt?.model || DEFAULTS.stt.model).trim() || DEFAULTS.stt.model,
+      apiType: normalizeApiType(out.stt?.apiType, DEFAULTS.stt.apiType),
+    };
+  }
+
+  const ttsSelected = String(out.tts?.providerId || "").trim();
+  if (ttsSelected && findProviderById(out.apiProviders, ttsSelected)) {
+    const ttsProvider = findProviderById(out.apiProviders, ttsSelected);
+    out.tts = {
+      ...(out.tts || {}),
+      providerId: ttsProvider.id,
+      baseUrl: ttsProvider.baseUrl,
+      apiKey: ttsProvider.apiKey,
+      model: String(out.tts?.model || DEFAULTS.tts.model).trim() || DEFAULTS.tts.model,
+      voice: String(out.tts?.voice || DEFAULTS.tts.voice).trim() || DEFAULTS.tts.voice,
+      apiType: normalizeApiType(out.tts?.apiType, DEFAULTS.tts.apiType),
+    };
+  } else {
+    out.tts = {
+      ...(out.tts || {}),
+      providerId: "",
+      baseUrl: "",
+      apiKey: "",
+      model: String(out.tts?.model || DEFAULTS.tts.model).trim() || DEFAULTS.tts.model,
+      voice: String(out.tts?.voice || DEFAULTS.tts.voice).trim() || DEFAULTS.tts.voice,
+      apiType: normalizeApiType(out.tts?.apiType, DEFAULTS.tts.apiType),
+    };
+  }
+
+  return out;
+}
 function clampNumber(value, fallback, min, max) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(Math.max(n, min), max);
 }
 
+function normalizeApiType(value, fallback = "auto") {
+  const allowed = new Set(["auto", "openai-chat", "openai-responses", "openai-transcriptions", "openai-speech", "xiaomi-mimo"]);
+  const v = String(value || "").trim();
+  return allowed.has(v) ? v : fallback;
+}
+
 function normalizeConfig(next) {
-  const out = deepMerge(DEFAULTS, next || {});
+  const raw = next || {};
+  const legacyProviders = providerFromLegacyConfig(raw);
+  const out = deepMerge(DEFAULTS, {
+    ...raw,
+    apiProviders: legacyProviders.apiProviders,
+    llm: {
+      providerId: raw.llm?.providerId || legacyProviders.llmProviderId || DEFAULT_PROVIDER_ID,
+      model: raw.llm?.model,
+      apiType: normalizeApiType(raw.llm?.apiType, DEFAULTS.llm.apiType),
+    },
+    stt: {
+      providerId: raw.stt?.providerId || legacyProviders.sttProviderId || "",
+      model: raw.stt?.model,
+      apiType: normalizeApiType(raw.stt?.apiType, DEFAULTS.stt.apiType),
+    },
+    tts: {
+      providerId: raw.tts?.providerId || legacyProviders.ttsProviderId || "",
+      model: raw.tts?.model,
+      voice: raw.tts?.voice,
+      apiType: normalizeApiType(raw.tts?.apiType, DEFAULTS.tts.apiType),
+    },
+  });
   out.systemPrompt = String(out.systemPrompt || "").trim() || SYSTEM_PROMPT_PRESETS.general.prompt;
   out.systemPromptPreset = inferPromptPreset(out.systemPrompt, out.systemPromptPreset || "general");
   out.maxHistoryTurns = clampNumber(out.maxHistoryTurns, 12, 2, 30);
   out.maxTokens = clampNumber(out.maxTokens, 512, 256, 1024);
   out.temperature = clampNumber(out.temperature, 0.7, 0, 1.5);
-  return out;
+  delete out.providers;
+  return syncResolvedCredentials(out);
 }
 
 function loadLegacyConfig() {
@@ -604,6 +891,135 @@ async function retryMessageAt(index) {
   }
 }
 
+
+async function requestChatJson(requestMessages) {
+  const controller = new AbortController();
+  const chatTimer = setTimeout(() => controller.abort(), 60000);
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: requestMessages, config: apiConfigPayload() }),
+      signal: controller.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    const reply = String(data.reply || "").trim();
+    if (!reply) throw new Error("模型没有返回文字，请换模型或稍后再试");
+    return { reply, webSearch: data.webSearch || null };
+  } finally {
+    clearTimeout(chatTimer);
+  }
+}
+
+function parseSseEventBlock(block) {
+  let eventName = "message";
+  const dataLines = [];
+  for (const rawLine of String(block || "").split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    if (!line || line.startsWith(":")) continue;
+    if (line.startsWith("event:")) eventName = line.slice(6).trim() || "message";
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+  }
+  return { eventName, dataText: dataLines.join("\n").trim() };
+}
+
+function assistantBubble(row) {
+  return row?.querySelector?.(".msg.assistant") || row;
+}
+
+function setAssistantText(row, text) {
+  const bubble = assistantBubble(row);
+  if (bubble) bubble.textContent = text || "…";
+  el.chat.scrollTop = el.chat.scrollHeight;
+}
+
+async function requestChatStreamWithFallback(requestMessages, row) {
+  let reply = "";
+  let webSearch = null;
+  let sawDelta = false;
+  const controller = new AbortController();
+  const chatTimer = setTimeout(() => controller.abort(), 120000);
+  try {
+    const res = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: requestMessages, config: apiConfigPayload() }),
+      signal: controller.signal,
+    });
+    if (!res.ok || !res.body) {
+      const data = await res.json().catch(() => ({}));
+      throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { beforeDelta: true });
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const handleBlock = (block) => {
+      const { eventName, dataText } = parseSseEventBlock(block);
+      if (!dataText || dataText === "[DONE]") return;
+      let data = {};
+      try { data = JSON.parse(dataText); } catch { data = { text: dataText }; }
+      if (eventName === "delta") {
+        const text = String(data.text || "");
+        if (text) {
+          sawDelta = true;
+          reply += text;
+          setAssistantText(row, reply);
+        }
+        return;
+      }
+      if (eventName === "done") {
+        if (data.reply) {
+          reply = String(data.reply || "").trim();
+          setAssistantText(row, reply);
+        }
+        webSearch = data.webSearch || null;
+        return;
+      }
+      if (eventName === "error") {
+        const err = new Error(data.error || "流式生成失败");
+        err.partial = data.partial || reply;
+        throw err;
+      }
+    };
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      let idx2;
+      while ((idx2 = buffer.indexOf("\n\n")) >= 0) {
+        const block = buffer.slice(0, idx2);
+        buffer = buffer.slice(idx2 + 2);
+        handleBlock(block);
+      }
+    }
+    const tail = decoder.decode();
+    if (tail) buffer += tail;
+    if (buffer.trim()) handleBlock(buffer);
+    reply = reply.trim();
+    if (!reply) throw Object.assign(new Error("模型没有返回文字，请换模型或稍后再试"), { beforeDelta: !sawDelta });
+    return { reply, webSearch, streamed: true };
+  } catch (err) {
+    if (sawDelta || err.partial) {
+      err.partial = String(err.partial || reply || "").trim();
+      throw err;
+    }
+    console.warn("stream chat failed before output; fallback to /api/chat", err);
+    const data = await requestChatJson(requestMessages);
+    setAssistantText(row, data.reply);
+    return { ...data, streamed: false };
+  } finally {
+    clearTimeout(chatTimer);
+  }
+}
+
+function removeAssistantPlaceholder(row, index) {
+  if (Number.isInteger(index) && messages[index]?.role === "assistant" && !messages[index].content) {
+    messages.splice(index, 1);
+  }
+  row?.remove?.();
+}
+
 async function regenerateAssistant() {
   if (busy) return;
   if (!config.llm.apiKey) {
@@ -621,34 +1037,32 @@ async function regenerateAssistant() {
   el.btnHold.disabled = true;
   setStatus("正在重新生成…");
 
+  const requestMessages = messages.slice();
+  const assistantIndex = messages.length;
+  messages.push({ role: "assistant", content: "" });
+  const row = appendMessage("assistant", "…", assistantIndex);
+
   try {
-    const controller = new AbortController();
-    const chatTimer = setTimeout(() => controller.abort(), 45000);
-    let res;
-    try {
-      res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ messages, config: apiConfigPayload() }),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(chatTimer);
-    }
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
-    const reply = String(data.reply || "").trim();
-    if (!reply) throw new Error("模型没有返回文字，请换模型或稍后再试");
-    messages.push({ role: "assistant", content: reply });
-    appendMessage("assistant", reply, messages.length - 1);
+    const data = await requestChatStreamWithFallback(requestMessages, row);
+    messages[assistantIndex].content = data.reply;
     await saveHistory();
+    let speakResult = { mode: "off" };
     if (config.autoSpeak) {
       setStatus("正在朗读…");
-      await speakText(reply);
+      speakResult = await speakText(data.reply);
     }
-    setStatus(config.autoSpeak ? "可以继续聊" : "可以继续聊（文字模式）");
+    setStatus(readyStatusAfterSpeak(speakResult));
   } catch (err) {
-    setStatus(`重试失败：${explainFetchError(err)}`);
+    const partial = String(err.partial || "").trim();
+    if (partial) {
+      messages[assistantIndex].content = partial;
+      setAssistantText(row, partial);
+      await saveHistory();
+      setStatus(`生成中断：${explainFetchError(err)}`);
+    } else {
+      removeAssistantPlaceholder(row, assistantIndex);
+      setStatus(`重试失败：${explainFetchError(err)}`);
+    }
   } finally {
     busy = false;
     el.btnSend.disabled = false;
@@ -656,49 +1070,280 @@ async function regenerateAssistant() {
   }
 }
 
-function apiConfigPayload() {
-  return {
-    llm: {
-      baseUrl: config.llm.baseUrl,
-      apiKey: config.llm.apiKey,
-      model: config.llm.model,
-    },
-    stt: {
-      baseUrl: config.stt.baseUrl || config.llm.baseUrl,
-      apiKey: config.stt.apiKey || config.llm.apiKey,
-      model: config.stt.model,
-    },
-    tts: {
-      baseUrl: config.tts.baseUrl || config.llm.baseUrl,
-      apiKey: config.tts.apiKey || config.llm.apiKey,
-      model: config.tts.model,
-      voice: config.tts.voice,
-    },
-    systemPromptPreset: config.systemPromptPreset || inferPromptPreset(config.systemPrompt),
-    systemPrompt: config.systemPrompt,
-    maxHistoryTurns: Number(config.maxHistoryTurns) || 12,
-    maxTokens: clampNumber(config.maxTokens, 512, 256, 1024),
-    temperature: Number(config.temperature) || 0.7,
-    ttsEnabled: Boolean(config.ttsEnabled),
-    webSearchEnabled: Boolean(config.webSearchEnabled),
-    searchProvider: config.searchProvider || "auto",
-    searchApiKey: config.searchApiKey || "",
-    searchBaseUrl: config.searchBaseUrl || "",
+function resolveRuntimeService(service, role) {
+  const list = ensureProviderList(config.apiProviders);
+  const llmProvider = resolveServiceProvider(list, config.llm?.providerId, DEFAULT_PROVIDER_ID);
+  const selectedId = String(service?.providerId || "").trim();
+  const provider = role === "llm"
+    ? llmProvider
+    : (selectedId ? resolveServiceProvider(list, selectedId, llmProvider.id) : llmProvider);
+  const payload = {
+    baseUrl: provider.baseUrl || llmProvider.baseUrl || "",
+    apiKey: provider.apiKey || llmProvider.apiKey || "",
+    model: String(service?.model || "").trim(),
+    apiType: normalizeApiType(service?.apiType),
   };
+  if (role === "tts") payload.voice = String(service?.voice || "alloy").trim() || "alloy";
+  return payload;
+}
+
+function readLiveSearchSettings() {
+  const f = el.fields || {};
+  return {
+    webSearchEnabled: f.webSearchEnabled ? f.webSearchEnabled.checked : Boolean(config.webSearchEnabled),
+    searchProvider: f.searchProvider ? (f.searchProvider.value || "auto") : (config.searchProvider || "auto"),
+    searchApiKey: f.searchApiKey ? f.searchApiKey.value.trim() : (config.searchApiKey || ""),
+    searchBaseUrl: f.searchBaseUrl ? f.searchBaseUrl.value.trim() : (config.searchBaseUrl || ""),
+  };
+}
+
+function applyLiveSearchSettings({ persist = false, quiet = true } = {}) {
+  const next = readLiveSearchSettings();
+  config = normalizeConfig({ ...config, ...next });
+  if (persist) {
+    saveConfig(config)
+      .then(() => {
+        if (!quiet) setSettingsStatus("搜索设置已保存并立即生效");
+      })
+      .catch((err) => {
+        setSettingsStatus(`搜索设置保存失败：${err.message || err}`);
+      });
+  }
+  return next;
+}
+
+function apiConfigPayload() {
+  // 搜索开关容易被误会：这里直接读取设置面板当前值，哪怕还没点「保存到本地」也会对下一次对话生效。
+  const liveSearch = readLiveSearchSettings();
+  const runtimeConfig = normalizeConfig({ ...config, ...liveSearch });
+  const llm = resolveRuntimeService(runtimeConfig.llm, "llm");
+  const stt = resolveRuntimeService(runtimeConfig.stt, "stt");
+  const tts = resolveRuntimeService(runtimeConfig.tts, "tts");
+  return {
+    llm,
+    stt,
+    tts,
+    apiProviders: ensureProviderList(runtimeConfig.apiProviders).map((item) => ({
+      id: item.id,
+      name: item.name,
+      baseUrl: item.baseUrl,
+    })),
+    systemPromptPreset: runtimeConfig.systemPromptPreset || inferPromptPreset(runtimeConfig.systemPrompt),
+    systemPrompt: runtimeConfig.systemPrompt,
+    maxHistoryTurns: Number(runtimeConfig.maxHistoryTurns) || 12,
+    maxTokens: clampNumber(runtimeConfig.maxTokens, 512, 256, 1024),
+    temperature: Number(runtimeConfig.temperature) || 0.7,
+    ttsEnabled: Boolean(runtimeConfig.ttsEnabled),
+    webSearchEnabled: Boolean(liveSearch.webSearchEnabled),
+    searchProvider: liveSearch.searchProvider || "auto",
+    searchApiKey: liveSearch.searchApiKey || "",
+    searchBaseUrl: liveSearch.searchBaseUrl || "",
+  };
+}
+
+function fillProviderSelect(selectEl, selectedId, { allowFollow = false } = {}) {
+  if (!selectEl) return;
+  const list = ensureProviderList(providersDraft);
+  const current = String(selectedId || "");
+  const options = [];
+  if (allowFollow) {
+    options.push(`<option value="">跟随大模型</option>`);
+  }
+  for (const item of list) {
+    options.push(`<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`);
+  }
+  selectEl.innerHTML = options.join("") || `<option value="">暂无供应商</option>`;
+  if (current && list.some((item) => item.id === current)) {
+    selectEl.value = current;
+  } else if (allowFollow) {
+    selectEl.value = "";
+  } else if (list[0]) {
+    selectEl.value = list[0].id;
+  } else {
+    selectEl.value = "";
+  }
+}
+
+function usedProviderTags(providerId) {
+  const tags = [];
+  if (el.fields.llmProviderId?.value === providerId) tags.push("LLM");
+  if (el.fields.sttProviderId?.value === providerId) tags.push("语音识别");
+  if (el.fields.ttsProviderId?.value === providerId) tags.push("TTS");
+  return tags;
+}
+
+function syncProviderPicker(list) {
+  const picker = el.fields.apiProviderPicker;
+  if (!picker) return null;
+  if (!list.length) {
+    picker.innerHTML = `<option value="">暂无供应商</option>`;
+    picker.value = "";
+    selectedProviderDraftId = "";
+    picker.disabled = true;
+    return null;
+  }
+  picker.disabled = false;
+  if (!findProviderById(list, selectedProviderDraftId)) {
+    selectedProviderDraftId = list[0].id;
+  }
+  picker.innerHTML = list.map((item) => {
+    const keyState = item.apiKey ? "已填 Key" : "未填 Key";
+    return `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} · ${keyState}</option>`;
+  }).join("");
+  picker.value = selectedProviderDraftId;
+  return findProviderById(list, selectedProviderDraftId) || list[0];
+}
+
+function selectedProviderDraft() {
+  const list = ensureProviderList(providersDraft);
+  providersDraft = list;
+  return syncProviderPicker(list);
+}
+
+function renderProviderList() {
+  const box = el.fields.apiProviderList;
+  if (!box) return;
+  const list = ensureProviderList(providersDraft);
+  providersDraft = list;
+  const item = syncProviderPicker(list);
+  if (!item) {
+    box.innerHTML = `<div class="provider-empty">还没有供应商。先点「新增供应商」，填写 Base URL 和 API Key。</div>`;
+    return;
+  }
+  const tags = usedProviderTags(item.id);
+  const tagHtml = [
+    item.apiKey
+      ? `<span class="provider-tag ok">Key 已填</span>`
+      : `<span class="provider-tag warn">Key 未填</span>`,
+    ...tags.map((tag) => `<span class="provider-tag">${escapeHtml(tag)}</span>`),
+  ].join("");
+  const editing = providerEditorMode === "edit" && el.fields.providerEditId?.value === item.id;
+  box.innerHTML = `
+    <div class="provider-item provider-item-selected${editing ? " active" : ""}" data-provider-id="${escapeHtml(item.id)}">
+      <div class="provider-item-main">
+        <div class="provider-item-title">${escapeHtml(item.name)}</div>
+        <div class="provider-item-meta">${escapeHtml(item.baseUrl || "未填写 Base URL")}</div>
+        <div class="provider-item-tags">${tagHtml}</div>
+      </div>
+    </div>
+  `;
+}
+
+function refreshProviderSelects(selected = {}) {
+  fillProviderSelect(el.fields.llmProviderId, selected.llm ?? el.fields.llmProviderId?.value ?? config.llm.providerId, { allowFollow: false });
+  fillProviderSelect(el.fields.sttProviderId, selected.stt ?? el.fields.sttProviderId?.value ?? config.stt.providerId, { allowFollow: true });
+  fillProviderSelect(el.fields.ttsProviderId, selected.tts ?? el.fields.ttsProviderId?.value ?? config.tts.providerId, { allowFollow: true });
+  renderProviderList();
+}
+
+function closeProviderEditor() {
+  providerEditorMode = "";
+  if (el.fields.providerEditor) el.fields.providerEditor.classList.add("hidden");
+  if (el.fields.providerEditId) el.fields.providerEditId.value = "";
+  if (el.fields.providerName) el.fields.providerName.value = "";
+  if (el.fields.providerBaseUrl) el.fields.providerBaseUrl.value = "";
+  if (el.fields.providerApiKey) {
+    el.fields.providerApiKey.value = "";
+    el.fields.providerApiKey.type = "password";
+  }
+  const eye = document.querySelector('[data-eye-for="providerApiKey"]');
+  if (eye) {
+    eye.textContent = "👁";
+    eye.setAttribute("aria-pressed", "false");
+    eye.title = "显示密钥";
+  }
+  renderProviderList();
+}
+
+function openProviderEditor(provider = null) {
+  if (!el.fields.providerEditor) return;
+  if (provider?.id) selectedProviderDraftId = provider.id;
+  providerEditorMode = provider ? "edit" : "add";
+  el.fields.providerEditor.classList.remove("hidden");
+  el.fields.providerEditId.value = provider?.id || "";
+  el.fields.providerName.value = provider?.name || "";
+  el.fields.providerBaseUrl.value = provider?.baseUrl || "https://api.siliconflow.cn/v1";
+  el.fields.providerApiKey.value = provider?.apiKey || "";
+  el.fields.providerName.focus();
+  renderProviderList();
+}
+
+function saveProviderEditor() {
+  const name = el.fields.providerName?.value.trim() || "未命名供应商";
+  const baseUrl = el.fields.providerBaseUrl?.value.trim() || "";
+  const apiKey = el.fields.providerApiKey?.value.trim() || "";
+  if (!baseUrl) {
+    setSettingsStatus("请填写供应商 Base URL");
+    el.fields.providerBaseUrl?.focus();
+    return false;
+  }
+  const editId = el.fields.providerEditId?.value || "";
+  if (editId) {
+    providersDraft = ensureProviderList(providersDraft).map((item) => (
+      item.id === editId ? makeProvider({ id: editId, name, baseUrl, apiKey }) : item
+    ));
+    selectedProviderDraftId = editId;
+  } else {
+    const provider = makeProvider({ name, baseUrl, apiKey });
+    providersDraft = [
+      ...ensureProviderList(providersDraft),
+      provider,
+    ];
+    selectedProviderDraftId = provider.id;
+  }
+  closeProviderEditor();
+  refreshProviderSelects();
+  setSettingsStatus("供应商已更新，记得点底部「保存到本地」");
+  return true;
+}
+
+function deleteProvider(providerId) {
+  const list = ensureProviderList(providersDraft);
+  if (list.length <= 1) {
+    setSettingsStatus("至少保留一个供应商");
+    return;
+  }
+  const target = findProviderById(list, providerId);
+  if (!target) return;
+  if (!confirm(`确定删除供应商「${target.name}」？`)) return;
+  providersDraft = list.filter((item) => item.id !== providerId);
+  if (selectedProviderDraftId === providerId) {
+    selectedProviderDraftId = providersDraft[0]?.id || "";
+  }
+  if (el.fields.llmProviderId?.value === providerId) {
+    el.fields.llmProviderId.value = providersDraft[0]?.id || "";
+  }
+  if (el.fields.sttProviderId?.value === providerId) {
+    el.fields.sttProviderId.value = "";
+  }
+  if (el.fields.ttsProviderId?.value === providerId) {
+    el.fields.ttsProviderId.value = "";
+  }
+  if (el.fields.providerEditId?.value === providerId) closeProviderEditor();
+  refreshProviderSelects();
+  setSettingsStatus("供应商已删除，记得点底部「保存到本地」");
 }
 
 function fillSettingsForm() {
   const f = el.fields;
-  f.llmBaseUrl.value = config.llm.baseUrl || "";
+  providersDraft = ensureProviderList(config.apiProviders);
+  selectedProviderDraftId = findProviderById(providersDraft, selectedProviderDraftId)?.id
+    || findProviderById(providersDraft, config.llm.providerId)?.id
+    || providersDraft[0]?.id
+    || "";
+  closeProviderEditor();
+  refreshProviderSelects({
+    llm: config.llm.providerId,
+    stt: config.stt.providerId,
+    tts: config.tts.providerId,
+  });
   f.llmModel.value = config.llm.model || "";
-  f.llmApiKey.value = config.llm.apiKey || "";
-  f.sttBaseUrl.value = config.stt.baseUrl || "";
+  if (f.llmApiType) f.llmApiType.value = normalizeApiType(config.llm.apiType, DEFAULTS.llm.apiType);
   f.sttModel.value = config.stt.model || "";
-  f.sttApiKey.value = config.stt.apiKey || "";
-  f.ttsBaseUrl.value = config.tts.baseUrl || "";
+  if (f.sttApiType) f.sttApiType.value = normalizeApiType(config.stt.apiType, DEFAULTS.stt.apiType);
   f.ttsModel.value = config.tts.model || "";
-  f.ttsVoice.value = config.tts.voice || "";
-  f.ttsApiKey.value = config.tts.apiKey || "";
+  setTtsVoiceFormValue(config.tts.voice || "");
+  if (f.ttsApiType) f.ttsApiType.value = normalizeApiType(config.tts.apiType, DEFAULTS.tts.apiType);
   const promptPreset = inferPromptPreset(config.systemPrompt, config.systemPromptPreset || "general");
   if (f.systemPromptPreset) f.systemPromptPreset.value = promptPreset;
   f.systemPrompt.value = config.systemPrompt || SYSTEM_PROMPT_PRESETS.general.prompt;
@@ -717,22 +1362,25 @@ function fillSettingsForm() {
 
 function readSettingsForm() {
   const f = el.fields;
+  const apiProviders = ensureProviderList(providersDraft);
+  const llmProviderId = String(f.llmProviderId?.value || apiProviders[0]?.id || DEFAULT_PROVIDER_ID);
   return deepMerge(DEFAULTS, {
+    apiProviders,
     llm: {
-      baseUrl: f.llmBaseUrl.value.trim(),
+      providerId: llmProviderId,
       model: f.llmModel.value.trim(),
-      apiKey: f.llmApiKey.value.trim(),
+      apiType: normalizeApiType(f.llmApiType?.value, DEFAULTS.llm.apiType),
     },
     stt: {
-      baseUrl: f.sttBaseUrl.value.trim(),
+      providerId: String(f.sttProviderId?.value || ""),
       model: f.sttModel.value.trim(),
-      apiKey: f.sttApiKey.value.trim(),
+      apiType: normalizeApiType(f.sttApiType?.value, DEFAULTS.stt.apiType),
     },
     tts: {
-      baseUrl: f.ttsBaseUrl.value.trim(),
+      providerId: String(f.ttsProviderId?.value || ""),
       model: f.ttsModel.value.trim(),
-      voice: f.ttsVoice.value.trim(),
-      apiKey: f.ttsApiKey.value.trim(),
+      voice: readTtsVoiceFormValue(),
+      apiType: normalizeApiType(f.ttsApiType?.value, DEFAULTS.tts.apiType),
     },
     systemPromptPreset: inferPromptPreset(f.systemPrompt.value, f.systemPromptPreset?.value || "general"),
     systemPrompt: f.systemPrompt.value.trim() || SYSTEM_PROMPT_PRESETS.general.prompt,
@@ -750,7 +1398,7 @@ function readSettingsForm() {
 }
 
 function switchSettingsTab(tabName) {
-  const name = tabName || "llm";
+  const name = tabName || "providers";
   document.querySelectorAll(".settings-tab").forEach((btn) => {
     const active = btn.getAttribute("data-tab") === name;
     btn.classList.toggle("active", active);
@@ -765,7 +1413,7 @@ function switchSettingsTab(tabName) {
 
 function openSettings() {
   fillSettingsForm();
-  switchSettingsTab("llm");
+  switchSettingsTab("providers");
   el.settingsModal.classList.remove("hidden");
   setSettingsStatus("配置保存在本机 IndexedDB，可导入/导出。");
 }
@@ -786,12 +1434,22 @@ async function exportConfig(includeKeys = true) {
   data.app = "ai-voice-call";
   data.version = 1;
   if (!includeKeys) {
+    data.apiProviders = ensureProviderList(data.apiProviders).map((item) => ({
+      ...item,
+      apiKey: "",
+    }));
     data.llm = { ...(data.llm || {}), apiKey: "" };
     data.stt = { ...(data.stt || {}), apiKey: "" };
     data.tts = { ...(data.tts || {}), apiKey: "" };
     data.searchApiKey = "";
   }
-  const hasKey = Boolean(data.llm?.apiKey || data.stt?.apiKey || data.tts?.apiKey || data.searchApiKey);
+  const hasKey = Boolean(
+    (data.apiProviders || []).some((item) => item?.apiKey) ||
+    data.llm?.apiKey ||
+    data.stt?.apiKey ||
+    data.tts?.apiKey ||
+    data.searchApiKey
+  );
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
   const a = document.createElement("a");
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
@@ -815,19 +1473,44 @@ async function importConfigFile(file) {
   const parsed = JSON.parse(text);
   const incoming = parsed.llm || parsed.stt || parsed.tts ? parsed : parsed.config;
   if (!incoming || typeof incoming !== "object") throw new Error("未识别的配置文件");
-  await saveConfig(deepMerge(config, incoming));
+  await saveConfig(incoming);
   fillSettingsForm();
   setSettingsStatus("导入成功，已保存到本机数据库");
   setStatus(config.llm.apiKey ? "本地配置已就绪" : "请填写 API Key");
 }
 
 async function testConnection() {
-  const draft = readSettingsForm();
+  const draft = normalizeConfig(readSettingsForm());
   setSettingsStatus("测试中…");
   const res = await fetch("/api/test", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ config: draft }),
+    body: JSON.stringify({
+      config: {
+        llm: {
+          baseUrl: draft.llm.baseUrl,
+          apiKey: draft.llm.apiKey,
+          model: draft.llm.model,
+          apiType: draft.llm.apiType,
+        },
+        stt: {
+          baseUrl: draft.stt.baseUrl || draft.llm.baseUrl,
+          apiKey: draft.stt.apiKey || draft.llm.apiKey,
+          model: draft.stt.model,
+          apiType: draft.stt.apiType,
+        },
+        tts: {
+          baseUrl: draft.tts.baseUrl || draft.llm.baseUrl,
+          apiKey: draft.tts.apiKey || draft.llm.apiKey,
+          model: draft.tts.model,
+          voice: draft.tts.voice,
+          apiType: draft.tts.apiType,
+        },
+        systemPrompt: draft.systemPrompt,
+        maxTokens: draft.maxTokens,
+        temperature: draft.temperature,
+      },
+    }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.ok) {
@@ -1031,7 +1714,8 @@ function browserSpeak(text) {
 }
 
 async function speakText(text) {
-  if (!config.autoSpeak) return;
+  if (!config.autoSpeak) return { mode: "off" };
+  let onlineError = "";
   if (config.ttsEnabled) {
     try {
       const controller = new AbortController();
@@ -1051,13 +1735,34 @@ async function speakText(text) {
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const audio = new Audio(url);
+        audio.addEventListener("ended", () => URL.revokeObjectURL(url), { once: true });
+        audio.addEventListener("error", () => URL.revokeObjectURL(url), { once: true });
         await audio.play();
-        URL.revokeObjectURL(url);
-        return;
+        return { mode: "online" };
       }
-    } catch {}
+      const data = await res.json().catch(() => ({}));
+      onlineError = data.error || `HTTP ${res.status}`;
+      console.warn("在线 TTS 失败", { status: res.status, ...data });
+    } catch (err) {
+      onlineError = err && err.name === "AbortError" ? "TTS 请求超时" : explainFetchError(err);
+      console.warn("在线 TTS 失败", err);
+    }
   }
-  if (config.browserTtsFallback) await browserSpeak(text);
+  if (config.browserTtsFallback) {
+    const ok = await browserSpeak(text);
+    if (onlineError) return { mode: ok ? "browser" : "browser-failed", error: onlineError };
+    return { mode: ok ? "browser" : "browser-failed" };
+  }
+  if (onlineError) return { mode: "failed", error: onlineError };
+  return { mode: "skipped" };
+}
+
+function readyStatusAfterSpeak(result) {
+  if (result?.mode === "browser" && result.error) return `在线 TTS 失败，已用浏览器朗读：${result.error}`;
+  if (result?.mode === "browser-failed" && result.error) return `在线 TTS 失败，浏览器朗读也失败：${result.error}`;
+  if (result?.mode === "browser-failed") return "浏览器朗读失败，请检查系统语音设置";
+  if (result?.mode === "failed") return `朗读失败：${result.error || "未知错误"}`;
+  return "";
 }
 
 async function sendText(text) {
@@ -1079,26 +1784,14 @@ async function sendText(text) {
   await saveHistory();
   setStatus("正在思考…");
 
+  const requestMessages = messages.slice();
+  const assistantIndex = messages.length;
+  messages.push({ role: "assistant", content: "" });
+  const row = appendMessage("assistant", "…", assistantIndex);
+
   try {
-    const controller = new AbortController();
-    const chatTimer = setTimeout(() => controller.abort(), 45000);
-    let res;
-    try {
-      res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ messages, config: apiConfigPayload() }),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(chatTimer);
-    }
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
-    const reply = String(data.reply || "").trim();
-    if (!reply) throw new Error("模型没有返回文字，请换模型或稍后再试");
-    messages.push({ role: "assistant", content: reply });
-    appendMessage("assistant", reply, messages.length - 1);
+    const data = await requestChatStreamWithFallback(requestMessages, row);
+    messages[assistantIndex].content = data.reply;
     await saveHistory();
     if (data.webSearch && data.webSearch.used) {
       const ws = data.webSearch;
@@ -1107,13 +1800,23 @@ async function sendText(text) {
     } else {
       setStatus("可以继续聊");
     }
+    let speakResult = { mode: "off" };
     if (config.autoSpeak) {
       setStatus("正在朗读…");
-      await speakText(reply);
+      speakResult = await speakText(data.reply);
     }
-    setStatus(config.autoSpeak ? "可以继续聊" : "可以继续聊（文字模式）");
+    setStatus(readyStatusAfterSpeak(speakResult));
   } catch (err) {
-    setStatus(`发送失败：${explainFetchError(err)}`);
+    const partial = String(err.partial || "").trim();
+    if (partial) {
+      messages[assistantIndex].content = partial;
+      setAssistantText(row, partial);
+      await saveHistory();
+      setStatus(`生成中断：${explainFetchError(err)}`);
+    } else {
+      removeAssistantPlaceholder(row, assistantIndex);
+      setStatus(`发送失败：${explainFetchError(err)}`);
+    }
   } finally {
     busy = false;
     el.btnSend.disabled = false;
@@ -1474,7 +2177,7 @@ async function handleRecordedAudio(blob) {
     if (!res.ok || !data.ok) throw new Error(data.error || ("HTTP " + res.status));
     const text = String(data.text || "").trim();
     if (!text) {
-      setStatus("没有识别出文字。请靠近麦克风大声说，并确认 STT=FunAudioLLM/SenseVoiceSmall");
+      setStatus("没有识别出文字。请靠近麦克风大声说，并确认语音识别模型为 FunAudioLLM/SenseVoiceSmall");
       return;
     }
     setStatus("识别到：" + text);
@@ -1574,22 +2277,30 @@ async function initDefaults() {
     const data = await res.json();
     serverDefaults = data?.defaults || null;
     if (serverDefaults && !(await hasAppConfig())) {
-      config = deepMerge(DEFAULTS, {
+      config = normalizeConfig({
+        apiProviders: [
+          makeProvider({
+            id: DEFAULT_PROVIDER_ID,
+            name: "默认供应商",
+            baseUrl: serverDefaults.llm?.baseUrl || "https://api.siliconflow.cn/v1",
+            apiKey: "",
+          }),
+        ],
         llm: {
-          baseUrl: serverDefaults.llm?.baseUrl,
+          providerId: DEFAULT_PROVIDER_ID,
           model: serverDefaults.llm?.model,
-          apiKey: "",
+          apiType: serverDefaults.llm?.apiType || DEFAULTS.llm.apiType,
         },
         stt: {
-          baseUrl: serverDefaults.stt?.baseUrl,
+          providerId: "",
           model: serverDefaults.stt?.model,
-          apiKey: "",
+          apiType: serverDefaults.stt?.apiType || DEFAULTS.stt.apiType,
         },
         tts: {
-          baseUrl: serverDefaults.tts?.baseUrl,
+          providerId: "",
           model: serverDefaults.tts?.model,
           voice: serverDefaults.tts?.voice,
-          apiKey: "",
+          apiType: serverDefaults.tts?.apiType || DEFAULTS.tts.apiType,
         },
         systemPromptPreset: serverDefaults.systemPromptPreset || inferPromptPreset(serverDefaults.systemPrompt),
         systemPrompt: serverDefaults.systemPrompt,
@@ -1703,6 +2414,9 @@ if (el.btnVoice) el.btnVoice.addEventListener("click", async (e) => {
   }
 });
 
+if (el.fields?.ttsVoicePreset) {
+  el.fields.ttsVoicePreset.addEventListener("change", () => syncTtsVoiceCustomInput(true));
+}
 // settings switches also update header voice icon
 ["autoSpeak", "ttsEnabled", "browserTtsFallback"].forEach((key) => {
   const input = el.fields?.[key];
@@ -1754,8 +2468,41 @@ el.settingsModal.addEventListener("click", (e) => {
   if (e.target === el.settingsModal) closeSettings();
 });
 
+el.fields.btnAddProvider?.addEventListener("click", () => openProviderEditor(null));
+el.fields.btnEditSelectedProvider?.addEventListener("click", () => {
+  const provider = selectedProviderDraft();
+  if (provider) openProviderEditor(provider);
+});
+el.fields.btnDeleteSelectedProvider?.addEventListener("click", () => {
+  const provider = selectedProviderDraft();
+  if (provider) deleteProvider(provider.id);
+});
+el.fields.btnSaveProvider?.addEventListener("click", () => saveProviderEditor());
+el.fields.btnCancelProvider?.addEventListener("click", () => closeProviderEditor());
+el.fields.apiProviderPicker?.addEventListener("change", () => {
+  selectedProviderDraftId = el.fields.apiProviderPicker.value;
+  if (providerEditorMode === "edit") closeProviderEditor();
+  renderProviderList();
+});
+el.fields.llmProviderId?.addEventListener("change", () => renderProviderList());
+el.fields.sttProviderId?.addEventListener("change", () => renderProviderList());
+el.fields.ttsProviderId?.addEventListener("change", () => renderProviderList());
+
+["webSearchEnabled", "searchProvider", "searchApiKey", "searchBaseUrl"].forEach((key) => {
+  const input = el.fields?.[key];
+  if (!input) return;
+  const eventName = input.tagName === "SELECT" || input.type === "checkbox" ? "change" : "input";
+  input.addEventListener(eventName, () => {
+    applyLiveSearchSettings({ persist: key === "webSearchEnabled" || key === "searchProvider", quiet: false });
+  });
+});
+
 el.btnSaveSettings.addEventListener("click", async () => {
   try {
+    if (providerEditorMode) {
+      const ok = saveProviderEditor();
+      if (!ok) return;
+    }
     await saveConfig(readSettingsForm());
     syncVoiceToggle();
     setSettingsStatus("已保存到本机数据库");
@@ -1782,21 +2529,38 @@ el.importFile.addEventListener("change", async () => {
 });
 
 el.btnReset.addEventListener("click", () => {
-  const keepKey = config.llm.apiKey;
-  config = structuredClone(DEFAULTS);
-  if (serverDefaults) {
-    config = deepMerge(config, {
-      llm: { baseUrl: serverDefaults.llm?.baseUrl, model: serverDefaults.llm?.model, apiKey: keepKey },
-      stt: { model: serverDefaults.stt?.model },
-      tts: { model: serverDefaults.tts?.model, voice: serverDefaults.tts?.voice },
-      systemPromptPreset: serverDefaults.systemPromptPreset || inferPromptPreset(serverDefaults.systemPrompt),
-      systemPrompt: serverDefaults.systemPrompt,
-    });
-  } else {
-    config.llm.apiKey = keepKey;
-  }
+  const keepProviders = ensureProviderList(config.apiProviders);
+  config = normalizeConfig({
+    apiProviders: keepProviders,
+    llm: {
+      providerId: keepProviders[0]?.id || DEFAULT_PROVIDER_ID,
+      model: serverDefaults?.llm?.model || DEFAULTS.llm.model,
+      apiType: serverDefaults?.llm?.apiType || DEFAULTS.llm.apiType,
+    },
+    stt: {
+      providerId: "",
+      model: serverDefaults?.stt?.model || DEFAULTS.stt.model,
+      apiType: serverDefaults?.stt?.apiType || DEFAULTS.stt.apiType,
+    },
+    tts: {
+      providerId: "",
+      model: serverDefaults?.tts?.model || DEFAULTS.tts.model,
+      voice: serverDefaults?.tts?.voice || DEFAULTS.tts.voice,
+      apiType: serverDefaults?.tts?.apiType || DEFAULTS.tts.apiType,
+    },
+    systemPromptPreset: serverDefaults?.systemPromptPreset || DEFAULTS.systemPromptPreset,
+    systemPrompt: serverDefaults?.systemPrompt || DEFAULTS.systemPrompt,
+    maxHistoryTurns: serverDefaults?.maxHistoryTurns ?? DEFAULTS.maxHistoryTurns,
+    maxTokens: serverDefaults?.maxTokens ?? DEFAULTS.maxTokens,
+    temperature: serverDefaults?.temperature ?? DEFAULTS.temperature,
+    ttsEnabled: serverDefaults?.ttsEnabled ?? DEFAULTS.ttsEnabled,
+    browserTtsFallback: serverDefaults?.browserTtsFallback ?? DEFAULTS.browserTtsFallback,
+    autoSpeak: DEFAULTS.autoSpeak,
+    webSearchEnabled: serverDefaults?.webSearchEnabled ?? DEFAULTS.webSearchEnabled,
+    searchProvider: serverDefaults?.searchProvider || DEFAULTS.searchProvider,
+  });
   fillSettingsForm();
-  setSettingsStatus("已恢复默认（尽量保留当前 Key）");
+  setSettingsStatus("已恢复默认（保留当前供应商列表和 Key）");
 });
 
 document.querySelectorAll(".quick [data-q]").forEach((btn) => {
@@ -1896,6 +2660,80 @@ function autosizeInput() {
   ta.style.height = Math.min(ta.scrollHeight, 120) + "px";
 }
 if (el.input) el.input.addEventListener("input", autosizeInput);
+
+function isStandaloneApp() {
+  return Boolean(
+    window.matchMedia?.("(display-mode: standalone)")?.matches ||
+    window.matchMedia?.("(display-mode: fullscreen)")?.matches ||
+    window.navigator.standalone === true
+  );
+}
+
+function isMobileLike() {
+  return Boolean(
+    window.matchMedia?.("(max-width: 760px)")?.matches ||
+    window.matchMedia?.("(pointer: coarse)")?.matches ||
+    /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "")
+  );
+}
+
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  const isLocalhost = ["localhost", "127.0.0.1", "::1"].includes(location.hostname);
+  if (location.protocol !== "https:" && !isLocalhost) return;
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch((err) => {
+      console.debug("[pwa] service worker skipped", err);
+    });
+  });
+}
+
+function setupInstallTip() {
+  const tip = el.installTip;
+  if (!tip) return;
+
+  let deferredInstallPrompt = null;
+  const dismissed = () => localStorage.getItem(INSTALL_TIP_DISMISS_KEY) === "1";
+  const shouldShow = () => isMobileLike() && !isStandaloneApp() && !dismissed();
+  const show = () => {
+    if (shouldShow()) tip.classList.remove("hidden");
+  };
+  const hide = () => tip.classList.add("hidden");
+  const dismiss = () => {
+    localStorage.setItem(INSTALL_TIP_DISMISS_KEY, "1");
+    hide();
+  };
+
+  el.btnInstallDismiss?.addEventListener("click", dismiss);
+  el.btnInstallApp?.addEventListener("click", async () => {
+    if (!deferredInstallPrompt) {
+      setStatus("请点浏览器菜单，选择“添加到主屏幕/安装应用”");
+      return;
+    }
+    const promptEvent = deferredInstallPrompt;
+    deferredInstallPrompt = null;
+    try {
+      promptEvent.prompt();
+      const choice = await promptEvent.userChoice;
+      if (choice?.outcome === "accepted") dismiss();
+      else if (el.btnInstallApp) el.btnInstallApp.hidden = true;
+    } catch {
+      setStatus("请点浏览器菜单，选择“添加到主屏幕/安装应用”");
+    }
+  });
+
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    if (el.btnInstallApp) el.btnInstallApp.hidden = false;
+    show();
+  });
+  window.addEventListener("appinstalled", dismiss);
+
+  setTimeout(show, 1200);
+}
+registerServiceWorker();
+setupInstallTip();
 
 bindSecretEyes();
 bindMessageActions();

@@ -1,21 +1,29 @@
 {
   "app": "ai-voice-call",
-  "version": 1,
+  "version": 3,
+  "apiProviders": [
+    {
+      "id": "provider_default",
+      "name": "默认供应商",
+      "baseUrl": "",
+      "apiKey": ""
+    }
+  ],
   "llm": {
-    "baseUrl": "",
-    "apiKey": "",
-    "model": ""
+    "providerId": "provider_default",
+    "model": "",
+    "apiType": "auto"
   },
   "stt": {
-    "baseUrl": "",
-    "apiKey": "",
-    "model": "FunAudioLLM/SenseVoiceSmall"
+    "providerId": "",
+    "model": "",
+    "apiType": "auto"
   },
   "tts": {
-    "baseUrl": "",
-    "apiKey": "",
-    "model": "FnLP/MOSS-TTSD-v0.5",
-    "voice": "alloy"
+    "providerId": "",
+    "model": "",
+    "voice": "",
+    "apiType": "auto"
   },
   "systemPromptPreset": "general",
   "systemPrompt": "",

@@ -5,7 +5,7 @@
  * - Never log API keys
  */
 
-import { formatSearchContext, runWebSearch, shouldAutoSearch } from "./search";
+import { formatSearchContext, isExplicitSearchRequest, runWebSearch, shouldAutoSearch } from "./search";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -39,6 +39,7 @@ interface ClientProviderConfig {
   apiKey?: string;
   model?: string;
   voice?: string;
+  apiType?: string;
 }
 
 interface ClientConfig {
@@ -52,7 +53,7 @@ interface ClientConfig {
   temperature?: number;
   ttsEnabled?: boolean;
   webSearchEnabled?: boolean;
-  searchProvider?: string; // auto | duckduckgo | searxng | tavily | serper
+  searchProvider?: string; // auto | bing-rss | duckduckgo | searxng | tavily | serper
   searchApiKey?: string;
   searchBaseUrl?: string;
 }
@@ -113,6 +114,87 @@ function pickUrl(...urls: Array<string | undefined>): string {
   return "";
 }
 
+function normalizeApiType(value: string | undefined, fallback = "auto"): string {
+  const allowed = new Set(["auto", "openai-chat", "openai-responses", "openai-transcriptions", "openai-speech", "xiaomi-mimo"]);
+  const v = (value || "").trim();
+  return allowed.has(v) ? v : fallback;
+}
+
+function keyDiagnostic(apiKey: string | undefined) {
+  const key = (apiKey || "").trim();
+  return {
+    hasKey: Boolean(key),
+    keyLength: key.length,
+    keyTail: key ? key.slice(-4) : "",
+    hasBearerPrefix: /^bearer\s+/i.test(key),
+  };
+}
+
+function publicLlmConfig(baseUrl: string, model: string, apiType: string | undefined, apiKey: string) {
+  return {
+    baseUrl,
+    model,
+    apiType: normalizeApiType(apiType, "auto"),
+    ...keyDiagnostic(apiKey),
+  };
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientAuthError(status: number, message: string) {
+  return status === 401 && /invalid\s+(api\s*key|token)|invalid\s+key/i.test(message || "");
+}
+
+function formatLlmFailure(status: number, message: string) {
+  const msg = (message || `HTTP ${status}`).trim();
+  if (isTransientAuthError(status, msg)) {
+    return `LLM failed: ${msg}。如果同一 Key 马上重试可成功，通常是供应商限流或网关临时认证异常；请稍后重试或更换供应商。`;
+  }
+  if (status === 429) {
+    return `LLM failed: ${msg}。供应商返回限流/额度不足，请稍后重试或更换模型/供应商。`;
+  }
+  return `LLM failed: ${msg}`;
+}
+
+async function fetchLlmEndpointWithTransientRetry(
+  baseUrl: string,
+  apiKey: string,
+  endpointPath: string,
+  payload: Record<string, unknown>,
+  diag: ReturnType<typeof publicLlmConfig>,
+): Promise<{ res: Response; errText: string }> {
+  const doFetch = () => fetch(`${baseUrl}/${endpointPath}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  let res = await doFetch();
+  if (res.ok) return { res, errText: "" };
+  let errText = await readError(res);
+  if (isTransientAuthError(res.status, errText)) {
+    console.log("[llm] transient auth error, retry once", { status: res.status, endpointPath, ...diag });
+    await sleep(800);
+    res = await doFetch();
+    if (res.ok) return { res, errText: "" };
+    errText = await readError(res);
+  }
+  return { res, errText };
+}
+
+async function fetchChatCompletionWithTransientRetry(
+  baseUrl: string,
+  apiKey: string,
+  payload: Record<string, unknown>,
+  diag: ReturnType<typeof publicLlmConfig>,
+): Promise<{ res: Response; errText: string }> {
+  return fetchLlmEndpointWithTransientRetry(baseUrl, apiKey, "chat/completions", payload, diag);
+}
 function ensureV1(baseUrl: string): string {
   const u = trimSlash(baseUrl);
   if (!u) return "";
@@ -153,15 +235,18 @@ function publicConfig(env: Env) {
       llm: {
         baseUrl: env.LLM_BASE_URL || "https://api.siliconflow.cn/v1",
         model: env.LLM_MODEL || "Qwen/Qwen3.5-4B",
+        apiType: "auto",
       },
       stt: {
         baseUrl: env.STT_BASE_URL || env.LLM_BASE_URL || "https://api.siliconflow.cn/v1",
         model: env.STT_MODEL || "FunAudioLLM/SenseVoiceSmall",
+        apiType: "auto",
       },
       tts: {
         baseUrl: env.TTS_BASE_URL || env.LLM_BASE_URL || "https://api.siliconflow.cn/v1",
         model: env.TTS_MODEL || "FnLP/MOSS-TTSD-v0.5",
         voice: env.TTS_VOICE || "alloy",
+        apiType: "auto",
       },
       systemPrompt: env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT,
       maxHistoryTurns: asNumber(env.MAX_HISTORY_TURNS, 12),
@@ -199,17 +284,20 @@ function resolveProviders(env: Env, config?: ClientConfig) {
       baseUrl: llmBase,
       apiKey: llmKey,
       model: (config?.llm?.model || env.LLM_MODEL || "Qwen/Qwen3.5-4B").trim(),
+      apiType: normalizeApiType(config?.llm?.apiType),
     },
     stt: {
       baseUrl: sttBase,
       apiKey: sttKey,
       model: (config?.stt?.model || env.STT_MODEL || "FunAudioLLM/SenseVoiceSmall").trim(),
+      apiType: normalizeApiType(config?.stt?.apiType),
     },
     tts: {
       baseUrl: ttsBase,
       apiKey: ttsKey,
       model: (config?.tts?.model || env.TTS_MODEL || "FnLP/MOSS-TTSD-v0.5").trim(),
       voice: (config?.tts?.voice || env.TTS_VOICE || "alloy").trim(),
+      apiType: normalizeApiType(config?.tts?.apiType),
     },
     systemPromptPreset: (config?.systemPromptPreset || "general").trim(),
     systemPrompt: (config?.systemPrompt || env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT).trim(),
@@ -281,6 +369,118 @@ function extractChatText(data: any): string {
   return alt ? stripThinking(alt) : "";
 }
 
+
+type LlmKind = "chat" | "responses";
+
+function preferredLlmKind(apiType = "auto"): LlmKind {
+  return normalizeApiType(apiType, "auto") === "openai-responses" ? "responses" : "chat";
+}
+
+function llmKinds(apiType = "auto"): LlmKind[] {
+  return [preferredLlmKind(apiType)];
+}
+
+function shouldFallbackToResponses(apiType: string | undefined, status: number): boolean {
+  return false;
+}
+
+function splitSystemMessages(messages: ChatMessage[]): { instructions: string; input: ChatMessage[] } {
+  const list = Array.isArray(messages) ? messages : [];
+  const instructions = list
+    .filter((m) => m.role === "system")
+    .map((m) => m.content)
+    .join("\n\n")
+    .trim();
+  const input = list
+    .filter((m) => m.role !== "system")
+    .map((m) => ({ role: m.role, content: m.content }));
+  return { instructions, input };
+}
+
+function buildChatPayload(
+  model: string,
+  messages: ChatMessage[],
+  safeMaxTokens: number,
+  temperature: number,
+  stream = false,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { model, messages, temperature, max_tokens: safeMaxTokens, stream, ...extra };
+}
+
+function buildResponsesPayload(
+  model: string,
+  messages: ChatMessage[],
+  safeMaxTokens: number,
+  temperature: number,
+  stream = false,
+  toolType = "web_search",
+): Record<string, unknown> {
+  const { instructions, input } = splitSystemMessages(messages);
+  const payload: Record<string, unknown> = {
+    model,
+    input,
+    temperature,
+    max_output_tokens: safeMaxTokens,
+    stream,
+    tools: [{ type: toolType }],
+    tool_choice: "auto",
+  };
+  if (instructions) payload.instructions = instructions;
+  return payload;
+}
+
+function payloadVariants(
+  kind: LlmKind,
+  model: string,
+  messages: ChatMessage[],
+  safeMaxTokens: number,
+  temperature: number,
+  stream = false,
+): Record<string, unknown>[] {
+  if (kind === "responses") return [
+    buildResponsesPayload(model, messages, safeMaxTokens, temperature, stream),
+    buildResponsesPayload(model, messages, safeMaxTokens, temperature, stream, "web_search_preview"),
+  ];
+  return [
+    buildChatPayload(model, messages, safeMaxTokens, temperature, stream, {
+      // SiliconFlow / Qwen3 knobs (ignored by gateways that don't support them)
+      enable_thinking: false,
+      thinking_budget: 0,
+      chat_template_kwargs: { enable_thinking: false },
+    }),
+    buildChatPayload(model, messages, safeMaxTokens, temperature, stream),
+  ];
+}
+
+function endpointPath(kind: LlmKind): string {
+  return kind === "responses" ? "responses" : "chat/completions";
+}
+
+function extractResponseText(data: any): string {
+  const direct = extractTextContent(data?.output_text ?? data?.text ?? data?.content ?? data?.reply);
+  if (direct) return stripThinking(direct);
+
+  const output = Array.isArray(data?.output)
+    ? data.output
+    : Array.isArray(data?.response?.output)
+      ? data.response.output
+      : [];
+  const chunks: string[] = [];
+  for (const item of output) {
+    const content = Array.isArray(item?.content) ? item.content : [];
+    for (const part of content) {
+      const text = extractTextContent(part?.text ?? part?.delta ?? part?.content);
+      if (text) chunks.push(text);
+    }
+  }
+  return stripThinking(chunks.join(""));
+}
+
+function extractLlmText(data: any, kind: LlmKind): string {
+  return kind === "responses" ? extractResponseText(data) : extractChatText(data);
+}
+
 function looksLikeQwenThinkingModel(model: string): boolean {
   const m = model.toLowerCase();
   return m.includes("qwen3") || m.includes("qwen/qwen3") || m.includes("qwq");
@@ -293,82 +493,192 @@ async function chatCompletions(
   messages: ChatMessage[],
   maxTokens: number,
   temperature: number,
+  apiType = "auto",
 ): Promise<string> {
-  // For parent chat we want final spoken answer, not chain-of-thought.
-  // Qwen3.5 on SiliconFlow defaults to thinking and may put text only in reasoning_content.
   const safeMaxTokens = Math.max(maxTokens || 0, 512);
+  const diag = publicLlmConfig(baseUrl, model, apiType, apiKey);
+  console.log("[llm] config", diag);
+  let lastErr = "LLM failed";
 
-  const payload: Record<string, unknown> = {
-    model,
-    messages,
-    temperature,
-    max_tokens: safeMaxTokens,
-    stream: false,
-    // SiliconFlow / Qwen3 knobs (ignored by gateways that don't support them)
-    enable_thinking: false,
-    thinking_budget: 0,
-    chat_template_kwargs: {
-      enable_thinking: false,
-    },
-  };
-
-  const res = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) {
-    // Some providers reject unknown fields; retry with minimal OpenAI payload
-    const errText = await readError(res);
-    if (res.status === 400 || /unknown|invalid|unexpected/i.test(errText)) {
-      const retry = await fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${apiKey}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature,
-          max_tokens: safeMaxTokens,
-          stream: false,
-        }),
-      });
-      if (!retry.ok) {
-        throw new Error(`LLM failed: ${await readError(retry)}`);
+  for (const kind of llmKinds(apiType)) {
+    let fallbackToNextKind = false;
+    const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, false);
+    for (let i = 0; i < variants.length; i++) {
+      const payload = variants[i];
+      console.log("[llm] request", kind, model, "tokens=", safeMaxTokens, kind === "responses" ? `tool=${(payload.tools as any)?.[0]?.type}` : "");
+      const first = await fetchLlmEndpointWithTransientRetry(baseUrl, apiKey, endpointPath(kind), payload, diag);
+      const res = first.res;
+      if (!res.ok) {
+        lastErr = formatLlmFailure(res.status, first.errText);
+        console.log("[llm] fail", kind, res.status, lastErr);
+        if (kind === "chat" && shouldFallbackToResponses(apiType, res.status)) { fallbackToNextKind = true; break; }
+        if (res.status === 400 && i < variants.length - 1) continue;
+        throw new Error(lastErr);
       }
-      const retryData = (await retry.json()) as any;
-      const retryText = extractChatText(retryData);
-      if (!retryText) {
-        const finish = retryData?.choices?.[0]?.finish_reason;
-        const preview = JSON.stringify(retryData?.choices?.[0] || retryData).slice(0, 400);
-        throw new Error(
-          `LLM returned empty content after retry (finish_reason=${finish || "unknown"}). raw=${preview}`,
-        );
-      }
-      return retryText;
+
+      const data = (await res.json()) as any;
+      const text = extractLlmText(data, kind);
+      if (text) return text;
+
+      const preview = JSON.stringify(kind === "chat" ? (data?.choices?.[0] || data) : (data?.output || data)).slice(0, 400);
+      const finish = data?.choices?.[0]?.finish_reason;
+      const hint = kind === "chat" && looksLikeQwenThinkingModel(model)
+        ? " 这很像 Qwen3 思考模式：答案在 reasoning_content，且 max_tokens 被思考占满。已尝试关闭 thinking；可再把最大回复长度调到 512+，或换非 thinking 模型。"
+        : "";
+      lastErr = kind === "chat"
+        ? `LLM returned empty content (finish_reason=${finish || "unknown"}).${hint} raw=${preview}`
+        : `LLM returned empty content (responses). raw=${preview}`;
+      console.log("[llm] empty", kind, preview);
     }
-    throw new Error(`LLM failed: ${errText}`);
+    if (fallbackToNextKind) continue;
+    break;
   }
+  throw new Error(lastErr);
+}
 
-  const data = (await res.json()) as any;
-  const text = extractChatText(data);
-  if (!text) {
-    const finish = data?.choices?.[0]?.finish_reason;
-    const preview = JSON.stringify(data?.choices?.[0] || data).slice(0, 400);
-    const hint = looksLikeQwenThinkingModel(model)
-      ? " 这很像 Qwen3 思考模式：答案在 reasoning_content，且 max_tokens 被思考占满。已尝试关闭 thinking；可再把最大回复长度调到 512+，或换非 thinking 模型。"
-      : "";
-    throw new Error(
-      `LLM returned empty content (finish_reason=${finish || "unknown"}).${hint} raw=${preview}`,
-    );
+function extractStreamDelta(data: any, kind: LlmKind, eventName = ""): string {
+  if (!data || typeof data !== "object") return "";
+  if (data.error) throw new Error(String(data.error.message || data.error || "LLM stream error"));
+  const type = String(data.type || eventName || "");
+  if (kind === "responses") {
+    if (/output_text\.delta|output_text_delta/i.test(type) && typeof data.delta === "string") return data.delta;
+    if (/response\.completed/i.test(type)) return "";
+    if (typeof data.delta === "string" && /output|text|delta/i.test(type)) return data.delta;
+    if (typeof data.text === "string" && /output|text/i.test(type)) return data.text;
+    return "";
   }
-  return text;
+  const choice = data.choices?.[0] || {};
+  const delta = choice.delta || choice.message || {};
+  const content = delta.content ?? choice.text;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((part) => typeof part === "string" ? part : (part?.text || part?.content || "")).join("");
+  return "";
+}
+
+function parseSseBlock(block: string): { eventName: string; dataText: string } {
+  let eventName = "message";
+  const dataLines: string[] = [];
+  for (const rawLine of String(block || "").split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    if (!line || line.startsWith(":")) continue;
+    if (line.startsWith("event:")) eventName = line.slice(6).trim() || "message";
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+    else if (line.trimStart().startsWith("{")) dataLines.push(line.trim());
+  }
+  return { eventName, dataText: dataLines.join("\n").trim() };
+}
+
+async function readLlmStreamResponse(res: Response, kind: LlmKind, onDelta: (text: string) => void): Promise<string> {
+  if (!res.body) {
+    const data = (await res.json().catch(() => null)) as any;
+    const text = extractLlmText(data, kind);
+    if (text) onDelta(text);
+    return text;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let raw = "";
+  let reply = "";
+  const applyDelta = (delta: string) => {
+    const cleaned = String(delta || "").replace(/<think>[\s\S]*?<\/think>/gi, "");
+    if (!cleaned) return;
+    reply += cleaned;
+    onDelta(cleaned);
+  };
+  const handleBlock = (block: string) => {
+    const { eventName, dataText } = parseSseBlock(block);
+    if (!dataText || dataText === "[DONE]") return;
+    try {
+      const data = JSON.parse(dataText) as any;
+      applyDelta(extractStreamDelta(data, kind, eventName));
+      if (/response\.completed/i.test(String(data?.type || eventName || "")) && !reply) {
+        applyDelta(extractResponseText(data.response || data));
+      }
+    } catch (err) {
+      if (dataText.startsWith("{")) throw err;
+      applyDelta(dataText);
+    }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    raw = (raw + chunk).slice(-1024 * 1024);
+    buffer += chunk.replace(/\r\n/g, "\n");
+    let idx: number;
+    while ((idx = buffer.indexOf("\n\n")) >= 0) {
+      const block = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      handleBlock(block);
+    }
+  }
+  const tail = decoder.decode();
+  if (tail) buffer += tail;
+  if (buffer.trim()) handleBlock(buffer);
+  if (!reply && raw.trim()) {
+    try {
+      const data = JSON.parse(raw.trim()) as any;
+      applyDelta(extractLlmText(data, kind));
+    } catch {}
+  }
+  return reply.trim();
+}
+
+async function streamChatCompletions(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  messages: ChatMessage[],
+  maxTokens: number,
+  temperature: number,
+  apiType: string,
+  onDelta: (text: string) => void,
+): Promise<string> {
+  const safeMaxTokens = Math.max(maxTokens || 0, 512);
+  const diag = publicLlmConfig(baseUrl, model, apiType, apiKey);
+  console.log("[llm] config", diag);
+  let lastErr = "LLM failed";
+
+  for (const kind of llmKinds(apiType)) {
+    let fallbackToNextKind = false;
+    const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, true);
+    for (let i = 0; i < variants.length; i++) {
+      const payload = variants[i];
+      console.log("[llm] stream", kind, model, "tokens=", safeMaxTokens);
+      let res = await fetch(`${baseUrl}/${endpointPath(kind)}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        let errText = await readError(res);
+        if (isTransientAuthError(res.status, errText)) {
+          console.log("[llm] transient stream auth error, retry once", { status: res.status, endpointPath: endpointPath(kind), ...diag });
+          await sleep(800);
+          res = await fetch(`${baseUrl}/${endpointPath(kind)}`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!res.ok) errText = await readError(res);
+        }
+        if (!res.ok) {
+          lastErr = formatLlmFailure(res.status, errText);
+          console.log("[llm] stream fail", kind, res.status, lastErr);
+          if (kind === "chat" && shouldFallbackToResponses(apiType, res.status)) { fallbackToNextKind = true; break; }
+          if (res.status === 400 && i < variants.length - 1) continue;
+          throw new Error(lastErr);
+        }
+      }
+      const text = await readLlmStreamResponse(res, kind, onDelta);
+      if (text) return text;
+      lastErr = `LLM stream returned empty content (${kind})`;
+    }
+    if (fallbackToNextKind) continue;
+    break;
+  }
+  throw new Error(lastErr);
 }
 function pickTranscript(data: any): string {
   const candidates = [
@@ -455,9 +765,75 @@ async function transcribe(
   }
 
   const preview = JSON.stringify(attempts).slice(0, 500);
-  throw new Error(`ASR returned empty text. attempts=${preview}`);
+  throw new Error(`语音识别没有返回文字. attempts=${preview}`);
 }
-async function synthesize(
+function isMimoTts(baseUrl: string, model: string, apiType = "auto"): boolean {
+  const normalized = normalizeApiType(apiType);
+  if (normalized === "xiaomi-mimo") return true;
+  if (normalized === "openai-speech") return false;
+  let host = "";
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    // ignore invalid URL; normal validation will report it later
+  }
+  return host.includes("xiaomimimo.com") || /^mimo-v\d/i.test(model || "");
+}
+
+function normalizeMimoVoice(voice: string): string {
+  const v = (voice || "").trim();
+  if (!v || v === "alloy" || v === "default") return "mimo_default";
+  return v;
+}
+
+function base64ToBytes(data: unknown): Uint8Array | null {
+  const raw = String(data || "").replace(/^data:[^,]+,/, "").replace(/\s+/g, "");
+  if (!raw) return null;
+  const bin = atob(raw);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function synthesizeMimo(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  voice: string,
+  input: string,
+): Promise<Response> {
+  const res = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "api-key": apiKey,
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "assistant", content: input }],
+      audio: { format: "wav", voice: normalizeMimoVoice(voice) },
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+
+  const data = await res.json() as any;
+  const audioData = data?.choices?.[0]?.message?.audio?.data || data?.audio?.data || data?.data;
+  const bytes = base64ToBytes(audioData);
+  if (!bytes?.length) throw new Error("小米 MiMo TTS 没有返回音频数据");
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      "content-type": "audio/wav",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+async function synthesizeOpenAiSpeech(
   baseUrl: string,
   apiKey: string,
   model: string,
@@ -479,7 +855,7 @@ async function synthesize(
   });
 
   if (!res.ok) {
-    throw new Error(`TTS failed: ${await readError(res)}`);
+    throw new Error(await readError(res));
   }
 
   const contentType = res.headers.get("content-type") || "audio/mpeg";
@@ -493,9 +869,148 @@ async function synthesize(
   });
 }
 
+async function synthesize(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  voice: string,
+  input: string,
+  apiType = "auto",
+): Promise<Response> {
+  if (isMimoTts(baseUrl, model, apiType)) return synthesizeMimo(baseUrl, apiKey, model, voice, input);
+  return synthesizeOpenAiSpeech(baseUrl, apiKey, model, voice, input);
+}
+
 function parseClientConfig(raw: unknown): ClientConfig | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   return raw as ClientConfig;
+}
+
+function directSearchReply(search: any): string {
+  if (!search?.ok || !Array.isArray(search.items) || !search.items.length) return "";
+  if (search.provider === "weather") {
+    const place = String(search.query || "").trim();
+    const first = search.items[0];
+    return `${place || "天气"}查到了：${first.snippet}`;
+  }
+  return "";
+}
+
+function looksLikeNoWebReply(text: string): boolean {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  if (!s) return false;
+  return /(不能|无法|没有|未能).{0,10}(联网|上网|搜索|实时|查询|访问互联网)|没有.{0,10}(实时|联网|最新).{0,10}(数据|信息|能力)|不确定.{0,16}(天气|价格|新闻|当前|现在|实时|最新)|无法.{0,16}(获取|查询|访问).{0,16}(天气|实时|最新|网络|互联网)|作为(一个)?(AI|人工智能).{0,20}(不能|无法).{0,10}(联网|访问互联网|获取实时)/i.test(s);
+}
+
+async function fallbackServerSearchAnswer(
+  cfg: ReturnType<typeof resolveProviders>,
+  messages: ChatMessage[],
+  userText: string,
+  explicitSearch: boolean,
+): Promise<{ reply: string; webSearch: Record<string, unknown> }> {
+  const search = await runWebSearch({
+    query: userText,
+    provider: cfg.searchProvider,
+    apiKey: cfg.searchApiKey,
+    baseUrl: cfg.searchBaseUrl,
+  });
+  console.log("[search:fallback]", search.provider, "ok=", search.ok, "count=", search.items?.length || 0, search.error || "");
+  const webSearch = {
+    used: true,
+    explicit: explicitSearch,
+    provider: `fallback-${search.provider}`,
+    ok: search.ok,
+    count: search.items.length,
+    error: search.error || "",
+    titles: search.items.slice(0, 3).map((x: { title: string }) => x.title),
+  };
+  const directReply = directSearchReply(search);
+  if (directReply) return { reply: directReply, webSearch };
+
+  const systemPrompt = `${cfg.systemPrompt}
+
+${formatSearchContext(search)}
+
+重要：上面就是服务端已经获取到的联网结果。请直接基于这些结果回答。不能再说“我不能联网”“没有实时联网”“无法获取实时数据”。`;
+  const finalMessages = sanitizeMessages(messages, systemPrompt, cfg.maxHistoryTurns);
+  const reply = await chatCompletions(
+    cfg.llm.baseUrl,
+    cfg.llm.apiKey,
+    cfg.llm.model,
+    finalMessages,
+    cfg.maxTokens,
+    cfg.temperature,
+    cfg.llm.apiType,
+  );
+  return { reply, webSearch };
+}
+
+type PreparedChat = {
+  cfg: ReturnType<typeof resolveProviders>;
+  messages: ChatMessage[];
+  userText: string;
+  explicitSearch: boolean;
+  useResponsesTools: boolean;
+  finalMessages: ChatMessage[];
+  webSearch: Record<string, unknown> | null;
+  directReply: string;
+};
+
+async function prepareChat(body: ChatRequestBody, env: Env): Promise<PreparedChat | Response> {
+  const clientCfg = parseClientConfig(body.config);
+  const cfg = resolveProviders(env, clientCfg);
+  if (!cfg.llm.apiKey) return badRequest("缺少 API Key：请在页面「本地配置」里填写", 401);
+  if (!cfg.llm.baseUrl) return badRequest("缺少 LLM Base URL");
+
+  let messages = Array.isArray(body.messages) ? body.messages : [];
+  const single = (body.message || "").trim();
+  if (single) messages = [...messages, { role: "user", content: single }];
+  if (!messages.some((m) => m.role === "user" && m.content.trim())) return badRequest("请输入消息");
+
+  const lastUser = [...messages].reverse().find((m) => m.role === "user" && m.content.trim());
+  const userText = (lastUser?.content || "").trim();
+
+  let systemPrompt = cfg.systemPrompt;
+  let directReply = "";
+  const explicitSearch = isExplicitSearchRequest(userText);
+  const useResponsesTools = preferredLlmKind(cfg.llm.apiType) === "responses";
+  let webSearch: Record<string, unknown> | null = useResponsesTools
+    ? { used: true, explicit: explicitSearch, provider: "responses-tools", ok: true, count: 0, error: "", titles: [] }
+    : null;
+  const wantSearch = !useResponsesTools && shouldAutoSearch(userText) && (Boolean(cfg.webSearchEnabled) || explicitSearch);
+
+  if (wantSearch) {
+    const search = await runWebSearch({
+      query: userText,
+      provider: cfg.searchProvider,
+      apiKey: cfg.searchApiKey,
+      baseUrl: cfg.searchBaseUrl,
+    });
+    webSearch = {
+      used: true,
+      explicit: explicitSearch,
+      provider: search.provider,
+      ok: search.ok,
+      count: search.items.length,
+      error: search.error || "",
+      titles: search.items.slice(0, 3).map((x: { title: string }) => x.title),
+    };
+    directReply = directSearchReply(search);
+    if (!directReply) {
+      systemPrompt = `${cfg.systemPrompt}\n\n${formatSearchContext(search)}\n\n重要：上面就是服务端已经获取到的联网结果。不能再说“我不能联网”“无法直接联网”“联网搜索没开放”。`;
+    }
+  }
+
+  return {
+    cfg,
+    messages,
+    userText,
+    explicitSearch,
+    useResponsesTools,
+    finalMessages: sanitizeMessages(messages, systemPrompt, cfg.maxHistoryTurns),
+    webSearch,
+    directReply,
+  };
 }
 
 async function handleChat(req: Request, env: Env): Promise<Response> {
@@ -506,78 +1021,109 @@ async function handleChat(req: Request, env: Env): Promise<Response> {
     return badRequest("Invalid JSON body");
   }
 
-  const clientCfg = parseClientConfig(body.config);
-  const cfg = resolveProviders(env, clientCfg);
-  if (!cfg.llm.apiKey) {
-    return badRequest("缺少 API Key：请在页面「本地配置」里填写，或设置服务器密钥", 401);
+  const prepared = await prepareChat(body, env);
+  if (prepared instanceof Response) return prepared;
+  if (prepared.directReply) {
+    return json({ ok: true, reply: prepared.directReply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: prepared.webSearch });
   }
-  if (!cfg.llm.baseUrl) {
-    return badRequest("缺少 LLM Base URL");
-  }
-
-  let messages = Array.isArray(body.messages) ? body.messages : [];
-  const single = (body.message || "").trim();
-  if (single) {
-    messages = [...messages, { role: "user", content: single }];
-  }
-  if (!messages.some((m) => m.role === "user" && m.content.trim())) {
-    return badRequest("请输入消息");
-  }
-
-  const lastUser = [...messages].reverse().find((m) => m.role === "user" && m.content.trim());
-  const userText = (lastUser?.content || "").trim();
-
-  let searchMeta: Record<string, unknown> | null = null;
-  let systemPrompt = cfg.systemPrompt;
-  const wantSearch = Boolean(cfg.webSearchEnabled) && shouldAutoSearch(userText);
-
-  if (wantSearch) {
-    const search = await runWebSearch({
-      query: userText,
-      provider: cfg.searchProvider,
-      apiKey: cfg.searchApiKey,
-      baseUrl: cfg.searchBaseUrl,
-    });
-    systemPrompt = `${cfg.systemPrompt}
-
-${formatSearchContext(search)}`;
-    searchMeta = {
-      used: true,
-      provider: search.provider,
-      ok: search.ok,
-      count: search.items.length,
-      error: search.error || "",
-      titles: search.items.slice(0, 3).map((x: { title: string }) => x.title),
-    };
-  }
-
-  const finalMessages = sanitizeMessages(messages, systemPrompt, cfg.maxHistoryTurns);
   const reply = await chatCompletions(
-    cfg.llm.baseUrl,
-    cfg.llm.apiKey,
-    cfg.llm.model,
-    finalMessages,
-    cfg.maxTokens,
-    cfg.temperature,
+    prepared.cfg.llm.baseUrl,
+    prepared.cfg.llm.apiKey,
+    prepared.cfg.llm.model,
+    prepared.finalMessages,
+    prepared.cfg.maxTokens,
+    prepared.cfg.temperature,
+    prepared.cfg.llm.apiType,
   );
+  if (prepared.useResponsesTools && shouldAutoSearch(prepared.userText) && looksLikeNoWebReply(reply)) {
+    const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.userText, prepared.explicitSearch);
+    return json({ ok: true, reply: fallback.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: fallback.webSearch });
+  }
 
-  return json({
-    ok: true,
-    reply,
-    model: cfg.llm.model,
-    ttsEnabled: cfg.ttsEnabled,
-    webSearch: searchMeta,
+  return json({ ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: prepared.webSearch });
+}
+
+function encodeSse(event: string, data: unknown): Uint8Array {
+  return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+async function handleChatStream(req: Request, env: Env): Promise<Response> {
+  let body: ChatRequestBody;
+  try {
+    body = (await req.json()) as ChatRequestBody;
+  } catch {
+    return badRequest("Invalid JSON body");
+  }
+
+  const prepared = await prepareChat(body, env);
+  if (prepared instanceof Response) return prepared;
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let reply = "";
+      let doneWebSearch = prepared.webSearch;
+      try {
+        if (prepared.directReply) {
+          reply = prepared.directReply;
+          controller.enqueue(encodeSse("delta", { text: reply }));
+        } else if (prepared.useResponsesTools && shouldAutoSearch(prepared.userText)) {
+          reply = await chatCompletions(
+            prepared.cfg.llm.baseUrl,
+            prepared.cfg.llm.apiKey,
+            prepared.cfg.llm.model,
+            prepared.finalMessages,
+            prepared.cfg.maxTokens,
+            prepared.cfg.temperature,
+            prepared.cfg.llm.apiType,
+          );
+          if (looksLikeNoWebReply(reply)) {
+            const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.userText, prepared.explicitSearch);
+            reply = fallback.reply;
+            doneWebSearch = fallback.webSearch;
+          }
+          controller.enqueue(encodeSse("delta", { text: reply }));
+        } else {
+          reply = await streamChatCompletions(
+            prepared.cfg.llm.baseUrl,
+            prepared.cfg.llm.apiKey,
+            prepared.cfg.llm.model,
+            prepared.finalMessages,
+            prepared.cfg.maxTokens,
+            prepared.cfg.temperature,
+            prepared.cfg.llm.apiType,
+            (text) => {
+              reply += text;
+              controller.enqueue(encodeSse("delta", { text }));
+            },
+          );
+        }
+        controller.enqueue(encodeSse("done", { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: doneWebSearch }));
+      } catch (err: any) {
+        controller.enqueue(encodeSse("error", { error: String(err?.message || err), partial: reply }));
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store, no-transform",
+      "x-accel-buffering": "no",
+    },
   });
 }
 
-function decodeClientConfigHeader(text: string): ClientConfig {
-  const raw = text.trim();
-  if (raw.startsWith("{")) return JSON.parse(raw) as ClientConfig;
-  const bin = atob(raw);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
-  const jsonText = new TextDecoder().decode(bytes);
-  return JSON.parse(jsonText) as ClientConfig;
+
+
+function decodeClientConfigHeader(raw: string): ClientConfig | undefined {
+  const text = String(raw || "").trim();
+  if (!text) return undefined;
+  if (text.startsWith("{")) return JSON.parse(text) as ClientConfig;
+  const bin = atob(text);
+  const bytes = Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
+  return JSON.parse(new TextDecoder().decode(bytes)) as ClientConfig;
 }
 
 function parseConfigFromRequest(req: Request, form?: FormData): ClientConfig | undefined {
@@ -605,7 +1151,7 @@ function parseConfigFromRequest(req: Request, form?: FormData): ClientConfig | u
 async function handleAsr(req: Request, env: Env): Promise<Response> {
   const contentType = req.headers.get("content-type") || "";
   if (!contentType.includes("multipart/form-data")) {
-    return badRequest("ASR expects multipart/form-data");
+    return badRequest("语音识别接口需要 multipart/form-data");
   }
 
   let form: FormData;
@@ -632,10 +1178,10 @@ async function handleAsr(req: Request, env: Env): Promise<Response> {
 
   const cfg = resolveProviders(env, clientConfig);
   if (!cfg.stt.apiKey) {
-    return badRequest("缺少 STT API Key：请在本地配置中填写", 401);
+    return badRequest("缺少语音识别 API Key：请在本地配置中填写", 401);
   }
   if (!cfg.stt.baseUrl) {
-    return badRequest("缺少 STT Base URL");
+    return badRequest("缺少语音识别 Base URL");
   }
 
   try {
@@ -661,11 +1207,26 @@ async function handleTts(req: Request, env: Env): Promise<Response> {
   if (!cfg.ttsEnabled) {
     return badRequest("TTS disabled", 400);
   }
+  if (!cfg.tts.baseUrl) {
+    return json({ ok: false, error: "缺少 TTS Base URL", tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: Boolean(cfg.tts.apiKey) } }, 400);
+  }
+  if (!cfg.tts.model) {
+    return json({ ok: false, error: "缺少 TTS Model", tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: Boolean(cfg.tts.apiKey) } }, 400);
+  }
   if (!cfg.tts.apiKey) {
-    return badRequest("缺少 TTS API Key：请在本地配置中填写", 401);
+    return json({ ok: false, error: "缺少 TTS API Key：请在本地配置中填写", tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: false } }, 401);
   }
 
-  return synthesize(cfg.tts.baseUrl, cfg.tts.apiKey, cfg.tts.model, cfg.tts.voice, text.slice(0, 800));
+  try {
+    return await synthesize(cfg.tts.baseUrl, cfg.tts.apiKey, cfg.tts.model, cfg.tts.voice, text.slice(0, 800), cfg.tts.apiType);
+  } catch (err: any) {
+    const message = String(err?.message || err || "").trim();
+    return json({
+      ok: false,
+      error: message ? `TTS 请求失败：${message}` : "TTS 请求失败",
+      tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: true },
+    }, 502);
+  }
 }
 
 async function handleTest(req: Request, env: Env): Promise<Response> {
@@ -679,9 +1240,9 @@ async function handleTest(req: Request, env: Env): Promise<Response> {
   const cfg = resolveProviders(env, parseClientConfig(body.config));
   const result: Record<string, unknown> = {
     ok: true,
-    llm: { baseUrl: cfg.llm.baseUrl, model: cfg.llm.model, hasKey: Boolean(cfg.llm.apiKey) },
-    stt: { baseUrl: cfg.stt.baseUrl, model: cfg.stt.model, hasKey: Boolean(cfg.stt.apiKey) },
-    tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, hasKey: Boolean(cfg.tts.apiKey) },
+    llm: { baseUrl: cfg.llm.baseUrl, model: cfg.llm.model, apiType: cfg.llm.apiType, hasKey: Boolean(cfg.llm.apiKey) },
+    stt: { baseUrl: cfg.stt.baseUrl, model: cfg.stt.model, apiType: cfg.stt.apiType, hasKey: Boolean(cfg.stt.apiKey) },
+    tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: Boolean(cfg.tts.apiKey) },
   };
 
   if (!cfg.llm.apiKey) {
@@ -699,6 +1260,7 @@ async function handleTest(req: Request, env: Env): Promise<Response> {
       ],
       20,
       0,
+      cfg.llm.apiType,
     );
     result.llmTest = { ok: true, reply };
   } catch (err: any) {
@@ -719,6 +1281,10 @@ export default {
 
       if (url.pathname === "/api/defaults" && request.method === "GET") {
         return json(publicConfig(env));
+      }
+
+      if (url.pathname === "/api/chat/stream" && request.method === "POST") {
+        return await handleChatStream(request, env);
       }
 
       if (url.pathname === "/api/chat" && request.method === "POST") {

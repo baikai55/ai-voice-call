@@ -1,0 +1,33 @@
+{
+  "name": "AI语音通话",
+  "short_name": "语音通话",
+  "description": "本地配置的 AI 语音通话助手",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "fullscreen", "minimal-ui"],
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "orientation": "portrait",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="AI语音通话">
+  <defs>
+    <linearGradient id="bg" x1="88" y1="52" x2="424" y2="460" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="20" stdDeviation="24" flood-color="#1e3a8a" flood-opacity=".24"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#eff6ff"/>
+  <circle cx="256" cy="256" r="184" fill="url(#bg)" filter="url(#shadow)"/>
+  <path d="M256 142c-34 0-62 28-62 62v82c0 34 28 62 62 62s62-28 62-62v-82c0-34-28-62-62-62Z" fill="#fff"/>
+  <path d="M154 264c0 56 46 102 102 102s102-46 102-102" fill="none" stroke="#fff" stroke-width="28" stroke-linecap="round"/>
+  <path d="M256 366v44" stroke="#fff" stroke-width="28" stroke-linecap="round"/>
+  <path d="M206 414h100" stroke="#fff" stroke-width="28" stroke-linecap="round"/>
+  <path d="M360 176c20 20 32 48 32 80s-12 60-32 80" fill="none" stroke="#bfdbfe" stroke-width="18" stroke-linecap="round" opacity=".9"/>
+  <path d="M152 176c-20 20-32 48-32 80s12 60 32 80" fill="none" stroke="#bfdbfe" stroke-width="18" stroke-linecap="round" opacity=".9"/>
+</svg>

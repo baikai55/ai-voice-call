@@ -5,14 +5,14 @@
 ## 核心原则
 
 - **聊天数据存本地**：对话历史保存在当前浏览器 IndexedDB。
-- **配置存本地**：模型地址、模型名、API Key、搜索 Key、人设模板等保存在当前浏览器本地。
+- **配置存本地**：供应商（Base URL / API Key）、模型名、搜索 Key、人设模板等保存在当前浏览器本地。
 - **服务端不保存配置和数据**：本地 Node 服务 / Cloudflare Worker 只做静态资源托管和 API 代理，不持久化聊天记录，不保存 API Key。
 - **换设备需重新配置或导入配置 JSON**；清除浏览器数据会清掉本地配置和历史。
 
 ## 功能
 
 - 文字聊天
-- 按住说话（ASR）
+- 按住说话（语音识别 STT/ASR）
 - 自动朗读（TTS，失败可回退浏览器语音）
 - 场景模板下拉：通用助手、陪伴聊天、长辈友好、工作助理、学习辅导、简洁模式、自定义
 - 本地配置保存、导入、导出
@@ -24,7 +24,7 @@
 ### 1. 安装
 
 ```powershell
-cd H:\githubi-voice-call
+cd H:\github\ai-voice-call
 npm install
 ```
 
@@ -57,19 +57,35 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
 
 > 说明：手机浏览器录音通常更依赖 HTTPS。如果局域网 HTTP 下麦克风不可用，建议用 Cloudflare HTTPS 地址，或使用项目里的本地证书脚本配置 HTTPS。
 
+
+### 手机隐藏浏览器地址栏
+
+普通手机浏览器标签页里，网页不能强制隐藏系统地址栏/工具栏。项目已支持 PWA：手机访问 HTTPS 域名后，点浏览器菜单里的 **添加到主屏幕 / 安装应用**，以后从桌面图标打开，就会以独立应用模式运行，地址栏基本不会显示。
+
 ### 3. 填写本地配置
 
-点右上角 **本地配置**：
+点右上角 **设置 / 本地配置**，先进入 **供应商**：
+
+1. **新增供应商**：填写名称、Base URL、API Key（同一平台只填一次）
+2. **大模型 LLM**：选择模型供应商 + 聊天 Model + 接口类型
+3. **语音识别 STT/ASR**：选择语音识别供应商（可“跟随大模型”）+ 语音识别 Model + 接口类型
+4. **语音合成 TTS**：选择语音合成供应商（可“跟随大模型”）+ TTS Model + Voice / 音色 + 接口类型
 
 | 项 | 推荐值 |
 |---|---|
-| LLM Base URL | `https://api.siliconflow.cn/v1` |
-| LLM Model | `Qwen/Qwen3.5-4B` |
-| LLM API Key | 你的模型平台 Key，保存在当前浏览器本地 |
-| STT Model | `FunAudioLLM/SenseVoiceSmall` |
-| TTS Model | 平台可用 TTS，如 `FnLP/MOSS-TTSD-v0.5` 或 `mimo-v2.5-tts` |
+| 供应商 Base URL | 按供应商填写，例如 `https://api.siliconflow.cn/v1` |
+| 供应商 API Key | 你的模型平台 Key，保存在当前浏览器本地 |
+| LLM Model | 按供应商可用模型填写 |
+| 语音识别 STT/ASR Model | 按供应商可用语音识别模型填写 |
+| TTS Model | 按供应商可用语音合成模型填写 |
+| Voice / 音色 | 可从下拉选预置音色，也可以直接输入服务商支持的自定义 voice id |
+| 接口类型 | LLM 一般选 `自动识别`（优先 `/v1/chat/completions`，遇到 404/405 再尝试 `/v1/responses`）；也可手动选 `OpenAI Chat Completions` 或 `OpenAI Responses`。小米 `mimo-v2.5-tts` 可选 `小米 MiMo TTS`；OpenAI 兼容语音合成选 `OpenAI Speech API` |
 
-STT/TTS 的 Base URL、Key 可留空，默认跟随 LLM。
+可以分别定义 3 个供应商（LLM / 语音识别 / TTS 各一个），也可以共用同一个。语音识别 / TTS 选“跟随大模型”时，自动使用大模型对应供应商的 Base URL 和 Key。
+
+聊天接口已支持流式输出：前端优先请求 `/api/chat/stream`，后端会代理供应商的 `/v1/chat/completions` 或 `/v1/responses` 流；如果流式在输出前失败，会自动回退到原来的 `/api/chat` 非流式请求。TTS 仍等完整回复生成后再朗读。
+
+小米 MiMo TTS 供应商示例：Base URL 填 `https://api.xiaomimimo.com/v1`，TTS Model 填 `mimo-v2.5-tts`，TTS 接口类型选 `小米 MiMo TTS`（或保持 `自动识别`）。Voice / 音色可选 `mimo_default`、`冰糖`、`茉莉`、`苏打`、`白桦`、`Mia`、`Chloe`、`Milo`、`Dean`，也可以直接输入服务商支持的自定义 voice id。Voice 留空或填 `alloy` 时会自动按小米接口转成 `mimo_default`。
 
 然后：
 
@@ -81,7 +97,7 @@ STT/TTS 的 Base URL、Key 可留空，默认跟随 LLM。
 
 | 配置项 | 默认值 | 说明 |
 |---|---:|---|
-| 场景模板 | 通用助手 | 不限定给父母，也适合普通聊天和工作学习 |
+| 场景模板 | 通用助手 |   |
 | 历史轮数 `maxHistoryTurns` | `12` | 保留最近上下文，避免请求过长 |
 | 最大回复长度 `maxTokens` | `512` | 默认适合语音朗读；需要更详细可在 UI 调到 800/1024 |
 | 温度 `temperature` | `0.7` | 自然但不太发散 |
@@ -124,22 +140,30 @@ STT/TTS 的 Base URL、Key 可留空，默认跟随 LLM。
 ```json
 {
   "app": "ai-voice-call",
-  "version": 1,
+  "version": 3,
+  "apiProviders": [
+    {
+      "id": "provider_default",
+      "name": "默认供应商",
+      "baseUrl": "https://api.siliconflow.cn/v1",
+      "apiKey": "sk-xxx"
+    }
+  ],
   "llm": {
-    "baseUrl": "https://api.siliconflow.cn/v1",
-    "apiKey": "sk-xxx",
-    "model": "Qwen/Qwen3.5-4B"
+    "providerId": "provider_default",
+    "model": "Qwen/Qwen3.5-4B",
+    "apiType": "auto"
   },
   "stt": {
-    "baseUrl": "",
-    "apiKey": "",
-    "model": "FunAudioLLM/SenseVoiceSmall"
+    "providerId": "",
+    "model": "FunAudioLLM/SenseVoiceSmall",
+    "apiType": "auto"
   },
   "tts": {
-    "baseUrl": "",
-    "apiKey": "",
+    "providerId": "",
     "model": "FnLP/MOSS-TTSD-v0.5",
-    "voice": "alloy"
+    "voice": "alloy",
+    "apiType": "auto"
   },
   "systemPromptPreset": "general",
   "systemPrompt": "你是一个中文 AI 助手...",
@@ -171,6 +195,7 @@ npm run deploy
 - `GET /api/health`
 - `GET /api/defaults`
 - `POST /api/chat`
+- `POST /api/chat/stream`
 - `POST /api/asr`
 - `POST /api/tts`
 - `POST /api/test`
@@ -181,13 +206,13 @@ npm run deploy
 ## 目录
 
 ```text
-H:\githubi-voice-call  src\index.ts          Worker 后端
+H:\github\ai-voice-call  src\index.ts          Worker 后端
   src\search.ts         联网搜索
   public\index.html     页面
-  publicpp.js         前端逻辑
+  public\app.js         前端逻辑
   public\db.js          IndexedDB 存储
   public\styles.css
-  configpi.local.example.json
+  config\api.local.example.json
   local-server.mjs      本地 Node 服务
   wrangler.toml
   package.json

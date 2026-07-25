@@ -2,10 +2,19 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
   <meta name="theme-color" content="#ffffff" />
+  <meta name="application-name" content="AI语音通话" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="AI语音通话" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="format-detection" content="telephone=no" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
   <title>AI语音通话</title>
-  <link rel="stylesheet" href="/styles.css?v=25" />
+  <link rel="stylesheet" href="/styles.css?v=37" />
 </head>
 <body>
   <div class="app">
@@ -41,6 +50,7 @@
     </header>
 
     <main id="chat" class="chat" aria-live="polite"></main>
+    <p id="status" class="status chat-status">正在准备…</p>
 
     <section class="composer">
       <div class="quick" aria-label="快捷提问">
@@ -56,11 +66,18 @@
         <button id="btnHold" class="icon-btn mic" type="button" title="按住说话" aria-label="按住说话"><span class="mic-dot" aria-hidden="true"></span></button>
         <button id="btnSend" class="icon-btn send" type="button" title="发送" aria-label="发送">发送</button>
       </div>
-      <p id="status" class="status">正在准备…</p>
     </section>
   </div>
 
-    <div id="historyModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
+  <div id="installTip" class="install-tip hidden" role="status" aria-live="polite">
+    <span>想隐藏手机浏览器地址栏？把它“添加到主屏幕/安装应用”后，从桌面图标打开。</span>
+    <div class="install-tip-actions">
+      <button id="btnInstallApp" class="install-tip-primary" type="button" hidden>安装</button>
+      <button id="btnInstallDismiss" type="button">知道了</button>
+    </div>
+  </div>
+
+  <div id="historyModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
     <div class="modal-card history-sheet">
       <div class="history-head">
         <div>
@@ -88,67 +105,114 @@
       </div>
 
       <div class="settings-tabs" role="tablist" aria-label="设置分组">
-        <button type="button" class="settings-tab active" role="tab" aria-selected="true" data-tab="llm">模型</button>
-        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="voice">语音</button>
+        <button type="button" class="settings-tab active" role="tab" aria-selected="true" data-tab="providers">供应商</button>
         <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="chat">对话</button>
         <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="search">搜索</button>
         <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="backup">备份</button>
       </div>
 
       <div class="settings-body">
-        <section class="settings-panel active" data-panel="llm" role="tabpanel">
+        <section class="settings-panel active" data-panel="providers" role="tabpanel">
+          <article class="settings-card">
+            <div class="card-head">
+              <div>
+                <h3>API 供应商</h3>
+                <p>先新增供应商并填写 Base URL / API Key；大模型、语音识别、语音合成再分别选择用哪个</p>
+              </div>
+              <span class="card-badge">基础</span>
+            </div>
+            <div class="provider-manager">
+              <div class="provider-picker-row">
+                <label class="field provider-picker-field">
+                  <span class="field-label">选择供应商</span>
+                  <select id="apiProviderPicker"></select>
+                </label>
+                <div class="settings-actions mini-actions provider-toolbar" aria-label="供应商操作">
+                  <button id="btnEditSelectedProvider" type="button" class="btn ghost">编辑选中</button>
+                  <button id="btnDeleteSelectedProvider" type="button" class="btn ghost">删除选中</button>
+                  <button id="btnAddProvider" type="button" class="btn ghost">新增供应商</button>
+                </div>
+              </div>
+              <div id="apiProviderList" class="provider-list" aria-live="polite"></div>
+            </div>
+            <div id="providerEditor" class="provider-editor hidden">
+              <div class="field-grid">
+                <input id="providerEditId" type="hidden" />
+                <label class="field">
+                  <span class="field-label">供应商名称</span>
+                  <input id="providerName" placeholder="硅基流动 / OpenAI / 阿里 / 自定义" />
+                </label>
+                <label class="field">
+                  <span class="field-label">Base URL</span>
+                  <input id="providerBaseUrl" placeholder="https://api.siliconflow.cn/v1" />
+                </label>
+                <label class="field full">
+                  <span class="field-label">API Key</span>
+                  <div class="secret-input">
+                    <input id="providerApiKey" type="password" placeholder="sk-..." autocomplete="off" />
+                    <button type="button" class="eye-btn" data-eye-for="providerApiKey" aria-label="显示或隐藏密钥" title="显示/隐藏">👁</button>
+                  </div>
+                  <small class="field-help">同一平台只需填一次；LLM / 语音识别 / TTS 可以各自指向不同供应商。</small>
+                </label>
+              </div>
+              <div class="settings-actions mini-actions">
+                <button id="btnSaveProvider" type="button" class="btn primary">保存供应商</button>
+                <button id="btnCancelProvider" type="button" class="btn ghost">取消</button>
+              </div>
+            </div>
+          </article>
+
           <article class="settings-card">
             <div class="card-head">
               <div>
                 <h3>大模型 LLM</h3>
-                <p>聊天回复使用的接口与模型</p>
+                <p>聊天回复使用的供应商和模型</p>
               </div>
               <span class="card-badge">必填</span>
             </div>
             <div class="field-grid">
               <label class="field">
-                <span class="field-label">Base URL</span>
-                <input id="llmBaseUrl" placeholder="https://api.siliconflow.cn/v1" />
+                <span class="field-label">模型供应商</span>
+                <select id="llmProviderId"></select>
               </label>
               <label class="field">
-                <span class="field-label">Model</span>
+                <span class="field-label">聊天 Model</span>
                 <input id="llmModel" placeholder="Qwen/Qwen3.5-4B" />
               </label>
-              <label class="field full">
-                <span class="field-label">API Key</span>
-                <div class="secret-input">
-                  <input id="llmApiKey" type="password" placeholder="sk-..." autocomplete="off" />
-                  <button type="button" class="eye-btn" data-eye-for="llmApiKey" aria-label="显示或隐藏密钥" title="显示/隐藏">👁</button>
-                </div>
+              <label class="field">
+                <span class="field-label">LLM 接口类型</span>
+                <select id="llmApiType">
+                  <option value="auto">自动识别</option>
+                  <option value="openai-chat">OpenAI Chat Completions（/v1/chat/completions）</option>
+                  <option value="openai-responses">OpenAI Responses（/v1/responses + tools）</option>
+                </select>
               </label>
             </div>
           </article>
-        </section>
 
-        <section class="settings-panel" data-panel="voice" role="tabpanel" hidden>
           <article class="settings-card">
             <div class="card-head">
               <div>
-                <h3>语音识别 STT</h3>
-                <p>按住说话时转文字。可留空，默认跟随 LLM</p>
+                <h3>语音识别 STT/ASR</h3>
+                <p>按住说话时把录音转成文字；可与大模型用不同供应商</p>
               </div>
               <span class="card-badge soft">可选</span>
             </div>
             <div class="field-grid">
               <label class="field">
-                <span class="field-label">Base URL</span>
-                <input id="sttBaseUrl" placeholder="可留空，默认跟 LLM" />
+                <span class="field-label">语音识别供应商</span>
+                <select id="sttProviderId"></select>
               </label>
               <label class="field">
-                <span class="field-label">Model</span>
+                <span class="field-label">语音识别 STT/ASR Model</span>
                 <input id="sttModel" placeholder="FunAudioLLM/SenseVoiceSmall" />
               </label>
-              <label class="field full">
-                <span class="field-label">API Key</span>
-                <div class="secret-input">
-                  <input id="sttApiKey" type="password" placeholder="可留空，默认跟 LLM" autocomplete="off" />
-                  <button type="button" class="eye-btn" data-eye-for="sttApiKey" aria-label="显示或隐藏密钥" title="显示/隐藏">👁</button>
-                </div>
+              <label class="field">
+                <span class="field-label">语音识别接口类型</span>
+                <select id="sttApiType">
+                  <option value="auto">自动识别</option>
+                  <option value="openai-transcriptions">OpenAI Audio Transcriptions</option>
+                </select>
               </label>
             </div>
           </article>
@@ -157,35 +221,51 @@
             <div class="card-head">
               <div>
                 <h3>语音合成 TTS</h3>
-                <p>自动朗读回复。可留空，默认跟随 LLM</p>
+                <p>把助手回复生成语音播放；可与大模型用不同供应商</p>
               </div>
               <span class="card-badge soft">可选</span>
             </div>
             <div class="field-grid">
               <label class="field">
-                <span class="field-label">Base URL</span>
-                <input id="ttsBaseUrl" placeholder="可留空，默认跟 LLM" />
+                <span class="field-label">语音合成供应商</span>
+                <select id="ttsProviderId"></select>
               </label>
               <label class="field">
-                <span class="field-label">Model</span>
+                <span class="field-label">TTS Model</span>
                 <input id="ttsModel" placeholder="FnLP/MOSS-TTSD-v0.5 或 mimo-v2.5-tts" />
               </label>
               <label class="field">
-                <span class="field-label">Voice</span>
-                <input id="ttsVoice" placeholder="alloy" />
+                <span class="field-label">Voice / 音色</span>
+                <select id="ttsVoicePreset">
+                  <option value="mimo_default">mimo_default（小米默认音色）</option>
+                  <option value="冰糖">冰糖（小米中文女声）</option>
+                  <option value="茉莉">茉莉（小米中文女声）</option>
+                  <option value="苏打">苏打（小米中文男声）</option>
+                  <option value="白桦">白桦（小米中文男声）</option>
+                  <option value="Mia">Mia（小米英文女声）</option>
+                  <option value="Chloe">Chloe（小米英文女声）</option>
+                  <option value="Milo">Milo（小米英文男声）</option>
+                  <option value="Dean">Dean（小米英文男声）</option>
+                  <option value="alloy">alloy（OpenAI 兼容常用音色）</option>
+                  <option value="custom">自定义...</option>
+                </select>
+                <input id="ttsVoice" class="hidden" placeholder="输入服务商支持的 voice id" autocomplete="off" />
+                <small class="field-help">常用音色直接选；需要其它音色时选“自定义...”后输入 voice id。</small>
               </label>
               <label class="field full">
-                <span class="field-label">API Key</span>
-                <div class="secret-input">
-                  <input id="ttsApiKey" type="password" placeholder="可留空，默认跟 LLM" autocomplete="off" />
-                  <button type="button" class="eye-btn" data-eye-for="ttsApiKey" aria-label="显示或隐藏密钥" title="显示/隐藏">👁</button>
-                </div>
+                <span class="field-label">TTS 接口类型</span>
+                <select id="ttsApiType">
+                  <option value="auto">自动识别</option>
+                  <option value="openai-speech">OpenAI Speech API：/audio/speech</option>
+                  <option value="xiaomi-mimo">小米 MiMo TTS：/chat/completions</option>
+                </select>
+                <small class="field-help">小米 mimo-v2.5-tts 请选择“小米 MiMo TTS”，或保持“自动识别”。</small>
               </label>
             </div>
             <div class="switch-list">
               <label class="switch-row">
                 <span>
-                  <strong>启用服务端 TTS</strong>
+                  <strong>启用在线 TTS</strong>
                   <small>用接口生成语音再播放</small>
                 </span>
                 <input id="ttsEnabled" type="checkbox" class="switch-input" />
@@ -193,7 +273,7 @@
               <label class="switch-row">
                 <span>
                   <strong>失败时用浏览器朗读</strong>
-                  <small>服务端 TTS 失败后回退系统语音</small>
+                  <small>在线 TTS 失败后回退系统语音</small>
                 </span>
                 <input id="browserTtsFallback" type="checkbox" class="switch-input" />
               </label>
@@ -255,14 +335,14 @@
             <div class="card-head">
               <div>
                 <h3>联网搜索</h3>
-                <p>天气、新闻、价格等实时问题可先搜索再回答</p>
+                <p>只在天气、新闻、价格等强实时问题自动搜索；普通聊天和知识问答不搜</p>
               </div>
             </div>
             <div class="switch-list">
               <label class="switch-row">
                 <span>
                   <strong>启用联网搜索</strong>
-                  <small>识别到实时信息时自动搜索</small>
+                  <small>开关和提供方会立即生效；想强制联网时，可以直接说“搜一下/帮我查一下”</small>
                 </span>
                 <input id="webSearchEnabled" type="checkbox" class="switch-input" />
               </label>
@@ -271,7 +351,8 @@
               <label class="field">
                 <span class="field-label">搜索提供方</span>
                 <select id="searchProvider">
-                  <option value="auto">自动（免费优先）</option>
+                  <option value="auto">自动（优先必应）</option>
+                  <option value="bing-rss">Bing 必应免费</option>
                   <option value="duckduckgo">DuckDuckGo 免费</option>
                   <option value="searxng">SearXNG</option>
                   <option value="tavily">Tavily（需Key）</option>
@@ -281,13 +362,13 @@
               <label class="field full">
                 <span class="field-label">搜索 API Key（可选）</span>
                 <div class="secret-input">
-                  <input id="searchApiKey" type="password" placeholder="Tavily/Serper 等，可留空先用免费搜索" autocomplete="off" />
+                  <input id="searchApiKey" type="password" placeholder="建议填 Serper 或 Tavily；不填则使用轻量免费搜索" autocomplete="off" />
                   <button type="button" class="eye-btn" data-eye-for="searchApiKey" aria-label="显示或隐藏密钥" title="显示/隐藏">👁</button>
                 </div>
               </label>
               <label class="field full">
                 <span class="field-label">SearXNG 地址（可选）</span>
-                <input id="searchBaseUrl" placeholder="https://searx.be" />
+                <input id="searchBaseUrl" placeholder="例如 https://searx.be；仅选择 SearXNG 或自动兜底时使用" />
               </label>
             </div>
           </article>
@@ -335,7 +416,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=25" type="module"></script>
+  <script src="/app.js?v=37" type="module"></script>
 </body>
 </html>
-
