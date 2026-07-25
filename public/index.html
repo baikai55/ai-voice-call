@@ -14,7 +14,7 @@
   <link rel="icon" href="/icon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="/icon-192.png" />
   <title>AI语音通话</title>
-  <link rel="stylesheet" href="/styles.css?v=37" />
+  <link rel="stylesheet" href="/styles.css?v=38" />
 </head>
 <body>
   <div class="app">
@@ -34,6 +34,9 @@
         <p id="chatSub" class="sub">配置与对话都保存在本机数据库</p>
       </div>
       <div class="top-actions">
+        <button id="btnCall" class="icon-btn call-launch" type="button" title="开始语音通话" aria-label="开始语音通话" aria-pressed="false">
+          <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path fill="currentColor" d="M6.62 10.79a15.46 15.46 0 0 0 6.59 6.59l2.2-2.2a1 1 0 0 1 1.02-.24c1.12.37 2.33.57 3.57.57a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1C10.61 21 3 13.39 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1.02l-2.2 2.2z"/></svg>
+        </button>
         <button id="btnVoice" class="icon-btn voice-toggle on" type="button" title="语音朗读：开（点击关闭）" aria-label="关闭语音朗读" aria-pressed="true">
           <svg class="voice-svg" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
             <path class="voice-body" d="M4 9.5h2.8l4.2-3.6v12.2L6.8 14.5H4a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1z"></path>
@@ -68,6 +71,46 @@
       </div>
     </section>
   </div>
+
+  <section id="callPanel" class="call-panel hidden" role="dialog" aria-modal="true" aria-labelledby="callTitle">
+    <div class="call-panel-inner">
+      <div class="call-head">
+        <div>
+          <p class="call-kicker">AI 实时对话</p>
+          <h2 id="callTitle">语音通话</h2>
+        </div>
+        <time id="callTimer" class="call-timer">00:00</time>
+      </div>
+
+      <div id="callOrb" class="call-orb" aria-hidden="true">
+        <span class="call-orb-ring call-orb-ring-one"></span>
+        <span class="call-orb-ring call-orb-ring-two"></span>
+        <span class="call-orb-core">
+          <svg viewBox="0 0 24 24" width="46" height="46" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a1 1 0 1 1 2 0 7 7 0 0 1-6 6.92V21h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-3.08A7 7 0 0 1 5 11a1 1 0 1 1 2 0 5 5 0 0 0 10 0z"/></svg>
+        </span>
+      </div>
+
+      <div class="call-copy">
+        <p id="callStatus" class="call-status" aria-live="polite">正在接通…</p>
+        <p id="callTranscript" class="call-transcript">接通后直接说话，停顿时会自动发送。</p>
+      </div>
+
+      <div class="call-actions">
+        <button id="btnCallMute" class="call-control" type="button" aria-label="静音麦克风" aria-pressed="false">
+          <span class="call-control-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="25" height="25"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a1 1 0 1 1 2 0 7 7 0 0 1-6 6.92V21h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-3.08A7 7 0 0 1 5 11a1 1 0 1 1 2 0 5 5 0 0 0 10 0z"/></svg>
+          </span>
+          <span id="callMuteLabel">静音</span>
+        </button>
+        <button id="btnHangup" class="call-control hangup" type="button" aria-label="挂断语音通话">
+          <span class="call-control-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="28" height="28"><path fill="currentColor" d="M21 15.5c0 .55-.45 1-1 1h-3.4a1 1 0 0 1-.95-.69l-.62-1.9a12.1 12.1 0 0 0-6.06 0l-.62 1.9a1 1 0 0 1-.95.69H4a1 1 0 0 1-1-1v-2.04a1 1 0 0 1 .57-.9 19.43 19.43 0 0 1 16.86 0 1 1 0 0 1 .57.9v2.04z"/></svg>
+          </span>
+          <span>挂断</span>
+        </button>
+      </div>
+    </div>
+  </section>
 
   <div id="installTip" class="install-tip hidden" role="status" aria-live="polite">
     <span>想隐藏手机浏览器地址栏？把它“添加到主屏幕/安装应用”后，从桌面图标打开。</span>
@@ -175,17 +218,36 @@
                 <span class="field-label">模型供应商</span>
                 <select id="llmProviderId"></select>
               </label>
-              <label class="field">
+              <div class="field model-field">
                 <span class="field-label">聊天 Model</span>
-                <input id="llmModel" placeholder="Qwen/Qwen3.5-4B" />
-              </label>
+                <div class="model-picker" data-model-picker="llm">
+                  <button id="llmModelTrigger" class="model-picker-trigger" type="button" aria-expanded="false" aria-controls="llmModelMenu">
+                    <span id="llmModelSelected" class="model-picker-selected"></span>
+                    <span class="model-picker-chevron" aria-hidden="true">⌄</span>
+                  </button>
+                  <div id="llmModelMenu" class="model-picker-menu hidden">
+                    <div class="model-input-row">
+                      <input id="llmModel" placeholder="输入模型 ID" autocomplete="off" />
+                      <button id="btnAddLlmModel" class="btn secondary model-add-btn" type="button">添加</button>
+                    </div>
+                    <div id="llmModelList" class="model-option-list" role="listbox" aria-label="大模型选项"></div>
+                  </div>
+                </div>
+                <small class="field-help">从下拉列表选择；也可以在下拉框内输入并添加自定义模型。</small>
+              </div>
               <label class="field">
                 <span class="field-label">LLM 接口类型</span>
                 <select id="llmApiType">
                   <option value="auto">自动识别</option>
                   <option value="openai-chat">OpenAI Chat Completions（/v1/chat/completions）</option>
                   <option value="openai-responses">OpenAI Responses（/v1/responses + tools）</option>
+                  <option value="custom">自定义接口地址（OpenAI Chat 兼容）</option>
                 </select>
+              </label>
+              <label id="llmCustomEndpointField" class="field full hidden">
+                <span class="field-label">自定义 LLM 接口地址</span>
+                <input id="llmCustomEndpoint" placeholder="例如 /v1/chat/completions 或 https://example.com/api/chat" autocomplete="off" />
+                <small class="field-help">完整 URL 直接使用；以 / 开头时从域名根路径拼接；其它写法追加到供应商 Base URL。</small>
               </label>
             </div>
           </article>
@@ -203,16 +265,35 @@
                 <span class="field-label">语音识别供应商</span>
                 <select id="sttProviderId"></select>
               </label>
-              <label class="field">
+              <div class="field model-field">
                 <span class="field-label">语音识别 STT/ASR Model</span>
-                <input id="sttModel" placeholder="FunAudioLLM/SenseVoiceSmall" />
-              </label>
+                <div class="model-picker" data-model-picker="stt">
+                  <button id="sttModelTrigger" class="model-picker-trigger" type="button" aria-expanded="false" aria-controls="sttModelMenu">
+                    <span id="sttModelSelected" class="model-picker-selected"></span>
+                    <span class="model-picker-chevron" aria-hidden="true">⌄</span>
+                  </button>
+                  <div id="sttModelMenu" class="model-picker-menu hidden">
+                    <div class="model-input-row">
+                      <input id="sttModel" placeholder="输入模型 ID" autocomplete="off" />
+                      <button id="btnAddSttModel" class="btn secondary model-add-btn" type="button">添加</button>
+                    </div>
+                    <div id="sttModelList" class="model-option-list" role="listbox" aria-label="语音识别模型选项"></div>
+                  </div>
+                </div>
+                <small class="field-help">自定义模型的删除按钮位于下拉选项右侧。</small>
+              </div>
               <label class="field">
                 <span class="field-label">语音识别接口类型</span>
                 <select id="sttApiType">
                   <option value="auto">自动识别</option>
                   <option value="openai-transcriptions">OpenAI Audio Transcriptions</option>
+                  <option value="custom">自定义接口地址（OpenAI Transcriptions 兼容）</option>
                 </select>
+              </label>
+              <label id="sttCustomEndpointField" class="field full hidden">
+                <span class="field-label">自定义语音识别接口地址</span>
+                <input id="sttCustomEndpoint" placeholder="例如 /v1/audio/transcriptions" autocomplete="off" />
+                <small class="field-help">请求仍使用 OpenAI multipart/form-data 格式，字段为 file、model、response_format、language。</small>
               </label>
             </div>
           </article>
@@ -230,10 +311,23 @@
                 <span class="field-label">语音合成供应商</span>
                 <select id="ttsProviderId"></select>
               </label>
-              <label class="field">
+              <div class="field model-field">
                 <span class="field-label">TTS Model</span>
-                <input id="ttsModel" placeholder="FnLP/MOSS-TTSD-v0.5 或 mimo-v2.5-tts" />
-              </label>
+                <div class="model-picker" data-model-picker="tts">
+                  <button id="ttsModelTrigger" class="model-picker-trigger" type="button" aria-expanded="false" aria-controls="ttsModelMenu">
+                    <span id="ttsModelSelected" class="model-picker-selected"></span>
+                    <span class="model-picker-chevron" aria-hidden="true">⌄</span>
+                  </button>
+                  <div id="ttsModelMenu" class="model-picker-menu hidden">
+                    <div class="model-input-row">
+                      <input id="ttsModel" placeholder="输入模型 ID" autocomplete="off" />
+                      <button id="btnAddTtsModel" class="btn secondary model-add-btn" type="button">添加</button>
+                    </div>
+                    <div id="ttsModelList" class="model-option-list" role="listbox" aria-label="语音合成模型选项"></div>
+                  </div>
+                </div>
+                <small class="field-help">自定义模型的删除按钮位于下拉选项右侧。</small>
+              </div>
               <label class="field">
                 <span class="field-label">Voice / 音色</span>
                 <select id="ttsVoicePreset">
@@ -258,8 +352,14 @@
                   <option value="auto">自动识别</option>
                   <option value="openai-speech">OpenAI Speech API：/audio/speech</option>
                   <option value="xiaomi-mimo">小米 MiMo TTS：/chat/completions</option>
+                  <option value="custom">自定义接口地址（OpenAI Speech 兼容）</option>
                 </select>
                 <small class="field-help">小米 mimo-v2.5-tts 请选择“小米 MiMo TTS”，或保持“自动识别”。</small>
+              </label>
+              <label id="ttsCustomEndpointField" class="field full hidden">
+                <span class="field-label">自定义 TTS 接口地址</span>
+                <input id="ttsCustomEndpoint" placeholder="例如 /v1/audio/speech" autocomplete="off" />
+                <small class="field-help">请求仍使用 OpenAI Speech JSON 格式，字段为 model、voice、input、response_format。</small>
               </label>
             </div>
             <div class="switch-list">
@@ -416,6 +516,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=37" type="module"></script>
+  <script src="/app.js?v=40" type="module"></script>
 </body>
 </html>

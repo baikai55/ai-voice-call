@@ -1,6 +1,6 @@
 # AI语音通话 (ai-voice-call)
 
-大字号中文 AI 语音/文字聊天应用：适合日常聊天、工作助理、学习辅导、长辈友好等场景。支持按住说话、自动朗读、本地配置、导入/导出配置，可本地运行，也可部署到 Cloudflare Workers + Assets。
+大字号中文 AI 语音/文字聊天应用：适合日常聊天、工作助理、学习辅导、长辈友好等场景。支持免按住连续语音通话、按住说话、自动朗读、本地配置、导入/导出配置，可本地运行，也可部署到 Cloudflare Workers + Assets。
 
 ## 核心原则
 
@@ -12,6 +12,7 @@
 ## 功能
 
 - 文字聊天
+- 一键语音通话：自动收音、检测停顿、识别并发送，AI 朗读结束后继续聆听
 - 按住说话（语音识别 STT/ASR）
 - 自动朗读（TTS，失败可回退浏览器语音）
 - 场景模板下拉：通用助手、陪伴聊天、长辈友好、工作助理、学习辅导、简洁模式、自定义
@@ -79,19 +80,39 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
 | 语音识别 STT/ASR Model | 按供应商可用语音识别模型填写 |
 | TTS Model | 按供应商可用语音合成模型填写 |
 | Voice / 音色 | 可从下拉选预置音色，也可以直接输入服务商支持的自定义 voice id |
-| 接口类型 | LLM 一般选 `自动识别`（优先 `/v1/chat/completions`，遇到 404/405 再尝试 `/v1/responses`）；也可手动选 `OpenAI Chat Completions` 或 `OpenAI Responses`。小米 `mimo-v2.5-tts` 可选 `小米 MiMo TTS`；OpenAI 兼容语音合成选 `OpenAI Speech API` |
+| 接口类型 | LLM 一般选 `自动识别` 或明确选择 `OpenAI Chat Completions` / `OpenAI Responses`。小米 `mimo-v2.5-tts` 可选 `小米 MiMo TTS`；OpenAI 兼容语音合成选 `OpenAI Speech API`。三类服务也都支持 `自定义接口地址` |
 
 可以分别定义 3 个供应商（LLM / 语音识别 / TTS 各一个），也可以共用同一个。语音识别 / TTS 选“跟随大模型”时，自动使用大模型对应供应商的 Base URL 和 Key。
+
+选择 `自定义接口地址` 后，只覆盖最终请求 URL，请求和响应格式仍需兼容对应的 OpenAI 接口：LLM 使用 Chat Completions，STT 使用 Audio Transcriptions 的 `multipart/form-data`，TTS 使用 Speech API 的 JSON。地址支持三种写法：
+
+- 完整 `http://` / `https://` URL：直接使用
+- 以 `/` 开头：从供应商域名根路径拼接，例如 Base URL 为 `https://example.com/v1`，填写 `/api/chat` 后请求 `https://example.com/api/chat`
+- 其它相对路径：追加到供应商 Base URL，例如填写 `chat/completions` 后请求 `https://example.com/v1/chat/completions`
 
 聊天接口已支持流式输出：前端优先请求 `/api/chat/stream`，后端会代理供应商的 `/v1/chat/completions` 或 `/v1/responses` 流；如果流式在输出前失败，会自动回退到原来的 `/api/chat` 非流式请求。TTS 仍等完整回复生成后再朗读。
 
 小米 MiMo TTS 供应商示例：Base URL 填 `https://api.xiaomimimo.com/v1`，TTS Model 填 `mimo-v2.5-tts`，TTS 接口类型选 `小米 MiMo TTS`（或保持 `自动识别`）。Voice / 音色可选 `mimo_default`、`冰糖`、`茉莉`、`苏打`、`白桦`、`Mia`、`Chloe`、`Milo`、`Dean`，也可以直接输入服务商支持的自定义 voice id。Voice 留空或填 `alloy` 时会自动按小米接口转成 `mimo_default`。
+
+LLM / STT / TTS 模型使用下拉框选择。展开下拉框后可以输入任意服务商模型 ID 并点击 **添加**；自定义模型的 `×` 删除按钮位于对应下拉选项右侧，不占用设置表单布局。自定义模型列表会随配置一起导入、导出。
 
 然后：
 
 1. 点 **保存到本地**
 2. 点 **测试连接**
 3. 开始聊天
+
+### 4. 开始语音通话
+
+点击页面右上角的绿色电话按钮即可接通：
+
+1. 浏览器首次使用时允许麦克风权限。
+2. 直接说话，无需一直按住按钮。
+3. 自然停顿约 1 秒后，应用会自动结束本轮收音并发送识别结果。
+4. AI 回复并朗读完毕后，会自动重新打开麦克风等待下一轮。
+5. 通话界面可随时静音或挂断；切换页面到后台时会自动挂断并释放麦克风。
+
+语音通话采用轮流说话模式：AI 朗读时暂停收音，避免扬声器回声被再次识别。它是与 AI 的连续语音对话，不是用户之间的 WebRTC 真人通话。
 
 ## 推荐默认值
 
@@ -149,21 +170,29 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
       "apiKey": "sk-xxx"
     }
   ],
+  "customModels": {
+    "llm": ["your-org/your-chat-model"],
+    "stt": ["your-org/your-stt-model"],
+    "tts": ["your-org/your-tts-model"]
+  },
   "llm": {
     "providerId": "provider_default",
     "model": "Qwen/Qwen3.5-4B",
-    "apiType": "auto"
+    "apiType": "auto",
+    "endpoint": ""
   },
   "stt": {
     "providerId": "",
     "model": "FunAudioLLM/SenseVoiceSmall",
-    "apiType": "auto"
+    "apiType": "auto",
+    "endpoint": ""
   },
   "tts": {
     "providerId": "",
     "model": "FnLP/MOSS-TTSD-v0.5",
     "voice": "alloy",
-    "apiType": "auto"
+    "apiType": "auto",
+    "endpoint": ""
   },
   "systemPromptPreset": "general",
   "systemPrompt": "你是一个中文 AI 助手...",

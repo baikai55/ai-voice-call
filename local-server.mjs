@@ -66,6 +66,19 @@ function parseMultipart(buffer, contentType) {
 }
 function ensureV1(baseUrl) { const u = String(baseUrl || "").replace(/\/+$/, ""); if (!u) return ""; return /\/v1$/i.test(u) ? u : u + "/v1"; }
 function pick(...vals) { for (const v of vals) { const s = String(v ?? "").trim(); if (s) return s; } return ""; }
+function resolveCustomEndpoint(baseUrl, endpoint, fallbackPath) {
+  const base = String(baseUrl || "").trim().replace(/\/+$/, "");
+  const custom = String(endpoint || "").trim();
+  const fallback = String(fallbackPath || "").trim().replace(/^\/+/, "");
+  if (!custom) {
+    if (!base) throw new Error("缺少 API Base URL");
+    return fallback ? `${base}/${fallback}` : base;
+  }
+  if (/^https?:\/\//i.test(custom)) return custom;
+  if (!base) throw new Error("相对接口地址需要配置 API Base URL");
+  if (custom.startsWith("/")) return `${new URL(base).origin}${custom}`;
+  return `${base}/${custom.replace(/^\/+/, "")}`;
+}
 function keyDiagnostic(apiKey) {
   const key = String(apiKey || "").trim();
   return {
@@ -80,11 +93,12 @@ function publicLlmConfig(cfg) {
     baseUrl: cfg.llm.baseUrl,
     model: cfg.llm.model,
     apiType: cfg.llm.apiType,
+    endpoint: cfg.llm.endpoint,
     ...keyDiagnostic(cfg.llm.apiKey),
   };
 }
 function normalizeApiType(value, fallback = "auto") {
-  const allowed = new Set(["auto", "openai-chat", "openai-responses", "openai-transcriptions", "openai-speech", "xiaomi-mimo"]);
+  const allowed = new Set(["auto", "custom", "openai-chat", "openai-responses", "openai-transcriptions", "openai-speech", "xiaomi-mimo"]);
   const v = String(value || "").trim();
   return allowed.has(v) ? v : fallback;
 }
@@ -95,9 +109,9 @@ function resolveConfig(client = {}) {
   return {
     // API keys come only from the browser-local config sent with each request.
     // The local/Worker server does not store or fall back to server-side API keys.
-    llm: { baseUrl: llmBase, apiKey: pick(client.llm?.apiKey), model: pick(client.llm?.model, env("LLM_MODEL"), "Qwen/Qwen3.5-4B"), apiType: normalizeApiType(client.llm?.apiType, "auto") },
-    stt: { baseUrl: sttBase, apiKey: pick(client.stt?.apiKey, client.llm?.apiKey), model: pick(client.stt?.model, env("STT_MODEL"), "FunAudioLLM/SenseVoiceSmall"), apiType: normalizeApiType(client.stt?.apiType, "auto") },
-    tts: { baseUrl: ttsBase, apiKey: pick(client.tts?.apiKey, client.llm?.apiKey), model: pick(client.tts?.model, env("TTS_MODEL"), "FnLP/MOSS-TTSD-v0.5"), voice: pick(client.tts?.voice, env("TTS_VOICE"), "alloy"), apiType: normalizeApiType(client.tts?.apiType, "auto") },
+    llm: { baseUrl: llmBase, apiKey: pick(client.llm?.apiKey), model: pick(client.llm?.model, env("LLM_MODEL"), "Qwen/Qwen3.5-4B"), apiType: normalizeApiType(client.llm?.apiType, "auto"), endpoint: pick(client.llm?.endpoint) },
+    stt: { baseUrl: sttBase, apiKey: pick(client.stt?.apiKey, client.llm?.apiKey), model: pick(client.stt?.model, env("STT_MODEL"), "FunAudioLLM/SenseVoiceSmall"), apiType: normalizeApiType(client.stt?.apiType, "auto"), endpoint: pick(client.stt?.endpoint) },
+    tts: { baseUrl: ttsBase, apiKey: pick(client.tts?.apiKey, client.llm?.apiKey), model: pick(client.tts?.model, env("TTS_MODEL"), "FnLP/MOSS-TTSD-v0.5"), voice: pick(client.tts?.voice, env("TTS_VOICE"), "alloy"), apiType: normalizeApiType(client.tts?.apiType, "auto"), endpoint: pick(client.tts?.endpoint) },
     systemPrompt: pick(client.systemPrompt, env("SYSTEM_PROMPT"), DEFAULT_SYSTEM_PROMPT),
     maxHistoryTurns: Number(client.maxHistoryTurns || env("MAX_HISTORY_TURNS") || 12),
     maxTokens: Math.max(Number(client.maxTokens || env("LLM_MAX_TOKENS") || 512), 256),
@@ -180,6 +194,86 @@ async function fetchLlmWithTransientRetry(endpoint, options, timeoutMs, cfg) {
   }
   return res;
 }
+const REPLY_ONLY_INSTRUCTION = "输出要求：只输出给用户的最终回答，不要复述系统提示词、角色设定、对话记录或用户原话，不要重复回答。";
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function withReplyOnlyInstruction(systemPrompt) {
+  const prompt = String(systemPrompt || "").trim();
+  if (!prompt || prompt.includes(REPLY_ONLY_INSTRUCTION)) return prompt;
+  return `${prompt}\n\n${REPLY_ONLY_INSTRUCTION}`;
+}
+function mergeStreamText(current, incoming, cumulative = false) {
+  const reply = String(current || "");
+  const text = String(incoming || "").replace(/\<think>[\s\S]*?\<\/think>/gi, "");
+  if (!text) return { reply, delta: "" };
+  if (cumulative && text === reply) return { reply, delta: "" };
+  if (reply && text.length > reply.length && text.startsWith(reply)) {
+    return { reply: text, delta: text.slice(reply.length) };
+  }
+  if (text.length >= 12 && (text === reply || reply.endsWith(text))) {
+    return { reply, delta: "" };
+  }
+  if (reply && text.length >= 12) {
+    const maxOverlap = Math.min(reply.length, text.length);
+    for (let overlap = maxOverlap; overlap >= 12; overlap -= 1) {
+      if (reply.slice(-overlap) === text.slice(0, overlap)) {
+        const delta = text.slice(overlap);
+        return { reply: reply + delta, delta };
+      }
+    }
+  }
+  return { reply: reply + text, delta: text };
+}
+function cleanAssistantReply(text, messages = []) {
+  const original = String(text || "")
+    .replace(/\<think>[\s\S]*?\<\/think>/gi, "")
+    .replace(/<\|(?:im_start|im_end|endoftext|system|user|assistant)\|>/gi, "")
+    .trim();
+  if (!original) return "";
+  let cleaned = original;
+  const systemPrompts = (Array.isArray(messages) ? messages : [])
+    .filter((message) => message?.role === "system" && typeof message.content === "string")
+    .flatMap((message) => {
+      const prompt = message.content.trim();
+      const basePrompt = prompt.replace(REPLY_ONLY_INSTRUCTION, "").trim();
+      return [prompt, basePrompt];
+    })
+    .filter((prompt) => prompt.length >= 12)
+    .sort((a, b) => b.length - a.length);
+  for (const prompt of new Set(systemPrompts)) cleaned = cleaned.split(prompt).join("\n");
+
+  const lastUser = [...(Array.isArray(messages) ? messages : [])].reverse().find((message) => message?.role === "user");
+  const userText = String(lastUser?.content || "").trim();
+  if (userText) {
+    for (const marker of [
+      `用户说：“${userText}”`,
+      `用户说："${userText}"`,
+      `用户说：${userText}`,
+      `用户：${userText}`,
+      `user: ${userText}`,
+    ]) cleaned = cleaned.split(marker).join("\n");
+    const escapedUser = escapeRegExp(userText);
+    const userEchoPattern = new RegExp(`(^|\\n)\\s*(?:用户(?:说)?|user)\\s*[:：]\\s*[“”"'‘’]*\\s*${escapedUser}\\s*[“”"'‘’]*\\s*`, "gi");
+    for (let pass = 0; pass < 3; pass += 1) cleaned = cleaned.replace(userEchoPattern, "$1");
+  }
+  cleaned = cleaned
+    .replace(/(^|\n)\s*(?:系统(?:提示|消息)?|system)\s*[:：]\s*(?=\n|$)/gi, "$1")
+    .replace(/(^|\n)\s*(?:用户(?:说)?|user)\s*[:：]\s*[“”"'‘’]*\s*(?=\n|$)/gi, "$1")
+    .replace(/^\s*(?:助手|assistant|小豆)\s*[:：]\s*/i, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  const paragraphs = cleaned.split(/\n{2,}/).map((item) => item.trim()).filter(Boolean);
+  cleaned = paragraphs.filter((item, index) => index === 0 || item !== paragraphs[index - 1]).join("\n\n").trim();
+  const anchor = cleaned.slice(0, 48).trim();
+  if (anchor.length >= 24) {
+    const repeatAt = cleaned.indexOf(anchor, Math.max(80, anchor.length + 1));
+    if (repeatAt >= 0) cleaned = cleaned.slice(0, repeatAt).trim();
+  }
+  return cleaned || original;
+}
 function extractChatText(data) {
   const choice = data?.choices?.[0] || {};
   const message = choice.message || choice.delta || {};
@@ -232,7 +326,7 @@ async function chatCompletions(cfg, messages) {
           if (res.status === 400 && i < variants.length - 1) continue;
           throw new Error(lastErr);
         }
-        const textOut = extractLlmText(res.data, kind);
+        const textOut = cleanAssistantReply(extractLlmText(res.data, kind), messages);
         if (!textOut) {
           lastErr = `LLM returned empty content (${kind})`;
           console.log("[llm] empty content, raw=", String(res.raw || "").slice(0, 300));
@@ -280,7 +374,12 @@ function buildResponsesPayload(cfg, messages, stream = false, toolType = "web_se
   return payload;
 }
 function llmEndpoint(cfg, kind) {
-  return `${cfg.llm.baseUrl}/${kind === "responses" ? "responses" : "chat/completions"}`;
+  const fallbackPath = kind === "responses" ? "responses" : "chat/completions";
+  if (normalizeApiType(cfg.llm.apiType, "auto") === "custom") {
+    if (!cfg.llm.endpoint) throw new Error("缺少自定义 LLM 接口地址");
+    return resolveCustomEndpoint(cfg.llm.baseUrl, cfg.llm.endpoint, fallbackPath);
+  }
+  return resolveCustomEndpoint(cfg.llm.baseUrl, "", fallbackPath);
 }
 function preferredLlmKind(cfg) {
   return normalizeApiType(cfg.llm.apiType, "auto") === "openai-responses" ? "responses" : "chat";
@@ -346,19 +445,20 @@ async function readLlmStreamResponse(res, kind, onDelta) {
   let buffer = "";
   let raw = "";
   let reply = "";
-  const applyDelta = (delta) => {
+  const applyDelta = (delta, cumulative = false) => {
     if (!delta) return;
-    const cleaned = String(delta).replace(/\<think>[\s\S]*?\<\/think>/gi, "");
-    if (!cleaned) return;
-    reply += cleaned;
-    onDelta(cleaned, reply);
+    const merged = mergeStreamText(reply, delta, cumulative);
+    reply = merged.reply;
+    if (merged.delta) onDelta(merged.delta, reply);
   };
   const handleBlock = (block) => {
     const { eventName, dataText } = parseSseBlock(block);
     if (!dataText || dataText === "[DONE]") return;
     try {
       const data = JSON.parse(dataText);
-      applyDelta(extractStreamDelta(data, kind, eventName));
+      const choice = data?.choices?.[0] || {};
+      const cumulative = kind === "chat" && Boolean(choice.message) && !choice.delta;
+      applyDelta(extractStreamDelta(data, kind, eventName), cumulative);
       if (/response\.completed/i.test(String(data?.type || eventName || "")) && !reply) {
         const finalText = extractResponseText(data.response || data);
         applyDelta(finalText);
@@ -437,12 +537,14 @@ async function streamChatCompletions(cfg, messages, onDelta) {
           }
         }
         const reply = await readLlmStreamResponse(res, kind, onDelta);
-        if (reply) {
-          console.log("[llm] stream ok", kind, "chars=", reply.length);
-          return reply;
+        const cleanedReply = cleanAssistantReply(reply, messages);
+        if (cleanedReply) {
+          console.log("[llm] stream ok", kind, "chars=", cleanedReply.length);
+          return cleanedReply;
         }
         lastErr = `LLM stream returned empty content (${kind})`;
       } catch (err) {
+        if (err?.partial) err.partial = cleanAssistantReply(err.partial, messages);
         lastErr = String(err.message || err);
         console.log("[llm] stream error", lastErr);
         throw err;
@@ -667,7 +769,7 @@ function formatSearchContext(result) {
 function sanitizeMessages(messages, systemPrompt, maxTurns) {
   const rest = (messages || []).filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string").map((m) => ({ role: m.role, content: String(m.content).slice(0, 4000) }));
   const keep = Math.max(2, (maxTurns || 12) * 2);
-  return [{ role: "system", content: systemPrompt }, ...rest.slice(-keep)];
+  return [{ role: "system", content: withReplyOnlyInstruction(systemPrompt) }, ...rest.slice(-keep)];
 }
 function looksLikeNoWebReply(text) {
   const s = cleanSearchText(text);
@@ -770,6 +872,9 @@ function pickTranscript(data) {
   return "";
 }
 async function transcribe(cfg, file) {
+  const isCustom = normalizeApiType(cfg.stt.apiType, "auto") === "custom";
+  if (isCustom && !cfg.stt.endpoint) throw new Error("缺少自定义语音识别接口地址");
+  const endpoint = resolveCustomEndpoint(cfg.stt.baseUrl, isCustom ? cfg.stt.endpoint : "", "audio/transcriptions");
   const models = Array.from(new Set([cfg.stt.model, "FunAudioLLM/SenseVoiceSmall", "TeleAI/TeleSpeechASR"].filter(Boolean)));
   let lastErr = "语音识别没有返回文字";
   for (const model of models) {
@@ -779,7 +884,7 @@ async function transcribe(cfg, file) {
       const mid = Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${model}\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n` + (withLang ? `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nzh\r\n` : "") + `--${boundary}--\r\n`, "utf8");
       const body = Buffer.concat([pre, file.buffer, mid]);
       try {
-        const res = await fetchJson(cfg.stt.baseUrl + "/audio/transcriptions", { method: "POST", headers: { authorization: `Bearer ${cfg.stt.apiKey}`, "content-type": `multipart/form-data; boundary=${boundary}`, "content-length": String(body.length) }, body }, 60000);
+        const res = await fetchJson(endpoint, { method: "POST", headers: { authorization: `Bearer ${cfg.stt.apiKey}`, "content-type": `multipart/form-data; boundary=${boundary}`, "content-length": String(body.length) }, body }, 60000);
         if (!res.ok) { lastErr = res.data?.error?.message || res.raw?.slice?.(0, 200) || `HTTP ${res.status}`; continue; }
         const textOut = pickTranscript(res.data);
         if (textOut) return { text: textOut, model };
@@ -792,7 +897,7 @@ async function transcribe(cfg, file) {
 function isMimoTts(cfg) {
   const apiType = normalizeApiType(cfg.tts.apiType, "auto");
   if (apiType === "xiaomi-mimo") return true;
-  if (apiType === "openai-speech") return false;
+  if (apiType === "openai-speech" || apiType === "custom") return false;
   const host = (() => { try { return new URL(cfg.tts.baseUrl).hostname.toLowerCase(); } catch { return ""; } })();
   return host.includes("xiaomimimo.com") || /^mimo-v\d/i.test(String(cfg.tts.model || ""));
 }
@@ -829,13 +934,16 @@ async function synthesizeMimo(cfg, inputText) {
   return { buffer, contentType: "audio/wav" };
 }
 async function synthesizeOpenAiSpeech(cfg, inputText) {
+  const isCustom = normalizeApiType(cfg.tts.apiType, "auto") === "custom";
+  if (isCustom && !cfg.tts.endpoint) throw new Error("缺少自定义 TTS 接口地址");
+  const endpoint = resolveCustomEndpoint(cfg.tts.baseUrl, isCustom ? cfg.tts.endpoint : "", "audio/speech");
   const payload = JSON.stringify({
     model: cfg.tts.model,
     voice: cfg.tts.voice || "alloy",
     input: String(inputText || "").slice(0, 800),
     response_format: "mp3",
   });
-  const res = await fetchJson(cfg.tts.baseUrl + "/audio/speech", {
+  const res = await fetchJson(endpoint, {
     method: "POST",
     headers: {
       authorization: `Bearer ${cfg.tts.apiKey}`,
@@ -852,7 +960,7 @@ async function synthesize(cfg, inputText) {
   return synthesizeOpenAiSpeech(cfg, inputText);
 }
 function publicTtsConfig(cfg) {
-  return { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: Boolean(cfg.tts.apiKey) };
+  return { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, endpoint: cfg.tts.endpoint, hasKey: Boolean(cfg.tts.apiKey) };
 }
 function formatTtsError(err) {
   const msg = String(err?.message || err || "").trim();
@@ -891,7 +999,7 @@ const requestHandler = async (req, res) => {
     const pathname = url.pathname;
     if (req.method === "OPTIONS") { res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,OPTIONS", "access-control-allow-headers": "content-type,x-client-config,authorization" }); return res.end(); }
     if (pathname === "/api/health") return json(res, 200, { ok: true, service: "ai-voice-call-local", time: new Date().toISOString(), secure: Boolean(req.socket && req.socket.encrypted) });
-    if (pathname === "/api/defaults" && req.method === "GET") return json(res, 200, { ok: true, defaults: { llm: { baseUrl: "https://api.siliconflow.cn/v1", model: "Qwen/Qwen3.5-4B", apiType: "auto" }, stt: { baseUrl: "https://api.siliconflow.cn/v1", model: "FunAudioLLM/SenseVoiceSmall", apiType: "auto" }, tts: { baseUrl: "https://api.siliconflow.cn/v1", model: "FnLP/MOSS-TTSD-v0.5", voice: "alloy", apiType: "auto" }, systemPromptPreset: "general", systemPrompt: DEFAULT_SYSTEM_PROMPT, maxHistoryTurns: 12, maxTokens: 512, temperature: 0.7, ttsEnabled: true, browserTtsFallback: true, autoSpeak: true, webSearchEnabled: true, searchProvider: "auto" } });
+    if (pathname === "/api/defaults" && req.method === "GET") return json(res, 200, { ok: true, defaults: { llm: { baseUrl: "https://api.siliconflow.cn/v1", model: "Qwen/Qwen3.5-4B", apiType: "auto", endpoint: "" }, stt: { baseUrl: "https://api.siliconflow.cn/v1", model: "FunAudioLLM/SenseVoiceSmall", apiType: "auto", endpoint: "" }, tts: { baseUrl: "https://api.siliconflow.cn/v1", model: "FnLP/MOSS-TTSD-v0.5", voice: "alloy", apiType: "auto", endpoint: "" }, systemPromptPreset: "general", systemPrompt: DEFAULT_SYSTEM_PROMPT, maxHistoryTurns: 12, maxTokens: 512, temperature: 0.7, ttsEnabled: true, browserTtsFallback: true, autoSpeak: true, webSearchEnabled: true, searchProvider: "auto" } });
     if (pathname === "/api/chat/stream" && req.method === "POST") {
       const raw = await readBody(req);
       const body = JSON.parse(raw.toString("utf8") || "{}");
@@ -926,7 +1034,7 @@ const requestHandler = async (req, res) => {
       const raw = await readBody(req); const body = JSON.parse(raw.toString("utf8") || "{}"); const cfg = resolveConfig(body.config || {});
       if (!cfg.llm.apiKey) return json(res, 401, { ok: false, error: "未配置 API Key" });
       const reply = await chatCompletions(cfg, [{ role: "system", content: "你是测试助手，只回复：连接成功。" }, { role: "user", content: "ping" }]);
-      return json(res, 200, { ok: true, llmTest: { ok: true, reply }, llm: { model: cfg.llm.model, baseUrl: cfg.llm.baseUrl, apiType: cfg.llm.apiType, hasKey: true } });
+      return json(res, 200, { ok: true, llmTest: { ok: true, reply }, llm: { model: cfg.llm.model, baseUrl: cfg.llm.baseUrl, apiType: cfg.llm.apiType, endpoint: cfg.llm.endpoint, hasKey: true } });
     }
     if (pathname === "/api/search" && req.method === "POST") {
       const raw = await readBody(req); const body = JSON.parse(raw.toString("utf8") || "{}"); const q = String(body.query || body.q || "").trim();

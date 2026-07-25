@@ -69,6 +69,39 @@ function inferPromptPreset(prompt, preferred = "general") {
 
 const DEFAULT_PROVIDER_ID = "provider_default";
 
+const BUILTIN_MODELS = {
+  llm: ["Qwen/Qwen3.5-4B"],
+  stt: ["FunAudioLLM/SenseVoiceSmall"],
+  tts: ["FnLP/MOSS-TTSD-v0.5", "mimo-v2.5-tts"],
+};
+
+const MODEL_KIND_LABELS = {
+  llm: "大模型",
+  stt: "语音识别模型",
+  tts: "语音合成模型",
+};
+
+function normalizeModelId(value) {
+  return String(value || "").replace(/[\r\n\t]/g, "").trim().slice(0, 256);
+}
+
+function normalizeCustomModels(value) {
+  const raw = value && typeof value === "object" ? value : {};
+  const result = {};
+  for (const kind of Object.keys(BUILTIN_MODELS)) {
+    const seen = new Set();
+    result[kind] = [];
+    for (const item of Array.isArray(raw[kind]) ? raw[kind] : []) {
+      const modelId = normalizeModelId(item);
+      if (!modelId || seen.has(modelId) || BUILTIN_MODELS[kind].includes(modelId)) continue;
+      seen.add(modelId);
+      result[kind].push(modelId);
+      if (result[kind].length >= 50) break;
+    }
+  }
+  return result;
+}
+
 const TTS_VOICE_PRESETS = [
   "mimo_default",
   "冰糖",
@@ -147,12 +180,14 @@ function defaultApiProviders() {
 
 const DEFAULTS = {
   apiProviders: defaultApiProviders(),
+  customModels: normalizeCustomModels(),
   llm: {
     providerId: DEFAULT_PROVIDER_ID,
     baseUrl: "https://api.siliconflow.cn/v1",
     apiKey: "",
     model: "Qwen/Qwen3.5-4B",
     apiType: "auto",
+    endpoint: "",
   },
   stt: {
     providerId: "",
@@ -160,6 +195,7 @@ const DEFAULTS = {
     apiKey: "",
     model: "FunAudioLLM/SenseVoiceSmall",
     apiType: "auto",
+    endpoint: "",
   },
   tts: {
     providerId: "",
@@ -168,6 +204,7 @@ const DEFAULTS = {
     model: "FnLP/MOSS-TTSD-v0.5",
     voice: "alloy",
     apiType: "auto",
+    endpoint: "",
   },
   systemPromptPreset: "general",
   systemPrompt: SYSTEM_PROMPT_PRESETS.general.prompt,
@@ -189,7 +226,16 @@ const el = {
   status: document.getElementById("status"),
   btnSend: document.getElementById("btnSend"),
   btnHold: document.getElementById("btnHold"),
+  btnCall: document.getElementById("btnCall"),
   btnVoice: document.getElementById("btnVoice"),
+  callPanel: document.getElementById("callPanel"),
+  callOrb: document.getElementById("callOrb"),
+  callStatus: document.getElementById("callStatus"),
+  callTranscript: document.getElementById("callTranscript"),
+  callTimer: document.getElementById("callTimer"),
+  btnCallMute: document.getElementById("btnCallMute"),
+  callMuteLabel: document.getElementById("callMuteLabel"),
+  btnHangup: document.getElementById("btnHangup"),
   btnNewChat: document.getElementById("btnNewChat"),
   btnHistory: document.getElementById("btnHistory"),
   chatTitle: document.getElementById("chatTitle"),
@@ -227,15 +273,36 @@ const el = {
     btnCancelProvider: document.getElementById("btnCancelProvider"),
     llmProviderId: document.getElementById("llmProviderId"),
     llmModel: document.getElementById("llmModel"),
+    llmModelTrigger: document.getElementById("llmModelTrigger"),
+    llmModelSelected: document.getElementById("llmModelSelected"),
+    llmModelMenu: document.getElementById("llmModelMenu"),
+    llmModelList: document.getElementById("llmModelList"),
+    btnAddLlmModel: document.getElementById("btnAddLlmModel"),
     llmApiType: document.getElementById("llmApiType"),
+    llmCustomEndpointField: document.getElementById("llmCustomEndpointField"),
+    llmCustomEndpoint: document.getElementById("llmCustomEndpoint"),
     sttProviderId: document.getElementById("sttProviderId"),
     sttModel: document.getElementById("sttModel"),
+    sttModelTrigger: document.getElementById("sttModelTrigger"),
+    sttModelSelected: document.getElementById("sttModelSelected"),
+    sttModelMenu: document.getElementById("sttModelMenu"),
+    sttModelList: document.getElementById("sttModelList"),
+    btnAddSttModel: document.getElementById("btnAddSttModel"),
     sttApiType: document.getElementById("sttApiType"),
+    sttCustomEndpointField: document.getElementById("sttCustomEndpointField"),
+    sttCustomEndpoint: document.getElementById("sttCustomEndpoint"),
     ttsProviderId: document.getElementById("ttsProviderId"),
     ttsModel: document.getElementById("ttsModel"),
+    ttsModelTrigger: document.getElementById("ttsModelTrigger"),
+    ttsModelSelected: document.getElementById("ttsModelSelected"),
+    ttsModelMenu: document.getElementById("ttsModelMenu"),
+    ttsModelList: document.getElementById("ttsModelList"),
+    btnAddTtsModel: document.getElementById("btnAddTtsModel"),
     ttsVoicePreset: document.getElementById("ttsVoicePreset"),
     ttsVoice: document.getElementById("ttsVoice"),
     ttsApiType: document.getElementById("ttsApiType"),
+    ttsCustomEndpointField: document.getElementById("ttsCustomEndpointField"),
+    ttsCustomEndpoint: document.getElementById("ttsCustomEndpoint"),
     systemPromptPreset: document.getElementById("systemPromptPreset"),
     systemPrompt: document.getElementById("systemPrompt"),
     maxHistoryTurns: document.getElementById("maxHistoryTurns"),
@@ -260,6 +327,7 @@ let recordChunks = [];
 let recording = false;
 let serverDefaults = null;
 let providersDraft = defaultApiProviders();
+let customModelsDraft = normalizeCustomModels();
 let selectedProviderDraftId = DEFAULT_PROVIDER_ID;
 let providerEditorMode = ""; // "" | "add" | "edit"
 
@@ -269,6 +337,18 @@ let browserUsing = false;
 let holdActive = false;
 let holdGeneration = 0;
 let restartTimer = null;
+
+let callActive = false;
+let callMuted = false;
+let callGeneration = 0;
+let callStartedAt = 0;
+let callTimerId = null;
+let callListenTimer = null;
+let callCapture = null;
+let callSessionAbort = null;
+let activeSpeechAudio = null;
+let activeSpeechStop = null;
+let browserSpeechStop = null;
 
 function deepMerge(base, patch) {
   const out = { ...base, ...patch };
@@ -282,6 +362,7 @@ function deepMerge(base, patch) {
   } else {
     out.apiProviders = defaultApiProviders();
   }
+  out.customModels = normalizeCustomModels(patch?.customModels ?? base.customModels);
   return out;
 }
 
@@ -382,6 +463,7 @@ function syncResolvedCredentials(configLike) {
     apiKey: llmProvider.apiKey,
     model: String(out.llm?.model || DEFAULTS.llm.model).trim() || DEFAULTS.llm.model,
     apiType: normalizeApiType(out.llm?.apiType, DEFAULTS.llm.apiType),
+    endpoint: String(out.llm?.endpoint || "").trim(),
   };
 
   const sttSelected = String(out.stt?.providerId || "").trim();
@@ -394,6 +476,7 @@ function syncResolvedCredentials(configLike) {
       apiKey: sttProvider.apiKey,
       model: String(out.stt?.model || DEFAULTS.stt.model).trim() || DEFAULTS.stt.model,
       apiType: normalizeApiType(out.stt?.apiType, DEFAULTS.stt.apiType),
+      endpoint: String(out.stt?.endpoint || "").trim(),
     };
   } else {
     out.stt = {
@@ -403,6 +486,7 @@ function syncResolvedCredentials(configLike) {
       apiKey: "",
       model: String(out.stt?.model || DEFAULTS.stt.model).trim() || DEFAULTS.stt.model,
       apiType: normalizeApiType(out.stt?.apiType, DEFAULTS.stt.apiType),
+      endpoint: String(out.stt?.endpoint || "").trim(),
     };
   }
 
@@ -417,6 +501,7 @@ function syncResolvedCredentials(configLike) {
       model: String(out.tts?.model || DEFAULTS.tts.model).trim() || DEFAULTS.tts.model,
       voice: String(out.tts?.voice || DEFAULTS.tts.voice).trim() || DEFAULTS.tts.voice,
       apiType: normalizeApiType(out.tts?.apiType, DEFAULTS.tts.apiType),
+      endpoint: String(out.tts?.endpoint || "").trim(),
     };
   } else {
     out.tts = {
@@ -427,6 +512,7 @@ function syncResolvedCredentials(configLike) {
       model: String(out.tts?.model || DEFAULTS.tts.model).trim() || DEFAULTS.tts.model,
       voice: String(out.tts?.voice || DEFAULTS.tts.voice).trim() || DEFAULTS.tts.voice,
       apiType: normalizeApiType(out.tts?.apiType, DEFAULTS.tts.apiType),
+      endpoint: String(out.tts?.endpoint || "").trim(),
     };
   }
 
@@ -439,7 +525,7 @@ function clampNumber(value, fallback, min, max) {
 }
 
 function normalizeApiType(value, fallback = "auto") {
-  const allowed = new Set(["auto", "openai-chat", "openai-responses", "openai-transcriptions", "openai-speech", "xiaomi-mimo"]);
+  const allowed = new Set(["auto", "custom", "openai-chat", "openai-responses", "openai-transcriptions", "openai-speech", "xiaomi-mimo"]);
   const v = String(value || "").trim();
   return allowed.has(v) ? v : fallback;
 }
@@ -454,20 +540,27 @@ function normalizeConfig(next) {
       providerId: raw.llm?.providerId || legacyProviders.llmProviderId || DEFAULT_PROVIDER_ID,
       model: raw.llm?.model,
       apiType: normalizeApiType(raw.llm?.apiType, DEFAULTS.llm.apiType),
+      endpoint: String(raw.llm?.endpoint || "").trim(),
     },
     stt: {
       providerId: raw.stt?.providerId || legacyProviders.sttProviderId || "",
       model: raw.stt?.model,
       apiType: normalizeApiType(raw.stt?.apiType, DEFAULTS.stt.apiType),
+      endpoint: String(raw.stt?.endpoint || "").trim(),
     },
     tts: {
       providerId: raw.tts?.providerId || legacyProviders.ttsProviderId || "",
       model: raw.tts?.model,
       voice: raw.tts?.voice,
       apiType: normalizeApiType(raw.tts?.apiType, DEFAULTS.tts.apiType),
+      endpoint: String(raw.tts?.endpoint || "").trim(),
     },
   });
   out.systemPrompt = String(out.systemPrompt || "").trim() || SYSTEM_PROMPT_PRESETS.general.prompt;
+  out.llm.model = normalizeModelId(out.llm.model) || DEFAULTS.llm.model;
+  out.stt.model = normalizeModelId(out.stt.model) || DEFAULTS.stt.model;
+  out.tts.model = normalizeModelId(out.tts.model) || DEFAULTS.tts.model;
+  out.customModels = normalizeCustomModels(out.customModels);
   out.systemPromptPreset = inferPromptPreset(out.systemPrompt, out.systemPromptPreset || "general");
   out.maxHistoryTurns = clampNumber(out.maxHistoryTurns, 12, 2, 30);
   out.maxTokens = clampNumber(out.maxTokens, 512, 256, 1024);
@@ -569,6 +662,7 @@ function syncVoiceToggle() {
 
 async function setAutoSpeak(on) {
   config.autoSpeak = Boolean(on);
+  if (!config.autoSpeak) stopActiveSpeech();
   // 打开语音时确保服务端 TTS 开关也开着；关闭只停自动朗读，不影响其它设置
   if (config.autoSpeak && !config.ttsEnabled && !config.browserTtsFallback) {
     config.ttsEnabled = true;
@@ -776,6 +870,14 @@ function setStatus(text) {
   el.status.textContent = text || "";
 }
 
+function syncInteractionState() {
+  const composerLocked = busy || callActive;
+  if (el.btnSend) el.btnSend.disabled = composerLocked;
+  if (el.btnHold) el.btnHold.disabled = composerLocked;
+  if (el.input) el.input.disabled = callActive;
+  if (el.btnCall) el.btnCall.disabled = busy && !callActive;
+}
+
 function setSettingsStatus(text) {
   el.settingsStatus.textContent = text || "";
 }
@@ -826,7 +928,7 @@ function appendMessage(role, content, index = null) {
 
 function renderChat() {
   el.chat.innerHTML = "";
-  appendMessage("system", "你好，我是小豆，你的 AI 语音通话助手。可以打字，也可以按住麦克风说话。");
+  appendMessage("system", "你好，我是小豆。点右上角电话可以连续语音通话，也可以打字或按住麦克风说话。");
   messages.forEach((m, index) => {
     if (m.role === "user" || m.role === "assistant") appendMessage(m.role, m.content, index);
   });
@@ -892,9 +994,79 @@ async function retryMessageAt(index) {
 }
 
 
-async function requestChatJson(requestMessages) {
+function escapeReplyRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function mergeAssistantStreamText(current, incoming) {
+  const reply = String(current || "");
+  const text = String(incoming || "").replace(/<think>[\s\S]*?<\/think>/gi, "");
+  if (!text) return { reply, delta: "" };
+  if (reply && text.length > reply.length && text.startsWith(reply)) {
+    return { reply: text, delta: text.slice(reply.length) };
+  }
+  if (text.length >= 12 && (text === reply || reply.endsWith(text))) return { reply, delta: "" };
+  if (reply && text.length >= 12) {
+    const maxOverlap = Math.min(reply.length, text.length);
+    for (let overlap = maxOverlap; overlap >= 12; overlap -= 1) {
+      if (reply.slice(-overlap) === text.slice(0, overlap)) {
+        const delta = text.slice(overlap);
+        return { reply: reply + delta, delta };
+      }
+    }
+  }
+  return { reply: reply + text, delta: text };
+}
+
+function cleanClientAssistantReply(text, requestMessages = []) {
+  const original = String(text || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<\|(?:im_start|im_end|endoftext|system|user|assistant)\|>/gi, "")
+    .trim();
+  if (!original) return "";
+  let cleaned = original;
+  const prompts = [config.systemPrompt]
+    .map((prompt) => String(prompt || "").trim())
+    .filter((prompt) => prompt.length >= 12);
+  for (const prompt of prompts) cleaned = cleaned.split(prompt).join("\n");
+
+  const lastUser = [...requestMessages].reverse().find((message) => message?.role === "user");
+  const userText = String(lastUser?.content || "").trim();
+  if (userText) {
+    for (const marker of [
+      `用户说：“${userText}”`,
+      `用户说："${userText}"`,
+      `用户说：${userText}`,
+      `用户：${userText}`,
+      `user: ${userText}`,
+    ]) cleaned = cleaned.split(marker).join("\n");
+    const escapedUser = escapeReplyRegExp(userText);
+    const userEchoPattern = new RegExp(`(^|\\n)\\s*(?:用户(?:说)?|user)\\s*[:：]\\s*[“”"'‘’]*\\s*${escapedUser}\\s*[“”"'‘’]*\\s*`, "gi");
+    for (let pass = 0; pass < 3; pass += 1) cleaned = cleaned.replace(userEchoPattern, "$1");
+  }
+  cleaned = cleaned
+    .replace(/(^|\n)\s*(?:系统(?:提示|消息)?|system)\s*[:：]\s*(?=\n|$)/gi, "$1")
+    .replace(/(^|\n)\s*(?:用户(?:说)?|user)\s*[:：]\s*[“”"'‘’]*\s*(?=\n|$)/gi, "$1")
+    .replace(/^\s*(?:助手|assistant|小豆)\s*[:：]\s*/i, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const paragraphs = cleaned.split(/\n{2,}/).map((item) => item.trim()).filter(Boolean);
+  cleaned = paragraphs.filter((item, index) => index === 0 || item !== paragraphs[index - 1]).join("\n\n").trim();
+  const anchor = cleaned.slice(0, 48).trim();
+  if (anchor.length >= 24) {
+    const repeatAt = cleaned.indexOf(anchor, Math.max(80, anchor.length + 1));
+    if (repeatAt >= 0) cleaned = cleaned.slice(0, repeatAt).trim();
+  }
+  return cleaned || original;
+}
+
+async function requestChatJson(requestMessages, signal = null) {
   const controller = new AbortController();
   const chatTimer = setTimeout(() => controller.abort(), 60000);
+  const abortFromSession = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", abortFromSession, { once: true });
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -904,11 +1076,12 @@ async function requestChatJson(requestMessages) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
-    const reply = String(data.reply || "").trim();
+    const reply = cleanClientAssistantReply(data.reply, requestMessages);
     if (!reply) throw new Error("模型没有返回文字，请换模型或稍后再试");
     return { reply, webSearch: data.webSearch || null };
   } finally {
     clearTimeout(chatTimer);
+    signal?.removeEventListener("abort", abortFromSession);
   }
 }
 
@@ -934,12 +1107,15 @@ function setAssistantText(row, text) {
   el.chat.scrollTop = el.chat.scrollHeight;
 }
 
-async function requestChatStreamWithFallback(requestMessages, row) {
+async function requestChatStreamWithFallback(requestMessages, row, signal = null) {
   let reply = "";
   let webSearch = null;
   let sawDelta = false;
   const controller = new AbortController();
   const chatTimer = setTimeout(() => controller.abort(), 120000);
+  const abortFromSession = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", abortFromSession, { once: true });
   try {
     const res = await fetch("/api/chat/stream", {
       method: "POST",
@@ -962,15 +1138,18 @@ async function requestChatStreamWithFallback(requestMessages, row) {
       if (eventName === "delta") {
         const text = String(data.text || "");
         if (text) {
-          sawDelta = true;
-          reply += text;
-          setAssistantText(row, reply);
+          const merged = mergeAssistantStreamText(reply, text);
+          reply = merged.reply;
+          if (merged.delta) {
+            sawDelta = true;
+            setAssistantText(row, reply);
+          }
         }
         return;
       }
       if (eventName === "done") {
         if (data.reply) {
-          reply = String(data.reply || "").trim();
+          reply = cleanClientAssistantReply(data.reply, requestMessages);
           setAssistantText(row, reply);
         }
         webSearch = data.webSearch || null;
@@ -996,20 +1175,22 @@ async function requestChatStreamWithFallback(requestMessages, row) {
     const tail = decoder.decode();
     if (tail) buffer += tail;
     if (buffer.trim()) handleBlock(buffer);
-    reply = reply.trim();
+    reply = cleanClientAssistantReply(reply, requestMessages);
     if (!reply) throw Object.assign(new Error("模型没有返回文字，请换模型或稍后再试"), { beforeDelta: !sawDelta });
     return { reply, webSearch, streamed: true };
   } catch (err) {
+    if (signal?.aborted) throw err;
     if (sawDelta || err.partial) {
-      err.partial = String(err.partial || reply || "").trim();
+      err.partial = cleanClientAssistantReply(err.partial || reply || "", requestMessages);
       throw err;
     }
     console.warn("stream chat failed before output; fallback to /api/chat", err);
-    const data = await requestChatJson(requestMessages);
+    const data = await requestChatJson(requestMessages, signal);
     setAssistantText(row, data.reply);
     return { ...data, streamed: false };
   } finally {
     clearTimeout(chatTimer);
+    signal?.removeEventListener("abort", abortFromSession);
   }
 }
 
@@ -1033,8 +1214,7 @@ async function regenerateAssistant() {
   }
 
   busy = true;
-  el.btnSend.disabled = true;
-  el.btnHold.disabled = true;
+  syncInteractionState();
   setStatus("正在重新生成…");
 
   const requestMessages = messages.slice();
@@ -1065,8 +1245,7 @@ async function regenerateAssistant() {
     }
   } finally {
     busy = false;
-    el.btnSend.disabled = false;
-    el.btnHold.disabled = false;
+    syncInteractionState();
   }
 }
 
@@ -1082,6 +1261,7 @@ function resolveRuntimeService(service, role) {
     apiKey: provider.apiKey || llmProvider.apiKey || "",
     model: String(service?.model || "").trim(),
     apiType: normalizeApiType(service?.apiType),
+    endpoint: String(service?.endpoint || "").trim(),
   };
   if (role === "tts") payload.voice = String(service?.voice || "alloy").trim() || "alloy";
   return payload;
@@ -1198,6 +1378,134 @@ function selectedProviderDraft() {
   const list = ensureProviderList(providersDraft);
   providersDraft = list;
   return syncProviderPicker(list);
+}
+
+function modelField(kind) {
+  return el.fields?.[`${kind}Model`] || null;
+}
+
+function modelTrigger(kind) {
+  return el.fields?.[`${kind}ModelTrigger`] || null;
+}
+
+function modelSelected(kind) {
+  return el.fields?.[`${kind}ModelSelected`] || null;
+}
+
+function modelMenu(kind) {
+  return el.fields?.[`${kind}ModelMenu`] || null;
+}
+
+function modelList(kind) {
+  return el.fields?.[`${kind}ModelList`] || null;
+}
+
+function renderModelManager(kind) {
+  const input = modelField(kind);
+  const selected = modelSelected(kind);
+  const list = modelList(kind);
+  if (!input || !selected || !list || !BUILTIN_MODELS[kind]) return;
+  const custom = customModelsDraft[kind] || [];
+  const current = normalizeModelId(input.value);
+  const choices = [...new Set([current, ...BUILTIN_MODELS[kind], ...custom].filter(Boolean))];
+  selected.textContent = current || "请选择模型";
+  selected.title = current;
+  list.innerHTML = choices.map((modelId) => {
+    const removable = custom.includes(modelId);
+    const active = modelId === current;
+    return `
+    <div class="model-option-row${active ? " active" : ""}" title="${escapeHtml(modelId)}">
+      <button class="model-option-select" type="button" role="option" aria-selected="${active ? "true" : "false"}" data-model-kind="${kind}" data-model-value="${escapeHtml(modelId)}">${escapeHtml(modelId)}</button>
+      ${removable ? `<button class="model-option-remove" type="button" data-remove-model-kind="${kind}" data-model-value="${escapeHtml(modelId)}" aria-label="删除 ${escapeHtml(modelId)}">×</button>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function closeAllModelMenus(exceptKind = "") {
+  for (const kind of Object.keys(BUILTIN_MODELS)) {
+    if (kind === exceptKind) continue;
+    modelMenu(kind)?.classList.add("hidden");
+    modelTrigger(kind)?.setAttribute("aria-expanded", "false");
+  }
+}
+
+function setModelMenuOpen(kind, open) {
+  const menu = modelMenu(kind);
+  const trigger = modelTrigger(kind);
+  if (!menu || !trigger) return;
+  if (open) {
+    closeAllModelMenus(kind);
+    renderModelManager(kind);
+    menu.classList.remove("hidden");
+    trigger.setAttribute("aria-expanded", "true");
+    requestAnimationFrame(() => {
+      const input = modelField(kind);
+      input?.focus();
+      input?.select();
+    });
+    return;
+  }
+  menu.classList.add("hidden");
+  trigger.setAttribute("aria-expanded", "false");
+}
+
+function toggleModelMenu(kind) {
+  const menu = modelMenu(kind);
+  if (!menu) return;
+  setModelMenuOpen(kind, menu.classList.contains("hidden"));
+}
+
+function renderAllModelManagers() {
+  for (const kind of Object.keys(BUILTIN_MODELS)) renderModelManager(kind);
+}
+
+function addCustomModel(kind) {
+  const input = modelField(kind);
+  if (!input || !BUILTIN_MODELS[kind]) return;
+  const rawValue = String(input.value || "").trim();
+  const modelId = normalizeModelId(rawValue);
+  if (!modelId) {
+    setSettingsStatus(`请先填写${MODEL_KIND_LABELS[kind]} ID`);
+    input.focus();
+    return;
+  }
+  if (rawValue.length > 256) {
+    setSettingsStatus("模型 ID 不能超过 256 个字符");
+    input.focus();
+    return;
+  }
+  if (BUILTIN_MODELS[kind].includes(modelId)) {
+    input.value = modelId;
+    renderModelManager(kind);
+    setSettingsStatus(`${modelId} 已是内置常用模型，可直接选择`);
+    return;
+  }
+  const custom = customModelsDraft[kind] || [];
+  if (custom.includes(modelId)) {
+    input.value = modelId;
+    renderModelManager(kind);
+    setSettingsStatus(`${modelId} 已经在常用模型列表中`);
+    return;
+  }
+  if (custom.length >= 50) {
+    setSettingsStatus("每类最多添加 50 个自定义模型，请先删除不再使用的项");
+    return;
+  }
+  customModelsDraft[kind] = [...custom, modelId];
+  input.value = modelId;
+  renderModelManager(kind);
+  setSettingsStatus(`已添加 ${modelId}，点击底部“保存到本地”后永久保存`);
+}
+
+function removeCustomModel(kind, modelId) {
+  if (!BUILTIN_MODELS[kind]) return;
+  customModelsDraft[kind] = (customModelsDraft[kind] || []).filter((item) => item !== modelId);
+  const input = modelField(kind);
+  if (input && normalizeModelId(input.value) === modelId) {
+    input.value = BUILTIN_MODELS[kind][0] || "";
+  }
+  renderModelManager(kind);
+  setSettingsStatus(`已从常用列表删除 ${modelId}`);
 }
 
 function renderProviderList() {
@@ -1324,9 +1632,19 @@ function deleteProvider(providerId) {
   setSettingsStatus("供应商已删除，记得点底部「保存到本地」");
 }
 
+function syncCustomEndpointFields() {
+  for (const kind of ["llm", "stt", "tts"]) {
+    const apiType = el.fields?.[`${kind}ApiType`];
+    const field = el.fields?.[`${kind}CustomEndpointField`];
+    if (!field) continue;
+    field.classList.toggle("hidden", apiType?.value !== "custom");
+  }
+}
+
 function fillSettingsForm() {
   const f = el.fields;
   providersDraft = ensureProviderList(config.apiProviders);
+  customModelsDraft = normalizeCustomModels(config.customModels);
   selectedProviderDraftId = findProviderById(providersDraft, selectedProviderDraftId)?.id
     || findProviderById(providersDraft, config.llm.providerId)?.id
     || providersDraft[0]?.id
@@ -1339,11 +1657,16 @@ function fillSettingsForm() {
   });
   f.llmModel.value = config.llm.model || "";
   if (f.llmApiType) f.llmApiType.value = normalizeApiType(config.llm.apiType, DEFAULTS.llm.apiType);
+  if (f.llmCustomEndpoint) f.llmCustomEndpoint.value = config.llm.endpoint || "";
   f.sttModel.value = config.stt.model || "";
   if (f.sttApiType) f.sttApiType.value = normalizeApiType(config.stt.apiType, DEFAULTS.stt.apiType);
+  if (f.sttCustomEndpoint) f.sttCustomEndpoint.value = config.stt.endpoint || "";
   f.ttsModel.value = config.tts.model || "";
+  renderAllModelManagers();
   setTtsVoiceFormValue(config.tts.voice || "");
   if (f.ttsApiType) f.ttsApiType.value = normalizeApiType(config.tts.apiType, DEFAULTS.tts.apiType);
+  if (f.ttsCustomEndpoint) f.ttsCustomEndpoint.value = config.tts.endpoint || "";
+  syncCustomEndpointFields();
   const promptPreset = inferPromptPreset(config.systemPrompt, config.systemPromptPreset || "general");
   if (f.systemPromptPreset) f.systemPromptPreset.value = promptPreset;
   f.systemPrompt.value = config.systemPrompt || SYSTEM_PROMPT_PRESETS.general.prompt;
@@ -1366,21 +1689,25 @@ function readSettingsForm() {
   const llmProviderId = String(f.llmProviderId?.value || apiProviders[0]?.id || DEFAULT_PROVIDER_ID);
   return deepMerge(DEFAULTS, {
     apiProviders,
+    customModels: normalizeCustomModels(customModelsDraft),
     llm: {
       providerId: llmProviderId,
       model: f.llmModel.value.trim(),
       apiType: normalizeApiType(f.llmApiType?.value, DEFAULTS.llm.apiType),
+      endpoint: String(f.llmCustomEndpoint?.value || "").trim(),
     },
     stt: {
       providerId: String(f.sttProviderId?.value || ""),
       model: f.sttModel.value.trim(),
       apiType: normalizeApiType(f.sttApiType?.value, DEFAULTS.stt.apiType),
+      endpoint: String(f.sttCustomEndpoint?.value || "").trim(),
     },
     tts: {
       providerId: String(f.ttsProviderId?.value || ""),
       model: f.ttsModel.value.trim(),
       voice: readTtsVoiceFormValue(),
       apiType: normalizeApiType(f.ttsApiType?.value, DEFAULTS.tts.apiType),
+      endpoint: String(f.ttsCustomEndpoint?.value || "").trim(),
     },
     systemPromptPreset: inferPromptPreset(f.systemPrompt.value, f.systemPromptPreset?.value || "general"),
     systemPrompt: f.systemPrompt.value.trim() || SYSTEM_PROMPT_PRESETS.general.prompt,
@@ -1419,6 +1746,7 @@ function openSettings() {
 }
 
 function closeSettings() {
+  closeAllModelMenus();
   el.settingsModal.classList.add("hidden");
 }
 
@@ -1492,12 +1820,14 @@ async function testConnection() {
           apiKey: draft.llm.apiKey,
           model: draft.llm.model,
           apiType: draft.llm.apiType,
+          endpoint: draft.llm.endpoint,
         },
         stt: {
           baseUrl: draft.stt.baseUrl || draft.llm.baseUrl,
           apiKey: draft.stt.apiKey || draft.llm.apiKey,
           model: draft.stt.model,
           apiType: draft.stt.apiType,
+          endpoint: draft.stt.endpoint,
         },
         tts: {
           baseUrl: draft.tts.baseUrl || draft.llm.baseUrl,
@@ -1505,6 +1835,7 @@ async function testConnection() {
           model: draft.tts.model,
           voice: draft.tts.voice,
           apiType: draft.tts.apiType,
+          endpoint: draft.tts.endpoint,
         },
         systemPrompt: draft.systemPrompt,
         maxTokens: draft.maxTokens,
@@ -1697,29 +2028,94 @@ async function finishBrowserSpeechAndSend() {
   await sendText(text);
 }
 
-function browserSpeak(text) {
+function stopActiveSpeech() {
+  if (activeSpeechStop) activeSpeechStop();
+  activeSpeechStop = null;
+  activeSpeechAudio = null;
+  if (browserSpeechStop) browserSpeechStop();
+  browserSpeechStop = null;
+  try { window.speechSynthesis?.cancel(); } catch {}
+}
+
+function browserSpeak(text, { signal = null } = {}) {
   return new Promise((resolve) => {
-    if (!("speechSynthesis" in window)) {
+    if (!("speechSynthesis" in window) || signal?.aborted) {
       resolve(false);
       return;
     }
+    let settled = false;
     const utter = new SpeechSynthesisUtterance(text);
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      if (browserSpeechStop === stop) browserSpeechStop = null;
+      resolve(ok);
+    };
+    const stop = () => {
+      try { window.speechSynthesis.cancel(); } catch {}
+      finish(false);
+    };
+    const onAbort = () => stop();
     utter.lang = "zh-CN";
     utter.rate = 0.95;
-    utter.onend = () => resolve(true);
-    utter.onerror = () => resolve(false);
+    utter.onend = () => finish(true);
+    utter.onerror = () => finish(false);
+    browserSpeechStop = stop;
+    signal?.addEventListener("abort", onAbort, { once: true });
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(utter);
   });
 }
 
-async function speakText(text) {
-  if (!config.autoSpeak) return { mode: "off" };
+function playAudioBlobToEnd(blob, { signal = null } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("语音播放已停止", "AbortError"));
+      return;
+    }
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    let settled = false;
+    const cleanup = () => {
+      signal?.removeEventListener("abort", onAbort);
+      audio.removeEventListener("ended", onEnded);
+      audio.removeEventListener("error", onError);
+      URL.revokeObjectURL(url);
+      if (activeSpeechAudio === audio) activeSpeechAudio = null;
+      if (activeSpeechStop === stop) activeSpeechStop = null;
+    };
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      try { audio.pause(); } catch {}
+      cleanup();
+      if (error) reject(error);
+      else resolve(true);
+    };
+    const onEnded = () => finish();
+    const onError = () => finish(new Error("音频播放失败"));
+    const onAbort = () => finish(new DOMException("语音播放已停止", "AbortError"));
+    const stop = () => onAbort();
+    activeSpeechAudio = audio;
+    activeSpeechStop = stop;
+    audio.addEventListener("ended", onEnded);
+    audio.addEventListener("error", onError);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    audio.play().catch(onError);
+  });
+}
+
+async function speakText(text, { force = false, signal = null } = {}) {
+  if (!force && !config.autoSpeak) return { mode: "off" };
+  if (signal?.aborted) return { mode: "stopped" };
   let onlineError = "";
   if (config.ttsEnabled) {
     try {
       const controller = new AbortController();
       const ttsTimer = setTimeout(() => controller.abort(), 20000);
+      const abortFromSession = () => controller.abort();
+      signal?.addEventListener("abort", abortFromSession, { once: true });
       let res;
       try {
         res = await fetch("/api/tts", {
@@ -1730,26 +2126,25 @@ async function speakText(text) {
         });
       } finally {
         clearTimeout(ttsTimer);
+        signal?.removeEventListener("abort", abortFromSession);
       }
       if (res.ok) {
         const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        audio.addEventListener("ended", () => URL.revokeObjectURL(url), { once: true });
-        audio.addEventListener("error", () => URL.revokeObjectURL(url), { once: true });
-        await audio.play();
+        await playAudioBlobToEnd(blob, { signal });
         return { mode: "online" };
       }
       const data = await res.json().catch(() => ({}));
       onlineError = data.error || `HTTP ${res.status}`;
       console.warn("在线 TTS 失败", { status: res.status, ...data });
     } catch (err) {
+      if (signal?.aborted) return { mode: "stopped" };
       onlineError = err && err.name === "AbortError" ? "TTS 请求超时" : explainFetchError(err);
       console.warn("在线 TTS 失败", err);
     }
   }
-  if (config.browserTtsFallback) {
-    const ok = await browserSpeak(text);
+  if (config.browserTtsFallback || force) {
+    const ok = await browserSpeak(text, { signal });
+    if (signal?.aborted) return { mode: "stopped" };
     if (onlineError) return { mode: ok ? "browser" : "browser-failed", error: onlineError };
     return { mode: ok ? "browser" : "browser-failed" };
   }
@@ -1765,18 +2160,21 @@ function readyStatusAfterSpeak(result) {
   return "";
 }
 
-async function sendText(text) {
+async function sendText(text, options = {}) {
   const content = (text || "").trim();
-  if (!content || busy) return;
+  if (!content || busy) return false;
+  const callMode = options.callMode === true;
+  const sessionGeneration = Number(options.callGeneration || 0);
+  const sessionSignal = callMode ? callSessionAbort?.signal : null;
+  const callStillActive = () => !callMode || (callActive && callGeneration === sessionGeneration);
   if (!config.llm.apiKey) {
     openSettings();
     setSettingsStatus("请先填写本地 API Key");
-    return;
+    return false;
   }
 
   busy = true;
-  el.btnSend.disabled = true;
-  el.btnHold.disabled = true;
+  syncInteractionState();
   await ensureConversationReady();
   messages.push({ role: "user", content });
   appendMessage("user", content, messages.length - 1);
@@ -1788,25 +2186,51 @@ async function sendText(text) {
   const assistantIndex = messages.length;
   messages.push({ role: "assistant", content: "" });
   const row = appendMessage("assistant", "…", assistantIndex);
+  let succeeded = false;
 
   try {
-    const data = await requestChatStreamWithFallback(requestMessages, row);
+    if (callMode && callStillActive()) setCallStatus("AI 正在思考…", "thinking");
+    const data = await requestChatStreamWithFallback(
+      requestMessages,
+      row,
+      sessionSignal,
+    );
     messages[assistantIndex].content = data.reply;
     await saveHistory();
-    if (data.webSearch && data.webSearch.used) {
-      const ws = data.webSearch;
-      const flag = ws.ok ? `已联网(${ws.provider}, ${ws.count}条)` : `联网无结果(${ws.provider})`;
-      setStatus(flag + "，可以继续聊");
-    } else {
-      setStatus("可以继续聊");
+    if (callMode && callStillActive()) setCallTranscript(`AI：${data.reply}`);
+    if (!callMode || callStillActive()) {
+      if (data.webSearch && data.webSearch.used) {
+        const ws = data.webSearch;
+        const flag = ws.ok ? `已联网(${ws.provider}, ${ws.count}条)` : `联网无结果(${ws.provider})`;
+        setStatus(flag + "，可以继续聊");
+      } else {
+        setStatus("可以继续聊");
+      }
     }
     let speakResult = { mode: "off" };
-    if (config.autoSpeak) {
+    if ((config.autoSpeak || callMode) && callStillActive()) {
       setStatus("正在朗读…");
-      speakResult = await speakText(data.reply);
+      if (callMode) setCallStatus("AI 正在说话…", "speaking");
+      speakResult = await speakText(data.reply, {
+        force: callMode,
+        signal: sessionSignal,
+      });
     }
-    setStatus(readyStatusAfterSpeak(speakResult));
+    if (callMode && callStillActive()) {
+      const speakStatus = readyStatusAfterSpeak(speakResult);
+      if (speakStatus) setCallTranscript(speakStatus);
+      setCallStatus(callMuted ? "麦克风已静音" : "准备继续聆听…", callMuted ? "muted" : "connecting");
+      setStatus("语音通话中");
+    } else if (!callMode) {
+      setStatus(readyStatusAfterSpeak(speakResult));
+    }
+    succeeded = true;
   } catch (err) {
+    if (callMode && !callStillActive()) {
+      removeAssistantPlaceholder(row, assistantIndex);
+      await saveHistory();
+      return false;
+    }
     const partial = String(err.partial || "").trim();
     if (partial) {
       messages[assistantIndex].content = partial;
@@ -1817,11 +2241,16 @@ async function sendText(text) {
       removeAssistantPlaceholder(row, assistantIndex);
       setStatus(`发送失败：${explainFetchError(err)}`);
     }
+    if (callMode && callStillActive()) {
+      setCallStatus("回复失败，准备重试聆听", "error");
+      setCallTranscript(explainFetchError(err));
+    }
   } finally {
     busy = false;
-    el.btnSend.disabled = false;
-    el.btnHold.disabled = false;
+    syncInteractionState();
+    if (callMode && callStillActive() && !callMuted) scheduleCallListening(sessionGeneration, 450);
   }
+  return succeeded;
 }
 
 let pcmChunks = [];
@@ -1980,6 +2409,297 @@ function encodeWav(samples, sampleRate) {
   return buffer;
 }
 
+function setCallStatus(text, phase = "connecting") {
+  if (el.callStatus) el.callStatus.textContent = text || "";
+  if (el.callPanel) el.callPanel.dataset.phase = phase;
+}
+
+function setCallTranscript(text) {
+  if (el.callTranscript) el.callTranscript.textContent = text || "";
+}
+
+function setCallLevel(level) {
+  if (!el.callPanel) return;
+  const normalized = Math.max(0, Math.min(1, Number(level) || 0));
+  el.callPanel.style.setProperty("--call-level", normalized.toFixed(3));
+}
+
+function formatCallDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+function updateCallTimer() {
+  if (!el.callTimer) return;
+  el.callTimer.textContent = formatCallDuration((Date.now() - callStartedAt) / 1000);
+}
+
+function clearCallListenTimer() {
+  if (callListenTimer) clearTimeout(callListenTimer);
+  callListenTimer = null;
+}
+
+function closeCallCapture({ discard = false } = {}) {
+  const capture = callCapture;
+  callCapture = null;
+  if (!capture) return null;
+  capture.closed = true;
+  try { capture.processor.disconnect(); } catch {}
+  try { capture.source.disconnect(); } catch {}
+  try { capture.stream.getTracks().forEach((track) => track.stop()); } catch {}
+  try { capture.context.close(); } catch {}
+  setCallLevel(0);
+  if (discard || !capture.speechDetected || !capture.chunks.length) return null;
+  return new Blob([floatTo16kWav(flattenPcm(capture.chunks), capture.sampleRate)], { type: "audio/wav" });
+}
+
+async function transcribeCallAudio(blob, generation) {
+  if (!callActive || callGeneration !== generation) return;
+  if (!blob || blob.size < 3000) {
+    scheduleCallListening(generation, 250);
+    return;
+  }
+  busy = true;
+  syncInteractionState();
+  setCallStatus("正在识别…", "thinking");
+  setCallTranscript("正在整理你刚才说的话");
+  let handedToChat = false;
+  try {
+    const form = new FormData();
+    form.append("file", blob, "call-speech.wav");
+    const cfg = apiConfigPayload();
+    if (!cfg.stt.model || cfg.stt.model.includes("TeleSpeech")) {
+      cfg.stt.model = "FunAudioLLM/SenseVoiceSmall";
+    }
+    const controller = new AbortController();
+    const sessionSignal = callSessionAbort?.signal;
+    const abortFromSession = () => controller.abort();
+    if (sessionSignal?.aborted) controller.abort();
+    else sessionSignal?.addEventListener("abort", abortFromSession, { once: true });
+    const timer = setTimeout(() => controller.abort(), 90000);
+    let res;
+    try {
+      res = await fetch("/api/asr", {
+        method: "POST",
+        body: form,
+        headers: {
+          "x-client-config": btoa(unescape(encodeURIComponent(JSON.stringify(cfg)))),
+        },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+      sessionSignal?.removeEventListener("abort", abortFromSession);
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    const text = String(data.text || "").trim();
+    if (!callActive || callGeneration !== generation) return;
+    if (!text) {
+      setCallStatus("没听清，请再说一次", "connecting");
+      setCallTranscript("请靠近麦克风，声音稍微大一点");
+      return;
+    }
+    setCallTranscript(`你：${text}`);
+    busy = false;
+    syncInteractionState();
+    handedToChat = true;
+    await sendText(text, { callMode: true, callGeneration: generation });
+  } catch (err) {
+    if (!callActive || callGeneration !== generation) return;
+    const message = err?.name === "AbortError" ? "识别已停止" : explainFetchError(err);
+    setCallStatus("识别失败，准备重试", "error");
+    setCallTranscript(message);
+  } finally {
+    if (busy) {
+      busy = false;
+      syncInteractionState();
+    }
+    if (!handedToChat && callActive && callGeneration === generation && !callMuted && !callCapture && !busy) {
+      scheduleCallListening(generation, 650);
+    }
+  }
+}
+
+async function startCallListening(generation) {
+  if (!callActive || callGeneration !== generation || callMuted || busy || callCapture) return;
+  if (!ensureMediaDevices()) throw new Error(micUnsupportedHint());
+  setCallStatus("请说话，我在听", "hearing");
+  setCallTranscript("停顿约 1 秒后会自动发送");
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+  });
+  if (!callActive || callGeneration !== generation || callMuted) {
+    stream.getTracks().forEach((track) => track.stop());
+    return;
+  }
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const context = new AudioCtx();
+  if (context.state === "suspended") await context.resume();
+  const source = context.createMediaStreamSource(stream);
+  const processor = context.createScriptProcessor(4096, 1, 1);
+  const capture = {
+    stream,
+    context,
+    source,
+    processor,
+    sampleRate: context.sampleRate,
+    chunks: [],
+    preRoll: [],
+    speechDetected: false,
+    speechFrames: 0,
+    noiseFloor: .004,
+    startedAt: Date.now(),
+    speechStartedAt: 0,
+    lastVoiceAt: 0,
+    closed: false,
+  };
+  callCapture = capture;
+  processor.onaudioprocess = (event) => {
+    if (capture.closed || callCapture !== capture) return;
+    const input = event.inputBuffer.getChannelData(0);
+    const chunk = new Float32Array(input);
+    let energy = 0;
+    for (let index = 0; index < input.length; index += 1) energy += input[index] * input[index];
+    const rms = Math.sqrt(energy / input.length);
+    setCallLevel(Math.min(1, rms * 12));
+    const now = Date.now();
+
+    if (!capture.speechDetected) {
+      capture.preRoll.push(chunk);
+      if (capture.preRoll.length > 8) capture.preRoll.shift();
+      if (rms < .03) capture.noiseFloor = capture.noiseFloor * .92 + rms * .08;
+      const startThreshold = Math.max(.016, capture.noiseFloor * 2.8);
+      capture.speechFrames = rms >= startThreshold ? capture.speechFrames + 1 : 0;
+      if (capture.speechFrames >= 2) {
+        capture.speechDetected = true;
+        capture.speechStartedAt = now;
+        capture.lastVoiceAt = now;
+        capture.chunks.push(...capture.preRoll);
+        capture.preRoll = [];
+        setCallStatus("听到你说话了…", "hearing");
+        setCallTranscript("说完后自然停顿即可");
+      }
+      return;
+    }
+
+    capture.chunks.push(chunk);
+    const sustainThreshold = Math.max(.01, capture.noiseFloor * 1.8);
+    if (rms >= sustainThreshold) capture.lastVoiceAt = now;
+    const speechMs = now - (capture.lastVoiceAt || capture.startedAt);
+    const totalMs = now - (capture.speechStartedAt || now);
+    if ((speechMs >= 1050 && totalMs >= 1200) || totalMs >= 20000) {
+      const blob = closeCallCapture();
+      transcribeCallAudio(blob, generation);
+    }
+  };
+  source.connect(processor);
+  processor.connect(context.destination);
+}
+
+function scheduleCallListening(generation = callGeneration, delay = 0) {
+  clearCallListenTimer();
+  if (!callActive || callGeneration !== generation || callMuted) return;
+  callListenTimer = setTimeout(async () => {
+    callListenTimer = null;
+    if (!callActive || callGeneration !== generation || callMuted || busy || callCapture) return;
+    try {
+      await startCallListening(generation);
+    } catch (err) {
+      if (!callActive || callGeneration !== generation) return;
+      const message = micPermissionHint(err);
+      endVoiceCall("通话未接通");
+      setStatus(`无法开始通话：${message}`);
+    }
+  }, delay);
+}
+
+async function startVoiceCall() {
+  if (callActive || busy || isHoldingTalk()) return;
+  if (!config.llm.apiKey || !hasSttKey()) {
+    openSettings();
+    setSettingsStatus("语音通话需要大模型和语音识别 API Key");
+    return;
+  }
+  if (isInsecureContext() || !ensureMediaDevices()) {
+    setStatus(micUnsupportedHint());
+    return;
+  }
+  await ensureConversationReady();
+  callActive = true;
+  callMuted = false;
+  callGeneration += 1;
+  callStartedAt = Date.now();
+  callSessionAbort = new AbortController();
+  document.body.classList.add("in-call");
+  el.callPanel?.classList.remove("hidden");
+  el.btnCall?.classList.add("active");
+  el.btnCall?.setAttribute("aria-pressed", "true");
+  if (el.btnCall) {
+    el.btnCall.title = "挂断语音通话";
+    el.btnCall.setAttribute("aria-label", "挂断语音通话");
+  }
+  el.btnCallMute?.classList.remove("muted");
+  el.btnCallMute?.setAttribute("aria-pressed", "false");
+  if (el.callMuteLabel) el.callMuteLabel.textContent = "静音";
+  if (el.callTimer) el.callTimer.textContent = "00:00";
+  callTimerId = setInterval(updateCallTimer, 1000);
+  syncInteractionState();
+  setStatus("语音通话中");
+  setCallStatus("正在接通…", "connecting");
+  setCallTranscript("接通后直接说话，停顿时会自动发送。");
+  scheduleCallListening(callGeneration, 250);
+}
+
+function endVoiceCall(reason = "通话已结束") {
+  if (!callActive && el.callPanel?.classList.contains("hidden")) return;
+  const duration = callStartedAt ? formatCallDuration((Date.now() - callStartedAt) / 1000) : "00:00";
+  callActive = false;
+  callMuted = false;
+  callGeneration += 1;
+  clearCallListenTimer();
+  if (callTimerId) clearInterval(callTimerId);
+  callTimerId = null;
+  callSessionAbort?.abort();
+  callSessionAbort = null;
+  closeCallCapture({ discard: true });
+  stopActiveSpeech();
+  document.body.classList.remove("in-call");
+  el.callPanel?.classList.add("hidden");
+  el.btnCall?.classList.remove("active");
+  el.btnCall?.setAttribute("aria-pressed", "false");
+  if (el.btnCall) {
+    el.btnCall.title = "开始语音通话";
+    el.btnCall.setAttribute("aria-label", "开始语音通话");
+  }
+  syncInteractionState();
+  setStatus(`${reason}，时长 ${duration}`);
+}
+
+function toggleCallMute() {
+  if (!callActive) return;
+  callMuted = !callMuted;
+  el.btnCallMute?.classList.toggle("muted", callMuted);
+  el.btnCallMute?.setAttribute("aria-pressed", callMuted ? "true" : "false");
+  if (el.callMuteLabel) el.callMuteLabel.textContent = callMuted ? "取消静音" : "静音";
+  if (callMuted) {
+    clearCallListenTimer();
+    closeCallCapture({ discard: true });
+    setCallStatus("麦克风已静音", "muted");
+    setCallTranscript("取消静音后可继续说话");
+  } else {
+    setCallStatus("正在恢复麦克风…", "connecting");
+    scheduleCallListening(callGeneration, 150);
+  }
+}
+
 let holdStartedAt = 0;
 const MIN_HOLD_MS = 1000;
 
@@ -2135,8 +2855,7 @@ async function handleRecordedAudio(blob) {
   }
 
   busy = true;
-  el.btnSend.disabled = true;
-  el.btnHold.disabled = true;
+  syncInteractionState();
   setStatus("正在识别… (" + Math.round(blob.size / 1024) + "KB)");
   try {
     let uploadBlob = blob;
@@ -2182,16 +2901,14 @@ async function handleRecordedAudio(blob) {
     }
     setStatus("识别到：" + text);
     busy = false;
-    el.btnSend.disabled = false;
-    el.btnHold.disabled = false;
+    syncInteractionState();
     await sendText(text);
   } catch (err) {
     const msg = err && err.name === "AbortError" ? "识别超时，请再试一次" : explainFetchError(err);
     setStatus("识别失败：" + msg);
   } finally {
     busy = false;
-    el.btnSend.disabled = false;
-    el.btnHold.disabled = false;
+    syncInteractionState();
   }
 }
 
@@ -2290,17 +3007,20 @@ async function initDefaults() {
           providerId: DEFAULT_PROVIDER_ID,
           model: serverDefaults.llm?.model,
           apiType: serverDefaults.llm?.apiType || DEFAULTS.llm.apiType,
+          endpoint: serverDefaults.llm?.endpoint || "",
         },
         stt: {
           providerId: "",
           model: serverDefaults.stt?.model,
           apiType: serverDefaults.stt?.apiType || DEFAULTS.stt.apiType,
+          endpoint: serverDefaults.stt?.endpoint || "",
         },
         tts: {
           providerId: "",
           model: serverDefaults.tts?.model,
           voice: serverDefaults.tts?.voice,
           apiType: serverDefaults.tts?.apiType || DEFAULTS.tts.apiType,
+          endpoint: serverDefaults.tts?.endpoint || "",
         },
         systemPromptPreset: serverDefaults.systemPromptPreset || inferPromptPreset(serverDefaults.systemPrompt),
         systemPrompt: serverDefaults.systemPrompt,
@@ -2324,7 +3044,7 @@ async function initDefaults() {
       ? "微信HTTP不能录音：···→在浏览器打开，并用 https://电脑IP:8788"
       : "当前HTTP不能录音，请用 https://电脑IP:8788（手机录音需要HTTPS）");
   } else {
-    setStatus("按住说话（服务器识别）。靠近麦克风，至少 1 秒，说完再松开");
+    setStatus("点右上角电话可连续通话；也可按住麦克风说话");
   }
 }
 
@@ -2338,6 +3058,25 @@ function clearDomSelection() {
 function isHoldingTalk() {
   return holdActive || recording;
 }
+
+if (el.btnCall) {
+  el.btnCall.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (callActive) {
+      endVoiceCall();
+      return;
+    }
+    try {
+      await startVoiceCall();
+    } catch (err) {
+      endVoiceCall("通话未接通");
+      setStatus(`无法开始通话：${micPermissionHint(err)}`);
+    }
+  });
+}
+el.btnHangup?.addEventListener("click", () => endVoiceCall());
+el.btnCallMute?.addEventListener("click", toggleCallMute);
 
 el.btnSend.addEventListener("click", (e) => {
   if (isHoldingTalk()) {
@@ -2487,6 +3226,52 @@ el.fields.apiProviderPicker?.addEventListener("change", () => {
 el.fields.llmProviderId?.addEventListener("change", () => renderProviderList());
 el.fields.sttProviderId?.addEventListener("change", () => renderProviderList());
 el.fields.ttsProviderId?.addEventListener("change", () => renderProviderList());
+["llmApiType", "sttApiType", "ttsApiType"].forEach((key) => {
+  el.fields?.[key]?.addEventListener("change", syncCustomEndpointFields);
+});
+
+for (const kind of Object.keys(BUILTIN_MODELS)) {
+  const kindName = `${kind[0].toUpperCase()}${kind.slice(1)}`;
+  const addButton = el.fields?.[`btnAdd${kindName}Model`];
+  const input = modelField(kind);
+  const list = modelList(kind);
+  const trigger = modelTrigger(kind);
+  trigger?.addEventListener("click", () => toggleModelMenu(kind));
+  addButton?.addEventListener("click", () => addCustomModel(kind));
+  input?.addEventListener("input", () => renderModelManager(kind));
+  input?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addCustomModel(kind);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setModelMenuOpen(kind, false);
+      trigger?.focus();
+    }
+  });
+  list?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const removeButton = event.target.closest("[data-remove-model-kind][data-model-value]");
+    if (removeButton) {
+      removeCustomModel(kind, removeButton.getAttribute("data-model-value") || "");
+      return;
+    }
+    const valueButton = event.target.closest("[data-model-kind][data-model-value]");
+    if (valueButton) {
+      input.value = valueButton.getAttribute("data-model-value") || "";
+      renderModelManager(kind);
+      setModelMenuOpen(kind, false);
+      trigger?.focus();
+      setSettingsStatus(`已选择 ${input.value}，点击底部“保存到本地”后生效`);
+    }
+  });
+}
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("[data-model-picker]")) closeAllModelMenus();
+});
 
 ["webSearchEnabled", "searchProvider", "searchApiKey", "searchBaseUrl"].forEach((key) => {
   const input = el.fields?.[key];
@@ -2530,23 +3315,28 @@ el.importFile.addEventListener("change", async () => {
 
 el.btnReset.addEventListener("click", () => {
   const keepProviders = ensureProviderList(config.apiProviders);
+  const keepCustomModels = normalizeCustomModels(config.customModels);
   config = normalizeConfig({
     apiProviders: keepProviders,
+    customModels: keepCustomModels,
     llm: {
       providerId: keepProviders[0]?.id || DEFAULT_PROVIDER_ID,
       model: serverDefaults?.llm?.model || DEFAULTS.llm.model,
       apiType: serverDefaults?.llm?.apiType || DEFAULTS.llm.apiType,
+      endpoint: serverDefaults?.llm?.endpoint || DEFAULTS.llm.endpoint,
     },
     stt: {
       providerId: "",
       model: serverDefaults?.stt?.model || DEFAULTS.stt.model,
       apiType: serverDefaults?.stt?.apiType || DEFAULTS.stt.apiType,
+      endpoint: serverDefaults?.stt?.endpoint || DEFAULTS.stt.endpoint,
     },
     tts: {
       providerId: "",
       model: serverDefaults?.tts?.model || DEFAULTS.tts.model,
       voice: serverDefaults?.tts?.voice || DEFAULTS.tts.voice,
       apiType: serverDefaults?.tts?.apiType || DEFAULTS.tts.apiType,
+      endpoint: serverDefaults?.tts?.endpoint || DEFAULTS.tts.endpoint,
     },
     systemPromptPreset: serverDefaults?.systemPromptPreset || DEFAULTS.systemPromptPreset,
     systemPrompt: serverDefaults?.systemPrompt || DEFAULTS.systemPrompt,
@@ -2602,6 +3392,7 @@ function bindHoldListenersOnce() {
   });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden && (holdActive || recording || holdPointerId != null)) endHold();
+    if (document.hidden && callActive) endVoiceCall("页面进入后台，通话已结束");
   });
 }
 
@@ -2735,6 +3526,14 @@ function setupInstallTip() {
 registerServiceWorker();
 setupInstallTip();
 
+window.addEventListener("pagehide", () => {
+  if (callActive) endVoiceCall("通话已结束");
+  else stopActiveSpeech();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && callActive) endVoiceCall();
+});
+
 bindSecretEyes();
 bindMessageActions();
 
@@ -2748,6 +3547,7 @@ async function boot() {
     setStatus(`本地数据库初始化失败：${err.message || err}`);
   }
   syncVoiceToggle();
+  syncInteractionState();
   renderChat();
   await initDefaults();
   syncVoiceToggle();

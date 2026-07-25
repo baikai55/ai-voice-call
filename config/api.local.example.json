@@ -9,21 +9,29 @@
       "apiKey": ""
     }
   ],
+  "customModels": {
+    "llm": [],
+    "stt": [],
+    "tts": []
+  },
   "llm": {
     "providerId": "provider_default",
     "model": "",
-    "apiType": "auto"
+    "apiType": "auto",
+    "endpoint": ""
   },
   "stt": {
     "providerId": "",
     "model": "",
-    "apiType": "auto"
+    "apiType": "auto",
+    "endpoint": ""
   },
   "tts": {
     "providerId": "",
     "model": "",
     "voice": "",
-    "apiType": "auto"
+    "apiType": "auto",
+    "endpoint": ""
   },
   "systemPromptPreset": "general",
   "systemPrompt": "",

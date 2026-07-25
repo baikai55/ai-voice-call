@@ -40,6 +40,7 @@ interface ClientProviderConfig {
   model?: string;
   voice?: string;
   apiType?: string;
+  endpoint?: string;
 }
 
 interface ClientConfig {
@@ -114,8 +115,22 @@ function pickUrl(...urls: Array<string | undefined>): string {
   return "";
 }
 
+function resolveCustomEndpoint(baseUrl: string, endpoint: string | undefined, fallbackPath: string): string {
+  const base = trimSlash((baseUrl || "").trim());
+  const custom = (endpoint || "").trim();
+  const fallback = (fallbackPath || "").trim().replace(/^\/+/, "");
+  if (!custom) {
+    if (!base) throw new Error("缺少 API Base URL");
+    return fallback ? `${base}/${fallback}` : base;
+  }
+  if (/^https?:\/\//i.test(custom)) return custom;
+  if (!base) throw new Error("相对接口地址需要配置 API Base URL");
+  if (custom.startsWith("/")) return `${new URL(base).origin}${custom}`;
+  return `${base}/${custom.replace(/^\/+/, "")}`;
+}
+
 function normalizeApiType(value: string | undefined, fallback = "auto"): string {
-  const allowed = new Set(["auto", "openai-chat", "openai-responses", "openai-transcriptions", "openai-speech", "xiaomi-mimo"]);
+  const allowed = new Set(["auto", "custom", "openai-chat", "openai-responses", "openai-transcriptions", "openai-speech", "xiaomi-mimo"]);
   const v = (value || "").trim();
   return allowed.has(v) ? v : fallback;
 }
@@ -130,11 +145,12 @@ function keyDiagnostic(apiKey: string | undefined) {
   };
 }
 
-function publicLlmConfig(baseUrl: string, model: string, apiType: string | undefined, apiKey: string) {
+function publicLlmConfig(baseUrl: string, model: string, apiType: string | undefined, apiKey: string, endpoint = "") {
   return {
     baseUrl,
     model,
     apiType: normalizeApiType(apiType, "auto"),
+    endpoint,
     ...keyDiagnostic(apiKey),
   };
 }
@@ -159,13 +175,13 @@ function formatLlmFailure(status: number, message: string) {
 }
 
 async function fetchLlmEndpointWithTransientRetry(
-  baseUrl: string,
+  endpointUrl: string,
   apiKey: string,
   endpointPath: string,
   payload: Record<string, unknown>,
   diag: ReturnType<typeof publicLlmConfig>,
 ): Promise<{ res: Response; errText: string }> {
-  const doFetch = () => fetch(`${baseUrl}/${endpointPath}`, {
+  const doFetch = () => fetch(endpointUrl, {
     method: "POST",
     headers: {
       authorization: `Bearer ${apiKey}`,
@@ -193,7 +209,7 @@ async function fetchChatCompletionWithTransientRetry(
   payload: Record<string, unknown>,
   diag: ReturnType<typeof publicLlmConfig>,
 ): Promise<{ res: Response; errText: string }> {
-  return fetchLlmEndpointWithTransientRetry(baseUrl, apiKey, "chat/completions", payload, diag);
+  return fetchLlmEndpointWithTransientRetry(`${baseUrl}/chat/completions`, apiKey, "chat/completions", payload, diag);
 }
 function ensureV1(baseUrl: string): string {
   const u = trimSlash(baseUrl);
@@ -210,7 +226,7 @@ function sanitizeMessages(messages: ChatMessage[], systemPrompt: string, maxTurn
   const withoutSystem = cleaned.filter((m) => m.role !== "system");
   const keep = Math.max(2, maxTurns * 2);
   const trimmed = withoutSystem.slice(-keep);
-  return [{ role: "system", content: systemPrompt }, ...trimmed];
+  return [{ role: "system", content: withReplyOnlyInstruction(systemPrompt) }, ...trimmed];
 }
 
 async function readError(res: Response): Promise<string> {
@@ -236,17 +252,20 @@ function publicConfig(env: Env) {
         baseUrl: env.LLM_BASE_URL || "https://api.siliconflow.cn/v1",
         model: env.LLM_MODEL || "Qwen/Qwen3.5-4B",
         apiType: "auto",
+        endpoint: "",
       },
       stt: {
         baseUrl: env.STT_BASE_URL || env.LLM_BASE_URL || "https://api.siliconflow.cn/v1",
         model: env.STT_MODEL || "FunAudioLLM/SenseVoiceSmall",
         apiType: "auto",
+        endpoint: "",
       },
       tts: {
         baseUrl: env.TTS_BASE_URL || env.LLM_BASE_URL || "https://api.siliconflow.cn/v1",
         model: env.TTS_MODEL || "FnLP/MOSS-TTSD-v0.5",
         voice: env.TTS_VOICE || "alloy",
         apiType: "auto",
+        endpoint: "",
       },
       systemPrompt: env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT,
       maxHistoryTurns: asNumber(env.MAX_HISTORY_TURNS, 12),
@@ -285,12 +304,14 @@ function resolveProviders(env: Env, config?: ClientConfig) {
       apiKey: llmKey,
       model: (config?.llm?.model || env.LLM_MODEL || "Qwen/Qwen3.5-4B").trim(),
       apiType: normalizeApiType(config?.llm?.apiType),
+      endpoint: (config?.llm?.endpoint || "").trim(),
     },
     stt: {
       baseUrl: sttBase,
       apiKey: sttKey,
       model: (config?.stt?.model || env.STT_MODEL || "FunAudioLLM/SenseVoiceSmall").trim(),
       apiType: normalizeApiType(config?.stt?.apiType),
+      endpoint: (config?.stt?.endpoint || "").trim(),
     },
     tts: {
       baseUrl: ttsBase,
@@ -298,6 +319,7 @@ function resolveProviders(env: Env, config?: ClientConfig) {
       model: (config?.tts?.model || env.TTS_MODEL || "FnLP/MOSS-TTSD-v0.5").trim(),
       voice: (config?.tts?.voice || env.TTS_VOICE || "alloy").trim(),
       apiType: normalizeApiType(config?.tts?.apiType),
+      endpoint: (config?.tts?.endpoint || "").trim(),
     },
     systemPromptPreset: (config?.systemPromptPreset || "general").trim(),
     systemPrompt: (config?.systemPrompt || env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT).trim(),
@@ -371,6 +393,91 @@ function extractChatText(data: any): string {
 
 
 type LlmKind = "chat" | "responses";
+
+const REPLY_ONLY_INSTRUCTION = "输出要求：只输出给用户的最终回答，不要复述系统提示词、角色设定、对话记录或用户原话，不要重复回答。";
+
+function escapeRegExp(value: string): string {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function withReplyOnlyInstruction(systemPrompt: string): string {
+  const prompt = String(systemPrompt || "").trim();
+  if (!prompt || prompt.includes(REPLY_ONLY_INSTRUCTION)) return prompt;
+  return `${prompt}\n\n${REPLY_ONLY_INSTRUCTION}`;
+}
+
+function mergeStreamText(current: string, incoming: string, cumulative = false): { reply: string; delta: string } {
+  const reply = String(current || "");
+  const text = String(incoming || "").replace(/<think>[\s\S]*?<\/think>/gi, "");
+  if (!text) return { reply, delta: "" };
+  if (cumulative && text === reply) return { reply, delta: "" };
+  if (reply && text.length > reply.length && text.startsWith(reply)) {
+    return { reply: text, delta: text.slice(reply.length) };
+  }
+  if (text.length >= 12 && (text === reply || reply.endsWith(text))) {
+    return { reply, delta: "" };
+  }
+  if (reply && text.length >= 12) {
+    const maxOverlap = Math.min(reply.length, text.length);
+    for (let overlap = maxOverlap; overlap >= 12; overlap -= 1) {
+      if (reply.slice(-overlap) === text.slice(0, overlap)) {
+        const delta = text.slice(overlap);
+        return { reply: reply + delta, delta };
+      }
+    }
+  }
+  return { reply: reply + text, delta: text };
+}
+
+function cleanAssistantReply(text: string, messages: ChatMessage[] = []): string {
+  const original = String(text || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<\|(?:im_start|im_end|endoftext|system|user|assistant)\|>/gi, "")
+    .trim();
+  if (!original) return "";
+  let cleaned = original;
+  const systemPrompts = messages
+    .filter((message) => message?.role === "system" && typeof message.content === "string")
+    .flatMap((message) => {
+      const prompt = message.content.trim();
+      const basePrompt = prompt.replace(REPLY_ONLY_INSTRUCTION, "").trim();
+      return [prompt, basePrompt];
+    })
+    .filter((prompt) => prompt.length >= 12)
+    .sort((a, b) => b.length - a.length);
+  for (const prompt of new Set(systemPrompts)) cleaned = cleaned.split(prompt).join("\n");
+
+  const lastUser = [...messages].reverse().find((message) => message?.role === "user");
+  const userText = String(lastUser?.content || "").trim();
+  if (userText) {
+    for (const marker of [
+      `用户说：“${userText}”`,
+      `用户说："${userText}"`,
+      `用户说：${userText}`,
+      `用户：${userText}`,
+      `user: ${userText}`,
+    ]) cleaned = cleaned.split(marker).join("\n");
+    const escapedUser = escapeRegExp(userText);
+    const userEchoPattern = new RegExp(`(^|\\n)\\s*(?:用户(?:说)?|user)\\s*[:：]\\s*[“”"'‘’]*\\s*${escapedUser}\\s*[“”"'‘’]*\\s*`, "gi");
+    for (let pass = 0; pass < 3; pass += 1) cleaned = cleaned.replace(userEchoPattern, "$1");
+  }
+  cleaned = cleaned
+    .replace(/(^|\n)\s*(?:系统(?:提示|消息)?|system)\s*[:：]\s*(?=\n|$)/gi, "$1")
+    .replace(/(^|\n)\s*(?:用户(?:说)?|user)\s*[:：]\s*[“”"'‘’]*\s*(?=\n|$)/gi, "$1")
+    .replace(/^\s*(?:助手|assistant|小豆)\s*[:：]\s*/i, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  const paragraphs = cleaned.split(/\n{2,}/).map((item) => item.trim()).filter(Boolean);
+  cleaned = paragraphs.filter((item, index) => index === 0 || item !== paragraphs[index - 1]).join("\n\n").trim();
+  const anchor = cleaned.slice(0, 48).trim();
+  if (anchor.length >= 24) {
+    const repeatAt = cleaned.indexOf(anchor, Math.max(80, anchor.length + 1));
+    if (repeatAt >= 0) cleaned = cleaned.slice(0, repeatAt).trim();
+  }
+  return cleaned || original;
+}
 
 function preferredLlmKind(apiType = "auto"): LlmKind {
   return normalizeApiType(apiType, "auto") === "openai-responses" ? "responses" : "chat";
@@ -457,6 +564,15 @@ function endpointPath(kind: LlmKind): string {
   return kind === "responses" ? "responses" : "chat/completions";
 }
 
+function llmEndpoint(baseUrl: string, apiType: string | undefined, endpoint: string | undefined, kind: LlmKind): string {
+  const fallbackPath = endpointPath(kind);
+  if (normalizeApiType(apiType, "auto") === "custom") {
+    if (!(endpoint || "").trim()) throw new Error("缺少自定义 LLM 接口地址");
+    return resolveCustomEndpoint(baseUrl, endpoint, fallbackPath);
+  }
+  return resolveCustomEndpoint(baseUrl, "", fallbackPath);
+}
+
 function extractResponseText(data: any): string {
   const direct = extractTextContent(data?.output_text ?? data?.text ?? data?.content ?? data?.reply);
   if (direct) return stripThinking(direct);
@@ -494,9 +610,10 @@ async function chatCompletions(
   maxTokens: number,
   temperature: number,
   apiType = "auto",
+  endpoint = "",
 ): Promise<string> {
   const safeMaxTokens = Math.max(maxTokens || 0, 512);
-  const diag = publicLlmConfig(baseUrl, model, apiType, apiKey);
+  const diag = publicLlmConfig(baseUrl, model, apiType, apiKey, endpoint);
   console.log("[llm] config", diag);
   let lastErr = "LLM failed";
 
@@ -506,7 +623,7 @@ async function chatCompletions(
     for (let i = 0; i < variants.length; i++) {
       const payload = variants[i];
       console.log("[llm] request", kind, model, "tokens=", safeMaxTokens, kind === "responses" ? `tool=${(payload.tools as any)?.[0]?.type}` : "");
-      const first = await fetchLlmEndpointWithTransientRetry(baseUrl, apiKey, endpointPath(kind), payload, diag);
+      const first = await fetchLlmEndpointWithTransientRetry(llmEndpoint(baseUrl, apiType, endpoint, kind), apiKey, endpointPath(kind), payload, diag);
       const res = first.res;
       if (!res.ok) {
         lastErr = formatLlmFailure(res.status, first.errText);
@@ -517,7 +634,7 @@ async function chatCompletions(
       }
 
       const data = (await res.json()) as any;
-      const text = extractLlmText(data, kind);
+      const text = cleanAssistantReply(extractLlmText(data, kind), messages);
       if (text) return text;
 
       const preview = JSON.stringify(kind === "chat" ? (data?.choices?.[0] || data) : (data?.output || data)).slice(0, 400);
@@ -580,18 +697,19 @@ async function readLlmStreamResponse(res: Response, kind: LlmKind, onDelta: (tex
   let buffer = "";
   let raw = "";
   let reply = "";
-  const applyDelta = (delta: string) => {
-    const cleaned = String(delta || "").replace(/<think>[\s\S]*?<\/think>/gi, "");
-    if (!cleaned) return;
-    reply += cleaned;
-    onDelta(cleaned);
+  const applyDelta = (delta: string, cumulative = false) => {
+    const merged = mergeStreamText(reply, delta, cumulative);
+    reply = merged.reply;
+    if (merged.delta) onDelta(merged.delta);
   };
   const handleBlock = (block: string) => {
     const { eventName, dataText } = parseSseBlock(block);
     if (!dataText || dataText === "[DONE]") return;
     try {
       const data = JSON.parse(dataText) as any;
-      applyDelta(extractStreamDelta(data, kind, eventName));
+      const choice = data?.choices?.[0] || {};
+      const cumulative = kind === "chat" && Boolean(choice.message) && !choice.delta;
+      applyDelta(extractStreamDelta(data, kind, eventName), cumulative);
       if (/response\.completed/i.test(String(data?.type || eventName || "")) && !reply) {
         applyDelta(extractResponseText(data.response || data));
       }
@@ -633,10 +751,11 @@ async function streamChatCompletions(
   maxTokens: number,
   temperature: number,
   apiType: string,
+  endpoint: string,
   onDelta: (text: string) => void,
 ): Promise<string> {
   const safeMaxTokens = Math.max(maxTokens || 0, 512);
-  const diag = publicLlmConfig(baseUrl, model, apiType, apiKey);
+  const diag = publicLlmConfig(baseUrl, model, apiType, apiKey, endpoint);
   console.log("[llm] config", diag);
   let lastErr = "LLM failed";
 
@@ -645,8 +764,9 @@ async function streamChatCompletions(
     const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, true);
     for (let i = 0; i < variants.length; i++) {
       const payload = variants[i];
+      const endpointUrl = llmEndpoint(baseUrl, apiType, endpoint, kind);
       console.log("[llm] stream", kind, model, "tokens=", safeMaxTokens);
-      let res = await fetch(`${baseUrl}/${endpointPath(kind)}`, {
+      let res = await fetch(endpointUrl, {
         method: "POST",
         headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
         body: JSON.stringify(payload),
@@ -656,7 +776,7 @@ async function streamChatCompletions(
         if (isTransientAuthError(res.status, errText)) {
           console.log("[llm] transient stream auth error, retry once", { status: res.status, endpointPath: endpointPath(kind), ...diag });
           await sleep(800);
-          res = await fetch(`${baseUrl}/${endpointPath(kind)}`, {
+          res = await fetch(endpointUrl, {
             method: "POST",
             headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
             body: JSON.stringify(payload),
@@ -671,8 +791,13 @@ async function streamChatCompletions(
           throw new Error(lastErr);
         }
       }
-      const text = await readLlmStreamResponse(res, kind, onDelta);
-      if (text) return text;
+      try {
+        const text = cleanAssistantReply(await readLlmStreamResponse(res, kind, onDelta), messages);
+        if (text) return text;
+      } catch (err: any) {
+        if (err?.partial) err.partial = cleanAssistantReply(err.partial, messages);
+        throw err;
+      }
       lastErr = `LLM stream returned empty content (${kind})`;
     }
     if (fallbackToNextKind) continue;
@@ -699,7 +824,7 @@ function pickTranscript(data: any): string {
 }
 
 async function transcribeOnce(
-  baseUrl: string,
+  endpointUrl: string,
   apiKey: string,
   model: string,
   file: File,
@@ -712,7 +837,7 @@ async function transcribeOnce(
   form.append("response_format", "json");
   if (withLanguage) form.append("language", "zh");
 
-  const res = await fetch(`${baseUrl}/audio/transcriptions`, {
+  const res = await fetch(endpointUrl, {
     method: "POST",
     headers: { authorization: `Bearer ${apiKey}` },
     body: form,
@@ -737,7 +862,12 @@ async function transcribe(
   apiKey: string,
   model: string,
   file: File,
+  apiType = "auto",
+  endpoint = "",
 ): Promise<string> {
+  const isCustom = normalizeApiType(apiType, "auto") === "custom";
+  if (isCustom && !endpoint.trim()) throw new Error("缺少自定义语音识别接口地址");
+  const endpointUrl = resolveCustomEndpoint(baseUrl, isCustom ? endpoint : "", "audio/transcriptions");
   const models = Array.from(
     new Set(
       [
@@ -752,7 +882,7 @@ async function transcribe(
 
   for (const m of models) {
     for (const withLanguage of [true, false]) {
-      const result = await transcribeOnce(baseUrl, apiKey, m, file, withLanguage);
+      const result = await transcribeOnce(endpointUrl, apiKey, m, file, withLanguage);
       attempts.push({
         model: m,
         withLanguage,
@@ -770,7 +900,7 @@ async function transcribe(
 function isMimoTts(baseUrl: string, model: string, apiType = "auto"): boolean {
   const normalized = normalizeApiType(apiType);
   if (normalized === "xiaomi-mimo") return true;
-  if (normalized === "openai-speech") return false;
+  if (normalized === "openai-speech" || normalized === "custom") return false;
   let host = "";
   try {
     host = new URL(baseUrl).hostname.toLowerCase();
@@ -839,8 +969,9 @@ async function synthesizeOpenAiSpeech(
   model: string,
   voice: string,
   input: string,
+  endpoint = "",
 ): Promise<Response> {
-  const res = await fetch(`${baseUrl}/audio/speech`, {
+  const res = await fetch(resolveCustomEndpoint(baseUrl, endpoint, "audio/speech"), {
     method: "POST",
     headers: {
       authorization: `Bearer ${apiKey}`,
@@ -876,9 +1007,12 @@ async function synthesize(
   voice: string,
   input: string,
   apiType = "auto",
+  endpoint = "",
 ): Promise<Response> {
   if (isMimoTts(baseUrl, model, apiType)) return synthesizeMimo(baseUrl, apiKey, model, voice, input);
-  return synthesizeOpenAiSpeech(baseUrl, apiKey, model, voice, input);
+  const isCustom = normalizeApiType(apiType, "auto") === "custom";
+  if (isCustom && !endpoint.trim()) throw new Error("缺少自定义 TTS 接口地址");
+  return synthesizeOpenAiSpeech(baseUrl, apiKey, model, voice, input, isCustom ? endpoint : "");
 }
 
 function parseClientConfig(raw: unknown): ClientConfig | undefined {
@@ -941,6 +1075,7 @@ ${formatSearchContext(search)}
     cfg.maxTokens,
     cfg.temperature,
     cfg.llm.apiType,
+    cfg.llm.endpoint,
   );
   return { reply, webSearch };
 }
@@ -1034,6 +1169,7 @@ async function handleChat(req: Request, env: Env): Promise<Response> {
     prepared.cfg.maxTokens,
     prepared.cfg.temperature,
     prepared.cfg.llm.apiType,
+    prepared.cfg.llm.endpoint,
   );
   if (prepared.useResponsesTools && shouldAutoSearch(prepared.userText) && looksLikeNoWebReply(reply)) {
     const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.userText, prepared.explicitSearch);
@@ -1075,6 +1211,7 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
             prepared.cfg.maxTokens,
             prepared.cfg.temperature,
             prepared.cfg.llm.apiType,
+            prepared.cfg.llm.endpoint,
           );
           if (looksLikeNoWebReply(reply)) {
             const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.userText, prepared.explicitSearch);
@@ -1091,6 +1228,7 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
             prepared.cfg.maxTokens,
             prepared.cfg.temperature,
             prepared.cfg.llm.apiType,
+            prepared.cfg.llm.endpoint,
             (text) => {
               reply += text;
               controller.enqueue(encodeSse("delta", { text }));
@@ -1185,7 +1323,7 @@ async function handleAsr(req: Request, env: Env): Promise<Response> {
   }
 
   try {
-    const text = await transcribe(cfg.stt.baseUrl, cfg.stt.apiKey, cfg.stt.model, file);
+    const text = await transcribe(cfg.stt.baseUrl, cfg.stt.apiKey, cfg.stt.model, file, cfg.stt.apiType, cfg.stt.endpoint);
     return json({ ok: true, text, model: cfg.stt.model, bytes: file.size });
   } catch (err: any) {
     return json({ ok: false, error: String(err?.message || err) }, 502);
@@ -1208,23 +1346,23 @@ async function handleTts(req: Request, env: Env): Promise<Response> {
     return badRequest("TTS disabled", 400);
   }
   if (!cfg.tts.baseUrl) {
-    return json({ ok: false, error: "缺少 TTS Base URL", tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: Boolean(cfg.tts.apiKey) } }, 400);
+    return json({ ok: false, error: "缺少 TTS Base URL", tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, endpoint: cfg.tts.endpoint, hasKey: Boolean(cfg.tts.apiKey) } }, 400);
   }
   if (!cfg.tts.model) {
-    return json({ ok: false, error: "缺少 TTS Model", tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: Boolean(cfg.tts.apiKey) } }, 400);
+    return json({ ok: false, error: "缺少 TTS Model", tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, endpoint: cfg.tts.endpoint, hasKey: Boolean(cfg.tts.apiKey) } }, 400);
   }
   if (!cfg.tts.apiKey) {
-    return json({ ok: false, error: "缺少 TTS API Key：请在本地配置中填写", tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: false } }, 401);
+    return json({ ok: false, error: "缺少 TTS API Key：请在本地配置中填写", tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, endpoint: cfg.tts.endpoint, hasKey: false } }, 401);
   }
 
   try {
-    return await synthesize(cfg.tts.baseUrl, cfg.tts.apiKey, cfg.tts.model, cfg.tts.voice, text.slice(0, 800), cfg.tts.apiType);
+    return await synthesize(cfg.tts.baseUrl, cfg.tts.apiKey, cfg.tts.model, cfg.tts.voice, text.slice(0, 800), cfg.tts.apiType, cfg.tts.endpoint);
   } catch (err: any) {
     const message = String(err?.message || err || "").trim();
     return json({
       ok: false,
       error: message ? `TTS 请求失败：${message}` : "TTS 请求失败",
-      tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: true },
+      tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, endpoint: cfg.tts.endpoint, hasKey: true },
     }, 502);
   }
 }
@@ -1240,9 +1378,9 @@ async function handleTest(req: Request, env: Env): Promise<Response> {
   const cfg = resolveProviders(env, parseClientConfig(body.config));
   const result: Record<string, unknown> = {
     ok: true,
-    llm: { baseUrl: cfg.llm.baseUrl, model: cfg.llm.model, apiType: cfg.llm.apiType, hasKey: Boolean(cfg.llm.apiKey) },
-    stt: { baseUrl: cfg.stt.baseUrl, model: cfg.stt.model, apiType: cfg.stt.apiType, hasKey: Boolean(cfg.stt.apiKey) },
-    tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, hasKey: Boolean(cfg.tts.apiKey) },
+    llm: { baseUrl: cfg.llm.baseUrl, model: cfg.llm.model, apiType: cfg.llm.apiType, endpoint: cfg.llm.endpoint, hasKey: Boolean(cfg.llm.apiKey) },
+    stt: { baseUrl: cfg.stt.baseUrl, model: cfg.stt.model, apiType: cfg.stt.apiType, endpoint: cfg.stt.endpoint, hasKey: Boolean(cfg.stt.apiKey) },
+    tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, endpoint: cfg.tts.endpoint, hasKey: Boolean(cfg.tts.apiKey) },
   };
 
   if (!cfg.llm.apiKey) {
@@ -1261,6 +1399,7 @@ async function handleTest(req: Request, env: Env): Promise<Response> {
       20,
       0,
       cfg.llm.apiType,
+      cfg.llm.endpoint,
     );
     result.llmTest = { ok: true, reply };
   } catch (err: any) {
