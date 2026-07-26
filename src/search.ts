@@ -34,24 +34,49 @@ function truncate(text: string, max = 180): string {
   return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
+// Topics that on their own imply a live-data lookup.
+const REALTIME_KEYS = [
+  "天气", "气温", "下雨", "下雪", "台风", "空气质量", "新闻", "头条", "热点", "热搜",
+  "股价", "股票", "行情", "汇率", "油价", "金价", "黄金", "白银", "银价", "比特币", "btc", "eth",
+  "比分", "赛程", "谁赢了", "开奖", "中奖", "航班", "火车", "高铁", "路况", "限行",
+  "放假", "门票", "影讯", "房价", "疫情", "多少钱", "票价",
+  "weather", "news", "stock", "price",
+];
+
+// Words that only imply a lookup when paired with a topic — "今天" on its own
+// also matches "今天我有点累", which must not cost a search round-trip.
+const TIME_HINT_KEYS = ["今天", "今日", "现在", "最新", "实时", "目前", "当前", "刚刚", "最近", "本周", "本月", "今年", "几点", "日期", "today"];
+
+// Personal / conversational turns never auto-search, even phrased as questions.
+// "最近怎么样" reads as a time hint plus "怎么样" below, so the small-talk
+// phrasings of it have to be listed here explicitly.
+const CHITCHAT_RE =
+  /(你好|您好|你是谁|你叫什么|讲个|故事|笑话|陪我|聊天|聊聊|闲聊|解闷|谢谢|再见|辛苦|心情|想你|安慰|鼓励|帮我写|帮我改|翻译|总结|解释|代码|提醒|闹钟|我想|我要|怎么办|你觉得|你认为|你能|你会|好不好|行不行|你怎么样|过得怎么样|最近怎么样)/;
+
 export function shouldAutoSearch(userText: string): boolean {
   const q = clean(userText);
   if (!q) return false;
   if (q.length < 2) return false;
+  const lower = q.toLowerCase();
+  if (isExplicitSearchRequest(q)) return true;
 
-  const keys = [
-    "天气", "气温", "下雨", "下雪", "新闻", "头条", "今天", "今日", "现在", "最新",
-    "股价", "油价", "房价", "汇率", "黄金", "比分", "赛程", "几点", "日期", "放假",
-    "开奖", "疫情", "航班", "火车", "高铁", "路况", "限行", "查询", "搜索", "搜一下",
-    "什么情况", "怎么样了", "热点", "热搜", "谁赢了", "多少钱",
-    "weather", "news", "today", "price", "stock",
-  ];
-  if (keys.some((k) => q.includes(k))) return true;
+  // An unambiguous live-data topic is enough on its own.
+  if (REALTIME_KEYS.some((k) => lower.includes(k.toLowerCase()))) return true;
 
-  // question-like
-  if (/[?？]$/.test(q) || /(吗|呢|啥|多少|哪里|哪个|谁|何时|几号)/.test(q)) {
-    // avoid pure chitchat
-    if (!/(你好|你是谁|讲个|故事|陪我|聊天|解闷)/.test(q)) return true;
+  // Everything below is a weak signal, so conversational turns opt out first.
+  if (CHITCHAT_RE.test(q)) return false;
+
+  if (TIME_HINT_KEYS.some((k) => lower.includes(k.toLowerCase())) && /(多少|价格|情况|怎么样|排名|结果|数据|行情|榜)/.test(q)) {
+    return true;
+  }
+
+  // Third-party facts, whether or not they carry a question particle:
+  // "谁得了冠军" yes, "你能帮我吗" no. A bare question particle is not enough
+  // on its own — it has to be asking about something outside this conversation.
+  const asksThirdPartyFact = /(哪里|哪个|哪家|谁|何时|几号|多少钱|排名|在哪|怎么去)/.test(q);
+  if (/[?？]$/.test(q) || /(吗|呢|啥)/.test(q) || asksThirdPartyFact) {
+    if (/^(我|我们|咱|咱们|你|你们)/.test(q)) return false;
+    if (asksThirdPartyFact) return true;
   }
   return false;
 }
@@ -102,6 +127,7 @@ export function extractWeatherLocation(query: string): string {
   q = q.replace(/(的)?(天气预报|天气|气温|温度|下雨吗|会下雨吗|下雨|下雪吗|会下雪吗|下雪|降雨|降雪|空气质量|台风|雾霾|预报)/g, "");
   q = q.replace(/(怎么样|如何|怎样|多少|几度|有雨吗|冷不冷|热不热)/g, "");
   q = q.replace(/[，,。.!！?？：:\s]/g, "").replace(/(?:呢|呀|啊|吧|嘛|吗|么)+$/g, "").trim();
+  q = q.replace(/^(嗯|哦|噢|喔|啊|额|呃|那|那么|还有|再查查|再看看|查查|看看|查|搜|搜搜|换成|改成|换|到|去)+/g, "").trim();
   return q.slice(0, 40);
 }
 function pickWeatherDesc(current: any): string {
@@ -329,45 +355,45 @@ export async function runWebSearch(opts: {
 
   if (provider === "auto") {
     if (key) {
-      // heuristic: tavily keys often start with tvly-, otherwise try serper first
-      if (key.startsWith("tvly-")) candidates.push(() => searchTavily(query, key));
-      else candidates.push(() => searchSerper(query, key));
+      // Key formats are not reliably distinguishable, so try the likely provider
+      // first and fall through to the other one instead of failing on a bad guess.
+      const ordered = /^tvly-/i.test(key)
+        ? [() => searchTavily(query, key), () => searchSerper(query, key)]
+        : [() => searchSerper(query, key), () => searchTavily(query, key)];
+      candidates.push(...ordered);
     }
     candidates.push(() => searchBingRss(query));
-    candidates.push(() => searchDuckDuckGo(query));
     candidates.push(() => searchSearx(query, baseUrl || "https://searx.be"));
+    candidates.push(() => searchDuckDuckGo(query));
   }
 
+  // A configured provider that is missing its key still falls back to the free
+  // ones rather than returning "no provider configured".
   if (candidates.length === 0) {
-    return { ok: false, query, items: [], provider: provider || "auto", error: "no provider configured" };
+    candidates.push(() => searchBingRss(query));
+    candidates.push(() => searchSearx(query, baseUrl || "https://searx.be"));
+    candidates.push(() => searchDuckDuckGo(query));
   }
 
-  // Run candidates in parallel so one slow/blocked provider cannot stall the reply.
-  // Resolve on the first usable result; otherwise settle with the last outcome.
-  return await new Promise<SearchResult>((resolve) => {
-    let pending = candidates.length;
-    let last: SearchResult = {
-      ok: false,
-      query,
-      items: [],
-      provider: provider || "auto",
-      error: "no provider responded",
-    };
-    for (const fn of candidates) {
-      fn()
-        .then((result) => {
-          last = result;
-          if (result.ok && result.items.length) resolve(result);
-        })
-        .catch((err: any) => {
-          last = { ok: false, query, items: [], provider: "error", error: String(err?.message || err) };
-        })
-        .finally(() => {
-          pending -= 1;
-          if (pending === 0) resolve(last);
-        });
+  // Sequential, in preference order. Racing them in parallel let a fast free
+  // provider beat the user's configured (paid, higher quality) one.
+  let last: SearchResult = {
+    ok: false,
+    query,
+    items: [],
+    provider: provider || "auto",
+    error: "no provider responded",
+  };
+  for (const fn of candidates) {
+    try {
+      const result = await fn();
+      last = result;
+      if (result.ok && result.items.length) return result;
+    } catch (err: any) {
+      last = { ok: false, query, items: [], provider: "error", error: String(err?.message || err) };
     }
-  });
+  }
+  return last;
 }
 
 export function formatSearchContext(result: SearchResult): string {

@@ -255,16 +255,29 @@ function sanitizeMessages(messages: ChatMessage[], systemPrompt: string, maxTurn
   return [{ role: "system", content: withReplyOnlyInstruction(systemPrompt) }, ...trimmed];
 }
 
+// Never echo an upstream body verbatim: with a wrong or hostile endpoint it can
+// be an arbitrary page rather than a provider error. JSON error messages and
+// short plain-text errors stay visible so real misconfiguration is debuggable.
+function summarizeUpstreamError(status: number | string, statusText: string, contentType: string | null, body: string): string {
+  const head = `HTTP ${status}${statusText ? " " + statusText : ""}`.trim();
+  const raw = String(body || "").trim();
+  if (!raw) return head;
+  try {
+    const data = JSON.parse(raw) as any;
+    const msg = String(data?.error?.message || data?.message || "").trim();
+    if (msg) return msg.slice(0, 500);
+  } catch {}
+  if (/html/i.test(String(contentType || "")) || /^</.test(raw)) {
+    return `${head}（接口返回的是网页而不是 JSON，请检查 Base URL / 接口地址是否填错）`;
+  }
+  if (raw.length <= 200) return raw;
+  return `${head}（接口返回了非 JSON 内容，共 ${raw.length} 字符）`;
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const text = await res.text();
-    if (!text) return `${res.status} ${res.statusText}`;
-    try {
-      const data = JSON.parse(text) as any;
-      return data?.error?.message || data?.message || text.slice(0, 500);
-    } catch {
-      return text.slice(0, 500);
-    }
+    return summarizeUpstreamError(res.status, res.statusText, res.headers.get("content-type"), text);
   } catch {
     return `${res.status} ${res.statusText}`;
   }
@@ -555,12 +568,12 @@ function preferredLlmKind(apiType = "auto"): LlmKind {
   return normalizeApiType(apiType, "auto") === "openai-responses" ? "responses" : "chat";
 }
 
+// Deliberately a single kind: vision always needs Chat Completions, and every
+// other case follows the configured apiType. There is no chat->responses
+// fallback — a provider that rejects Chat Completions should be configured as
+// "OpenAI Responses" explicitly rather than discovered by retrying.
 function llmKinds(apiType = "auto", messages: ChatMessage[] = []): LlmKind[] {
   return [messagesHaveVision(messages) ? "chat" : preferredLlmKind(apiType)];
-}
-
-function shouldFallbackToResponses(apiType: string | undefined, status: number): boolean {
-  return false;
 }
 
 function splitSystemMessages(messages: ChatMessage[]): { instructions: string; input: ChatMessage[] } {
@@ -692,7 +705,6 @@ async function chatCompletions(
   let lastErr = "LLM failed";
 
   for (const kind of llmKinds(apiType, messages)) {
-    let fallbackToNextKind = false;
     const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, false);
     for (let i = 0; i < variants.length; i++) {
       const payload = variants[i];
@@ -702,7 +714,6 @@ async function chatCompletions(
       if (!res.ok) {
         lastErr = formatLlmFailure(res.status, first.errText);
         console.log("[llm] fail", kind, res.status, lastErr);
-        if (kind === "chat" && shouldFallbackToResponses(apiType, res.status)) { fallbackToNextKind = true; break; }
         if (i < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
         throw new Error(lastErr);
       }
@@ -711,17 +722,18 @@ async function chatCompletions(
       const text = cleanAssistantReply(extractLlmText(data, kind), messages);
       if (text) return text;
 
+      // The body of a 200 that yielded no text stays in the log only: with a
+      // wrong endpoint it is whatever that URL returned, not a provider reply.
       const preview = JSON.stringify(kind === "chat" ? (data?.choices?.[0] || data) : (data?.output || data)).slice(0, 400);
       const finish = data?.choices?.[0]?.finish_reason;
       const hint = kind === "chat" && looksLikeQwenThinkingModel(model)
         ? " 这很像 Qwen3 思考模式：答案在 reasoning_content，且 max_tokens 被思考占满。已尝试关闭 thinking；可再把最大回复长度调到 512+，或换非 thinking 模型。"
         : "";
       lastErr = kind === "chat"
-        ? `LLM returned empty content (finish_reason=${finish || "unknown"}).${hint} raw=${preview}`
-        : `LLM returned empty content (responses). raw=${preview}`;
+        ? `LLM returned empty content (finish_reason=${finish || "unknown"}).${hint} 若反复出现，请检查 Base URL / 接口地址是否指向真正的模型接口。`
+        : `LLM returned empty content (responses). 若反复出现，请检查 Base URL / 接口地址是否指向真正的模型接口。`;
       console.log("[llm] empty", kind, preview);
     }
-    if (fallbackToNextKind) continue;
     break;
   }
   throw new Error(lastErr);
@@ -1109,7 +1121,6 @@ async function streamChatCompletions(
   let lastErr = "LLM failed";
 
   for (const kind of llmKinds(apiType, messages)) {
-    let fallbackToNextKind = false;
     const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, true);
     for (let i = 0; i < variants.length; i++) {
       const payload = variants[i];
@@ -1135,7 +1146,6 @@ async function streamChatCompletions(
         if (!res.ok) {
           lastErr = formatLlmFailure(res.status, errText);
           console.log("[llm] stream fail", kind, res.status, lastErr);
-          if (kind === "chat" && shouldFallbackToResponses(apiType, res.status)) { fallbackToNextKind = true; break; }
           if (i < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
           throw new Error(lastErr);
         }
@@ -1149,7 +1159,6 @@ async function streamChatCompletions(
       }
       lastErr = `LLM stream returned empty content (${kind})`;
     }
-    if (fallbackToNextKind) continue;
     break;
   }
   throw new Error(lastErr);
@@ -1197,10 +1206,7 @@ async function transcribeOnce(
   try { raw = JSON.parse(rawText); } catch {}
 
   if (!res.ok) {
-    const msg = typeof raw === "object"
-      ? (raw?.error?.message || raw?.message || rawText.slice(0, 300))
-      : String(rawText).slice(0, 300);
-    return { text: "", raw, status: res.status, error: msg };
+    return { text: "", raw, status: res.status, error: summarizeUpstreamError(res.status, res.statusText, res.headers.get("content-type"), rawText) };
   }
 
   return { text: pickTranscript(raw), raw, status: res.status };
@@ -1383,11 +1389,23 @@ function extractWeatherTiming(query: string): string {
   return String(query || "").match(/后天|明天|今天|今日/)?.[0] || "";
 }
 
+function isClearlyNotWeatherLocation(rawText: string, location: string): boolean {
+  const raw = String(rawText || "").replace(/\s+/g, " ").trim();
+  const value = String(location || "").trim();
+  const text = `${raw} ${value}`;
+  if (/^(这里|那里|这边|那边|本地|附近|谢谢|多谢|好的|好啦|知道了|明白了|不用了|不用|算了|可以|行吧|行了|为什么|怎么了|是吗|真的|没事|没问题)$/.test(value)) return true;
+  if (/^(我|我们|咱|咱们|你|你们|他|他们|她|她们|它|它们)/.test(value)) return true;
+  if (/(聊天|聊聊|闲聊|说话|讲故事|故事|笑话|解闷|陪我|解释|翻译|总结|代码|图片|照片|语音|音乐|播放|打开|关闭|设置|提醒|闹钟|教我|学习|继续|停止|开始)/.test(text)) return true;
+  if (/(为什么|怎么|如何|能不能|可不可以|要不要|需要|想要|我要|帮我|麻烦|请你)/.test(text)) return true;
+  return false;
+}
+
 function isLikelyWeatherFollowupLocation(rawText: string, location: string): boolean {
   const raw = String(rawText || "").replace(/\s+/g, " ").trim();
   const value = String(location || "").trim();
   if (!raw || raw.length > 30 || value.length < 2) return false;
-  if (/^(这里|那里|这边|那边|本地|附近|谢谢|多谢|好的|好啦|知道了|明白了|不用了|不用|算了|可以|行吧|行了|为什么|怎么了|是吗|真的|没事|没问题)$/.test(value)) return false;
+  if (isClearlyNotWeatherLocation(rawText, value)) return false;
+  if (!/^[\p{Script=Han}A-Za-z·\-\s]+$/u.test(value)) return false;
   return true;
 }
 
@@ -1888,11 +1906,29 @@ async function handleTest(req: Request, env: Env): Promise<Response> {
   return json(result);
 }
 
+// The API proxies to whatever Base URL / endpoint the browser sends, so it must
+// never be callable from another site. The page is served from this same origin,
+// so a cross-origin Origin header only ever means someone else's page is driving
+// the proxy. No CORS headers are emitted anywhere, by design.
+function crossOriginRefusal(request: Request, url: URL): string {
+  const origin = request.headers.get("origin");
+  if (!origin || origin === "null") return "";
+  let originHost = "";
+  try { originHost = new URL(origin).host; } catch { return `拒绝请求：无法解析的 Origin "${origin}"。`; }
+  if (originHost !== url.host) return `拒绝跨站请求：Origin "${origin}" 与本服务 "${url.host}" 不同源。`;
+  return "";
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     try {
+      if (url.pathname.startsWith("/api/")) {
+        const refusal = crossOriginRefusal(request, url);
+        if (refusal) return json({ ok: false, error: refusal }, 403);
+      }
+
       if (url.pathname === "/api/health") {
         return json({ ok: true, service: "ai-voice-call", time: new Date().toISOString() });
       }

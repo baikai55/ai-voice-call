@@ -14,12 +14,89 @@ const DEFAULT_SYSTEM_PROMPT = "你是一个中文 AI 助手。默认使用简体
 
 function env(name, fallback = "") { return String(process.env[name] ?? fallback).trim(); }
 function json(res, status, data) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "access-control-allow-origin": "*" });
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   res.end(JSON.stringify(data));
 }
 function text(res, status, body, type = "text/plain; charset=utf-8") {
-  res.writeHead(status, { "content-type": type, "cache-control": "no-store", "access-control-allow-origin": "*" });
+  res.writeHead(status, { "content-type": type, "cache-control": "no-store" });
   res.end(body);
+}
+
+// --- Local-only access guard ---------------------------------------------
+// This server proxies to whatever Base URL / endpoint the browser sends, which
+// makes it a fetch-anything relay. The page is served from the same origin, so
+// no cross-origin access is ever needed: reject anything that is not addressed
+// as loopback/LAN, and reject cross-origin callers. Without this, any website
+// the user visits could script fetch("http://127.0.0.1:8787/api/chat") and read
+// back internal pages through the proxy.
+const EXTRA_ALLOWED_HOSTS = new Set(
+  env("ALLOWED_HOSTS").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
+);
+
+// Strips the port and IPv6 brackets. Apply exactly once: "::1" run through it
+// twice would lose its trailing ":1" to the port pattern.
+function hostOnly(value) {
+  const h = String(value || "").trim().toLowerCase();
+  if (h.startsWith("[")) {
+    const end = h.indexOf("]");
+    return end > 0 ? h.slice(1, end) : h.slice(1);
+  }
+  return h.replace(/:\d+$/, "");
+}
+
+// Takes an already-normalized hostname (see hostOnly).
+function isLocalHostname(h) {
+  if (!h) return false;
+  if (EXTRA_ALLOWED_HOSTS.has(h)) return true;
+  if (h === "localhost" || h === "::1" || h === "::") return true;
+  if (/^127\./.test(h)) return true;
+  if (h === "0.0.0.0") return true;
+  if (/^10\./.test(h)) return true;
+  if (/^192\.168\./.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true;
+  if (/^169\.254\./.test(h)) return true;
+  if (/^(fc|fd)[0-9a-f]{2}:/.test(h)) return true;
+  if (/^fe80:/.test(h)) return true;
+  return false;
+}
+
+// Returns an error string when the request must be refused, "" when it is fine.
+function checkLocalRequest(req) {
+  const host = hostOnly(req.headers.host);
+  // DNS-rebinding guard: a hostile domain pointed at 127.0.0.1 arrives with its
+  // own name in Host, and would otherwise pass the same-origin check below.
+  if (!isLocalHostname(host)) {
+    return `拒绝请求：Host 头 "${req.headers.host || ""}" 不是本机/局域网地址。如果你在用隧道或自定义域名，请设置环境变量 ALLOWED_HOSTS。`;
+  }
+  const origin = req.headers.origin;
+  if (origin && origin !== "null") {
+    let originHost = "";
+    // URL.host drops nothing: it keeps the port and, for IPv6, the brackets
+    // ("[::1]:8787"). Run it through the same hostOnly() as the Host header so
+    // both sides are normalized identically.
+    try { originHost = hostOnly(new URL(origin).host); } catch { return `拒绝请求：无法解析的 Origin "${origin}"。`; }
+    if (originHost !== host) return `拒绝跨站请求：Origin "${origin}" 与本服务 "${host}" 不同源。`;
+  }
+  return "";
+}
+
+// Never echo an upstream body verbatim: with a wrong or hostile endpoint it can
+// be an internal page rather than a provider error. JSON error messages and
+// short plain-text errors stay visible so real misconfiguration is debuggable.
+function summarizeUpstreamError(status, statusText, contentType, body) {
+  const head = `HTTP ${status}${statusText ? " " + statusText : ""}`.trim();
+  const raw = String(body || "").trim();
+  if (!raw) return head;
+  try {
+    const data = JSON.parse(raw);
+    const msg = String(data?.error?.message || data?.message || "").trim();
+    if (msg) return msg.slice(0, 500);
+  } catch {}
+  if (/html/i.test(String(contentType || "")) || /^</.test(raw)) {
+    return `${head}（接口返回的是网页而不是 JSON，请检查 Base URL / 接口地址是否填错）`;
+  }
+  if (raw.length <= 200) return raw;
+  return `${head}（接口返回了非 JSON 内容，共 ${raw.length} 字符）`;
 }
 function sendFile(res, filePath) {
   const ext = path.extname(filePath).toLowerCase();
@@ -170,8 +247,10 @@ function fetchJson(url, options = {}, timeoutMs = 45000) {
   });
 }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
-function pickLlmErrorMessage(res) {
-  return String(res?.data?.error?.message || res?.data?.message || res?.raw?.slice?.(0, 300) || `HTTP ${res?.status || ""}`).trim();
+function pickUpstreamErrorMessage(res) {
+  const fromJson = String(res?.data?.error?.message || res?.data?.message || "").trim();
+  if (fromJson) return fromJson.slice(0, 500);
+  return summarizeUpstreamError(res?.status || "", "", res?.headers?.["content-type"], res?.raw);
 }
 function isTransientAuthError(status, message) {
   return Number(status) === 401 && /invalid\s+(api\s*key|token)|invalid\s+key/i.test(String(message || ""));
@@ -188,7 +267,7 @@ function formatLlmFailure(status, message) {
 }
 async function fetchLlmWithTransientRetry(endpoint, options, timeoutMs, cfg) {
   let res = await fetchJson(endpoint, options, timeoutMs);
-  const msg = pickLlmErrorMessage(res);
+  const msg = pickUpstreamErrorMessage(res);
   if (!res.ok && isTransientAuthError(res.status, msg)) {
     console.log("[llm] transient auth error, retry once", { status: res.status, ...publicLlmConfig(cfg) });
     await sleep(800);
@@ -333,6 +412,10 @@ function extractChatText(data) {
   }
   return "";
 }
+// Deliberately a single kind: vision always needs Chat Completions, and every
+// other case follows the configured apiType. There is no chat->responses
+// fallback — a provider that rejects Chat Completions should be configured as
+// "OpenAI Responses" explicitly rather than discovered by retrying.
 function llmKinds(cfg, messages = []) {
   return [messagesHaveVision(messages) ? "chat" : preferredLlmKind(cfg)];
 }
@@ -356,7 +439,6 @@ async function chatCompletions(cfg, messages) {
   console.log("[llm] config", publicLlmConfig(cfg));
   let lastErr = "LLM failed";
   for (const kind of llmKinds(cfg, messages)) {
-    let fallbackToNextKind = false;
     const endpoint = llmEndpoint(cfg, kind);
     const variants = payloadVariants(cfg, messages, kind, false);
     for (let i = 0; i < variants.length; i++) {
@@ -365,9 +447,8 @@ async function chatCompletions(cfg, messages) {
         console.log("[llm] request", kind, cfg.llm.model, "tokens=", cfg.maxTokens, kind === "responses" ? `tool=${payload.tools?.[0]?.type}` : "");
         const res = await fetchLlmWithTransientRetry(endpoint, { method: "POST", headers, body: JSON.stringify(payload) }, 35000, cfg);
         if (!res.ok) {
-          lastErr = formatLlmFailure(res.status, pickLlmErrorMessage(res));
+          lastErr = formatLlmFailure(res.status, pickUpstreamErrorMessage(res));
           console.log("[llm] fail", kind, res.status, lastErr);
-          if (kind === "chat" && shouldFallbackToResponses(cfg, res.status)) { fallbackToNextKind = true; break; }
           if (i < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
           throw new Error(lastErr);
         }
@@ -385,7 +466,6 @@ async function chatCompletions(cfg, messages) {
         throw new Error(lastErr);
       }
     }
-    if (fallbackToNextKind) continue;
     break;
   }
   throw new Error(lastErr);
@@ -563,7 +643,7 @@ async function fetchChatToolStep(cfg, messages) {
   for (let index = 0; index < variants.length; index++) {
     const res = await fetchLlmWithTransientRetry(endpoint, { method: "POST", headers, body: JSON.stringify(variants[index]) }, 15000, cfg);
     if (!res.ok) {
-      lastErr = formatLlmFailure(res.status, pickLlmErrorMessage(res));
+      lastErr = formatLlmFailure(res.status, pickUpstreamErrorMessage(res));
       if (index < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
       throw new Error(lastErr);
     }
@@ -646,18 +726,9 @@ function buildLlmPayload(cfg, messages, kind, stream = false) {
 function extractLlmText(data, kind) {
   return kind === "responses" ? extractResponseText(data) : extractChatText(data);
 }
-function shouldFallbackToResponses(cfg, status) {
-  return false;
-}
 async function readFetchError(res) {
   const textBody = await res.text().catch(() => "");
-  if (!textBody) return `${res.status} ${res.statusText || ""}`.trim();
-  try {
-    const data = JSON.parse(textBody);
-    return String(data?.error?.message || data?.message || textBody.slice(0, 500)).trim();
-  } catch {
-    return textBody.slice(0, 500).trim();
-  }
+  return summarizeUpstreamError(res.status, res.statusText, res.headers?.get?.("content-type"), textBody);
 }
 function extractStreamDelta(data, kind, eventName = "") {
   if (!data || typeof data !== "object") return "";
@@ -777,7 +848,6 @@ async function streamChatCompletions(cfg, messages, onDelta) {
   console.log("[llm] config", publicLlmConfig(cfg));
   let lastErr = "LLM failed";
   for (const kind of llmKinds(cfg, messages)) {
-    let fallbackToNextKind = false;
     const endpoint = llmEndpoint(cfg, kind);
     const variants = payloadVariants(cfg, messages, kind, true);
     for (let i = 0; i < variants.length; i++) {
@@ -796,7 +866,6 @@ async function streamChatCompletions(cfg, messages, onDelta) {
           if (!res.ok) {
             lastErr = formatLlmFailure(res.status, errText);
             console.log("[llm] stream fail", kind, res.status, lastErr);
-            if (kind === "chat" && shouldFallbackToResponses(cfg, res.status)) { fallbackToNextKind = true; break; }
             if (i < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
             throw new Error(lastErr);
           }
@@ -815,7 +884,6 @@ async function streamChatCompletions(cfg, messages, onDelta) {
         throw err;
       }
     }
-    if (fallbackToNextKind) continue;
     break;
   }
   throw new Error(lastErr);
@@ -825,16 +893,50 @@ function truncateSearchText(text, max = 180) {
   const t = cleanSearchText(text);
   return t.length > max ? t.slice(0, max) + "…" : t;
 }
+// Topics that on their own imply a live-data lookup.
+const REALTIME_KEYS = [
+  "天气", "气温", "下雨", "下雪", "台风", "空气质量", "新闻", "头条", "热点", "热搜",
+  "股价", "股票", "行情", "汇率", "油价", "金价", "黄金", "白银", "银价", "比特币", "btc", "eth",
+  "比分", "赛程", "谁赢了", "开奖", "中奖", "航班", "火车", "高铁", "路况", "限行",
+  "放假", "门票", "影讯", "房价", "疫情", "多少钱", "票价",
+  "weather", "news", "stock", "price",
+];
+
+// Words that only imply a lookup when paired with a topic — "今天" on its own
+// also matches "今天我有点累", which must not cost a search round-trip.
+const TIME_HINT_KEYS = ["今天", "今日", "现在", "最新", "实时", "目前", "当前", "刚刚", "最近", "本周", "本月", "今年", "几点", "日期", "today"];
+
+// Personal / conversational turns never auto-search, even phrased as questions.
+// "最近怎么样" reads as a time hint plus "怎么样" below, so the small-talk
+// phrasings of it have to be listed here explicitly.
+const CHITCHAT_RE =
+  /(你好|您好|你是谁|你叫什么|讲个|故事|笑话|陪我|聊天|聊聊|闲聊|解闷|谢谢|再见|辛苦|心情|想你|安慰|鼓励|帮我写|帮我改|翻译|总结|解释|代码|提醒|闹钟|我想|我要|怎么办|你觉得|你认为|你能|你会|好不好|行不行|你怎么样|过得怎么样|最近怎么样)/;
+
 function shouldAutoSearch(q) {
   const s = cleanSearchText(q);
   if (s.length < 2) return false;
-  const casualOrCreative = ["你好", "你是谁", "讲个", "故事", "笑话", "陪我", "聊天", "解闷", "今天过得怎么样", "最近怎么样", "心情", "想你", "安慰", "鼓励"];
-  if (casualOrCreative.some((k) => s.includes(k))) return false;
-  const explicit = [/搜一下/, /搜索/, /帮我搜/, /查一下/, /查一查/, /帮我查/, /联网/, /网上/, /上网/, /百度/, /谷歌/i, /google/i];
-  if (explicit.some((re) => re.test(s))) return true;
-  const keys = ["天气", "气温", "下雨", "下雪", "台风", "空气质量", "新闻", "头条", "热点", "热搜", "最新", "最近", "刚刚", "目前", "现在", "当前", "今天", "今日", "本周", "本月", "今年", "股价", "股票", "行情", "价格", "多少钱", "汇率", "油价", "金价", "黄金", "白银", "比特币", "btc", "eth", "美元", "港币", "人民币", "比分", "赛程", "谁赢了", "开奖", "中奖", "航班", "火车", "高铁", "路况", "限行", "放假", "门票", "影讯"];
   const lower = s.toLowerCase();
-  return keys.some((k) => lower.includes(k.toLowerCase()));
+  if (isExplicitSearchRequest(s)) return true;
+
+  // An unambiguous live-data topic is enough on its own.
+  if (REALTIME_KEYS.some((k) => lower.includes(k.toLowerCase()))) return true;
+
+  // Everything below is a weak signal, so conversational turns opt out first.
+  if (CHITCHAT_RE.test(s)) return false;
+
+  if (TIME_HINT_KEYS.some((k) => lower.includes(k.toLowerCase())) && /(多少|价格|情况|怎么样|排名|结果|数据|行情|榜)/.test(s)) {
+    return true;
+  }
+
+  // Third-party facts, whether or not they carry a question particle:
+  // "谁得了冠军" yes, "你能帮我吗" no. A bare question particle is not enough
+  // on its own — it has to be asking about something outside this conversation.
+  const asksThirdPartyFact = /(哪里|哪个|哪家|谁|何时|几号|多少钱|排名|在哪|怎么去)/.test(s);
+  if (/[?？]$/.test(s) || /(吗|呢|啥)/.test(s) || asksThirdPartyFact) {
+    if (/^(我|我们|咱|咱们|你|你们)/.test(s)) return false;
+    if (asksThirdPartyFact) return true;
+  }
+  return false;
 }
 function stripSearchCommandWords(text) {
   let q = cleanSearchText(text);
@@ -888,16 +990,28 @@ function extractWeatherLocation(query) {
   q = q.replace(/(的)?(天气预报|天气|气温|温度|下雨吗|会下雨吗|下雨|下雪吗|会下雪吗|下雪|降雨|降雪|空气质量|台风|雾霾|预报)/g, "");
   q = q.replace(/(怎么样|如何|怎样|多少|几度|有雨吗|冷不冷|热不热)/g, "");
   q = q.replace(/[，,。.!！?？：:\s]/g, "").replace(/(?:呢|呀|啊|吧|嘛|吗|么)+$/g, "").trim();
+  q = q.replace(/^(嗯|哦|噢|喔|啊|额|呃|那|那么|还有|再查查|再看看|查查|看看|查|搜|搜搜|换成|改成|换|到|去)+/g, "").trim();
   return q.slice(0, 40);
 }
 function extractWeatherTiming(query) {
   return String(query || "").match(/后天|明天|今天|今日/)?.[0] || "";
 }
+function isClearlyNotWeatherLocation(rawText, location) {
+  const raw = cleanSearchText(rawText);
+  const value = String(location || "").trim();
+  const text = `${raw} ${value}`;
+  if (/^(这里|那里|这边|那边|本地|附近|谢谢|多谢|好的|好啦|知道了|明白了|不用了|不用|算了|可以|行吧|行了|为什么|怎么了|是吗|真的|没事|没问题)$/.test(value)) return true;
+  if (/^(我|我们|咱|咱们|你|你们|他|他们|她|她们|它|它们)/.test(value)) return true;
+  if (/(聊天|聊聊|闲聊|说话|讲故事|故事|笑话|解闷|陪我|解释|翻译|总结|代码|图片|照片|语音|音乐|播放|打开|关闭|设置|提醒|闹钟|教我|学习|继续|停止|开始)/.test(text)) return true;
+  if (/(为什么|怎么|如何|能不能|可不可以|要不要|需要|想要|我要|帮我|麻烦|请你)/.test(text)) return true;
+  return false;
+}
 function isLikelyWeatherFollowupLocation(rawText, location) {
   const raw = cleanSearchText(rawText);
   const value = String(location || "").trim();
   if (!raw || raw.length > 30 || value.length < 2) return false;
-  if (/^(这里|那里|这边|那边|本地|附近|谢谢|多谢|好的|好啦|知道了|明白了|不用了|不用|算了|可以|行吧|行了|为什么|怎么了|是吗|真的|没事|没问题)$/.test(value)) return false;
+  if (isClearlyNotWeatherLocation(rawText, value)) return false;
+  if (!/^[\p{Script=Han}A-Za-z·\-\s]+$/u.test(value)) return false;
   return true;
 }
 function contextualSearchIntent(messages) {
@@ -1073,12 +1187,25 @@ async function runWebSearch({ query, provider = "auto", apiKey = "", baseUrl = "
   if (p === "bing" || p === "bing-rss") candidates.push(() => searchBingRss(q));
   if (p === "duckduckgo") candidates.push(() => searchDuckDuckGo(q));
   if (p === "auto") {
-    if (key) candidates.push(() => key.startsWith("tvly-") ? searchTavily(q, key) : searchSerper(q, key));
+    if (key) {
+      // Key formats are not reliably distinguishable, so try the likely provider
+      // first and fall through to the other one instead of failing on a bad guess.
+      const ordered = /^tvly-/i.test(key)
+        ? [() => searchTavily(q, key), () => searchSerper(q, key)]
+        : [() => searchSerper(q, key), () => searchTavily(q, key)];
+      candidates.push(...ordered);
+    }
     candidates.push(() => searchBingRss(q));
     candidates.push(() => searchSearx(q, baseUrl || "https://searx.be"));
     candidates.push(() => searchDuckDuckGo(q));
   }
-  if (!candidates.length) return { ok: false, provider: p, query: q, items: [], error: "no provider configured" };
+  // A configured provider that is missing its key still falls back to the free
+  // ones rather than returning "no provider configured".
+  if (!candidates.length) {
+    candidates.push(() => searchBingRss(q));
+    candidates.push(() => searchSearx(q, baseUrl || "https://searx.be"));
+    candidates.push(() => searchDuckDuckGo(q));
+  }
   let last = { ok: false, provider: p, query: q, items: [], error: "no provider responded" };
   for (const fn of candidates) {
     try {
@@ -1212,7 +1339,6 @@ async function handleChatStream(body, res) {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-store, no-transform",
     "connection": "keep-alive",
-    "access-control-allow-origin": "*",
     "x-accel-buffering": "no",
   });
   let reply = "";
@@ -1270,7 +1396,7 @@ async function transcribe(cfg, file) {
       const body = Buffer.concat([pre, file.buffer, mid]);
       try {
         const res = await fetchJson(endpoint, { method: "POST", headers: { authorization: `Bearer ${cfg.stt.apiKey}`, "content-type": `multipart/form-data; boundary=${boundary}`, "content-length": String(body.length) }, body }, 60000);
-        if (!res.ok) { lastErr = res.data?.error?.message || res.raw?.slice?.(0, 200) || `HTTP ${res.status}`; continue; }
+        if (!res.ok) { lastErr = pickUpstreamErrorMessage(res); continue; }
         const textOut = pickTranscript(res.data);
         if (textOut) return { text: textOut, model };
         lastErr = "语音识别没有返回文字";
@@ -1312,7 +1438,7 @@ async function synthesizeMimo(cfg, inputText) {
     },
     body: payload,
   }, 60000);
-  if (!res.ok) throw new Error(res.data?.error?.message || res.raw?.slice?.(0, 200) || `MiMo TTS HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`小米 MiMo TTS: ${pickUpstreamErrorMessage(res)}`);
   const audioData = res.data?.choices?.[0]?.message?.audio?.data || res.data?.audio?.data || res.data?.data;
   const buffer = base64ToBuffer(audioData);
   if (!buffer?.length) throw new Error("小米 MiMo TTS 没有返回音频数据");
@@ -1337,7 +1463,7 @@ async function synthesizeOpenAiSpeech(cfg, inputText) {
     },
     body: payload,
   }, 60000);
-  if (!res.ok) throw new Error(res.data?.error?.message || res.raw?.slice?.(0, 200) || `TTS HTTP ${res.status}`);
+  if (!res.ok) throw new Error(pickUpstreamErrorMessage(res));
   return { buffer: res.buffer, contentType: res.headers?.["content-type"] || "audio/mpeg" };
 }
 async function synthesize(cfg, inputText) {
@@ -1382,7 +1508,14 @@ const requestHandler = async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
     const pathname = url.pathname;
-    if (req.method === "OPTIONS") { res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,OPTIONS", "access-control-allow-headers": "content-type,x-client-config,authorization" }); return res.end(); }
+    if (pathname.startsWith("/api/")) {
+      const refusal = checkLocalRequest(req);
+      if (refusal) {
+        console.log("[guard] blocked", req.method, pathname, "host=", req.headers.host, "origin=", req.headers.origin || "-");
+        return json(res, 403, { ok: false, error: refusal });
+      }
+    }
+    if (req.method === "OPTIONS") { res.writeHead(204, { "cache-control": "no-store" }); return res.end(); }
     if (pathname === "/api/health") return json(res, 200, { ok: true, service: "ai-voice-call-local", time: new Date().toISOString(), secure: Boolean(req.socket && req.socket.encrypted) });
     if (pathname === "/api/defaults" && req.method === "GET") return json(res, 200, { ok: true, defaults: { llm: { baseUrl: "https://api.siliconflow.cn/v1", model: "Qwen/Qwen3.5-4B", apiType: "auto", endpoint: "" }, stt: { baseUrl: "https://api.siliconflow.cn/v1", model: "FunAudioLLM/SenseVoiceSmall", apiType: "auto", endpoint: "" }, tts: { baseUrl: "https://api.siliconflow.cn/v1", model: "FnLP/MOSS-TTSD-v0.5", voice: "alloy", apiType: "auto", endpoint: "" }, systemPromptPreset: "general", systemPrompt: DEFAULT_SYSTEM_PROMPT, maxHistoryTurns: 12, maxTokens: 512, temperature: 0.7, ttsEnabled: true, browserTtsFallback: true, autoSpeak: true, toolCallingEnabled: true, webSearchEnabled: true, searchProvider: "auto" } });
     if (pathname === "/api/chat/stream" && req.method === "POST") {
@@ -1448,7 +1581,7 @@ const requestHandler = async (req, res) => {
       if (!cfg.tts.apiKey) return json(res, 401, { ok: false, error: "缺少 TTS API Key", tts: publicTtsConfig(cfg) });
       try {
         const audio = await synthesize(cfg, textInput);
-        res.writeHead(200, { "content-type": audio.contentType || "audio/mpeg", "cache-control": "no-store", "access-control-allow-origin": "*" });
+        res.writeHead(200, { "content-type": audio.contentType || "audio/mpeg", "cache-control": "no-store" });
         return res.end(audio.buffer);
       } catch (err) {
         const error = formatTtsError(err);
