@@ -9,7 +9,6 @@ echo.
 
 if exist "%ProgramFiles%\nodejs\node.exe" set "PATH=%ProgramFiles%\nodejs;%PATH%"
 if exist "%ProgramFiles(x86)%\nodejs\node.exe" set "PATH=%ProgramFiles(x86)%\nodejs;%PATH%"
-if exist "%ProgramFiles%\Git\usr\bin\openssl.exe" set "PATH=%ProgramFiles%\Git\usr\bin;%PATH%"
 
 where node >nul 2>&1
 if errorlevel 1 (
@@ -18,10 +17,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [1/5] Free port 8787 / 8788 ...
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ports=@(8787,8788); foreach($port in $ports){ $conns = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; foreach($p in $conns){ if($p -and $p -ne 0){ Write-Host ('kill ' + $p + ' port ' + $port); Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } } }; $names=@('workerd','wrangler'); foreach($n in $names){ Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }"
-timeout /t 1 /nobreak >nul
+where pwsh >nul 2>&1
+if errorlevel 1 (
+  echo [ERROR] PowerShell 7 ^(pwsh^) not found. Install PowerShell 7 first.
+  pause
+  exit /b 1
+)
 
 if not exist "local-server.mjs" (
   echo [ERROR] local-server.mjs missing
@@ -29,26 +30,23 @@ if not exist "local-server.mjs" (
   exit /b 1
 )
 
-echo [2/5] Ensure local HTTPS certs ...
-if not exist ".certs\cert.pem" (
-  if exist "scripts\gen-local-cert.cmd" call "scripts\gen-local-cert.cmd"
-)
-if exist ".certs\cert.pem" (
-  echo   HTTPS cert ready
-) else (
-  echo   [WARN] no cert, phone mic may fail on HTTP
+echo [1/3] Checking port 8787 ...
+set "AI_VOICE_SERVER=%~dp0local-server.mjs"
+pwsh -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$target=[IO.Path]::GetFullPath($env:AI_VOICE_SERVER); $owners=@(Get-NetTCPConnection -LocalPort 8787 -State Listen -ErrorAction SilentlyContinue ^| Select-Object -ExpandProperty OwningProcess -Unique); foreach($ownerId in $owners){ if(-not $ownerId){ continue }; $proc=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $ownerId) -ErrorAction SilentlyContinue; $cmd=[string]$proc.CommandLine; if($cmd.IndexOf($target,[StringComparison]::OrdinalIgnoreCase) -ge 0){ Write-Host ('Stopping previous project server PID ' + $ownerId); Stop-Process -Id $ownerId -Force -ErrorAction Stop } else { Write-Error ('Port 8787 is occupied by another process (PID ' + $ownerId + '). Close it manually and retry.'); exit 2 } }; Start-Sleep -Milliseconds 500; if(Get-NetTCPConnection -LocalPort 8787 -State Listen -ErrorAction SilentlyContinue){ Write-Error 'Port 8787 is still occupied.'; exit 3 }"
+if errorlevel 1 (
+  echo [ERROR] Cannot start while port 8787 is occupied.
+  pause
+  exit /b 1
 )
 
-echo [3/5] Local Node server mode
-echo [4/5] Addresses:
-node "%~dp0scripts\print-lan-ip.mjs"
+echo [2/3] Address:
+echo   PC: http://127.0.0.1:8787
+echo   Phone: use the deployed Cloudflare HTTPS address
 echo.
 
-echo [5/5] Starting local-server.mjs ...
-echo   PC:          http://127.0.0.1:8787
-echo   Phone mic:   https://LAN-IP:8788  ^(recommended^)
-echo   WeChat:      ... -^> open in browser, then use HTTPS
-echo   Keep this window OPEN while using the app.
+echo [3/3] Starting local-server.mjs ...
+echo   Keep this window OPEN while using the local app.
 echo.
 
 node "%~dp0local-server.mjs"

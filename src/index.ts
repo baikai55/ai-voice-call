@@ -5,7 +5,7 @@
  * - Never log API keys
  */
 
-import { extractWeatherLocation, formatSearchContext, isExplicitSearchRequest, isRealtimeQuery, isWeatherQuery, runWebSearch, shouldAutoSearch } from "./search";
+import { contextualSearchIntentFromTexts, extractWeatherLocation, formatSearchContext, isExplicitSearchRequest, isRealtimeQuery, isWeatherLookupRequest, runWebSearch, shouldAutoSearch, shouldUseFunctionTools } from "./search";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -110,6 +110,10 @@ function asNumber(v: string | number | undefined, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function clampMaxTokens(value: string | number | undefined, fallback = 512): number {
+  return Math.min(1024, Math.max(256, asNumber(value, fallback)));
+}
+
 function trimSlash(url: string): string {
   return url.replace(/\/+$/, "");
 }
@@ -130,18 +134,52 @@ function pickUrl(...urls: Array<string | undefined>): string {
   return "";
 }
 
+function isPrivateOrReservedHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").split("%")[0];
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".home.arpa")) return true;
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (ipv4) {
+    const [, aRaw, bRaw, cRaw, dRaw] = ipv4;
+    const [a, b, c, d] = [aRaw, bRaw, cRaw, dRaw].map(Number);
+    if ([a, b, c, d].some((part) => part < 0 || part > 255)) return true;
+    return a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      (a === 198 && b === 51 && c === 100) ||
+      (a === 203 && b === 0 && c === 113);
+  }
+  return host === "::" || host === "::1" || /^::ffff:(?:127\.|10\.|169\.254\.|192\.168\.)/.test(host) ||
+    /^f[cd]/.test(host) || /^fe[89ab]/.test(host) || /^ff/.test(host) || /^2001:db8(?::|$)/.test(host);
+}
+
+function assertSafeUpstreamUrl(rawUrl: string): string {
+  let url: URL;
+  try { url = new URL(rawUrl); } catch { throw new Error("上游接口地址无效"); }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("上游接口只允许 http:// 或 https:// 地址");
+  if (url.username || url.password) throw new Error("上游接口地址不能包含用户名或密码");
+  if (isPrivateOrReservedHostname(url.hostname)) throw new Error("出于安全原因，供应商接口不能指向本机、局域网或保留地址");
+  return url.toString();
+}
+
 function resolveCustomEndpoint(baseUrl: string, endpoint: string | undefined, fallbackPath: string): string {
   const base = trimSlash((baseUrl || "").trim());
   const custom = (endpoint || "").trim();
   const fallback = (fallbackPath || "").trim().replace(/^\/+/, "");
+  let resolved: string;
   if (!custom) {
     if (!base) throw new Error("缺少 API Base URL");
-    return fallback ? `${base}/${fallback}` : base;
+    resolved = fallback ? `${base}/${fallback}` : base;
+  } else if (/^https?:\/\//i.test(custom)) {
+    resolved = custom;
+  } else {
+    if (!base) throw new Error("相对接口地址需要配置 API Base URL");
+    resolved = custom.startsWith("/") ? `${new URL(base).origin}${custom}` : `${base}/${custom.replace(/^\/+/, "")}`;
   }
-  if (/^https?:\/\//i.test(custom)) return custom;
-  if (!base) throw new Error("相对接口地址需要配置 API Base URL");
-  if (custom.startsWith("/")) return `${new URL(base).origin}${custom}`;
-  return `${base}/${custom.replace(/^\/+/, "")}`;
+  return assertSafeUpstreamUrl(resolved);
 }
 
 function normalizeApiType(value: string | undefined, fallback = "auto"): string {
@@ -170,8 +208,33 @@ function publicLlmConfig(baseUrl: string, model: string, apiType: string | undef
   };
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function fetchWithTimeoutAndSignal(url: string, init: RequestInit, timeoutMs = 0, signal?: AbortSignal): Promise<Response> {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 function isTransientAuthError(status: number, message: string) {
@@ -196,23 +259,17 @@ async function fetchLlmEndpointWithTransientRetry(
   payload: Record<string, unknown>,
   diag: ReturnType<typeof publicLlmConfig>,
   timeoutMs = 0,
+  signal?: AbortSignal,
 ): Promise<{ res: Response; errText: string }> {
   const doFetch = async () => {
-    const controller = timeoutMs > 0 ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
-    try {
-      return await fetch(endpointUrl, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${apiKey}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(payload),
-        ...(controller ? { signal: controller.signal } : {}),
-      });
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
+    return fetchWithTimeoutAndSignal(endpointUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }, timeoutMs, signal);
   };
 
   let res = await doFetch();
@@ -220,7 +277,7 @@ async function fetchLlmEndpointWithTransientRetry(
   let errText = await readError(res);
   if (isTransientAuthError(res.status, errText)) {
     console.log("[llm] transient auth error, retry once", { status: res.status, endpointPath, ...diag });
-    await sleep(800);
+    await sleep(800, signal);
     res = await doFetch();
     if (res.ok) return { res, errText: "" };
     errText = await readError(res);
@@ -308,7 +365,7 @@ function publicConfig(env: Env) {
       },
       systemPrompt: env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT,
       maxHistoryTurns: asNumber(env.MAX_HISTORY_TURNS, 12),
-      maxTokens: asNumber(env.LLM_MAX_TOKENS, 512),
+      maxTokens: clampMaxTokens(env.LLM_MAX_TOKENS),
       temperature: asNumber(env.LLM_TEMPERATURE, 0.7),
       ttsEnabled: asBool(env.TTS_ENABLED, true),
       browserTtsFallback: asBool(env.BROWSER_TTS_FALLBACK, true),
@@ -364,7 +421,7 @@ function resolveProviders(env: Env, config?: ClientConfig) {
     systemPromptPreset: (config?.systemPromptPreset || "general").trim(),
     systemPrompt: (config?.systemPrompt || env.SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT).trim(),
     maxHistoryTurns: asNumber(config?.maxHistoryTurns ?? env.MAX_HISTORY_TURNS, 12),
-    maxTokens: asNumber(config?.maxTokens ?? env.LLM_MAX_TOKENS, 512),
+    maxTokens: clampMaxTokens(config?.maxTokens ?? env.LLM_MAX_TOKENS),
     temperature: asNumber(config?.temperature ?? env.LLM_TEMPERATURE, 0.7),
     ttsEnabled: config?.ttsEnabled ?? asBool(env.TTS_ENABLED, true),
     toolCallingEnabled: config?.toolCallingEnabled !== false,
@@ -698,8 +755,9 @@ async function chatCompletions(
   temperature: number,
   apiType = "auto",
   endpoint = "",
+  signal?: AbortSignal,
 ): Promise<string> {
-  const safeMaxTokens = Math.max(maxTokens || 0, 512);
+  const safeMaxTokens = clampMaxTokens(maxTokens);
   const diag = publicLlmConfig(baseUrl, model, apiType, apiKey, endpoint);
   console.log("[llm] config", diag);
   let lastErr = "LLM failed";
@@ -709,7 +767,7 @@ async function chatCompletions(
     for (let i = 0; i < variants.length; i++) {
       const payload = variants[i];
       console.log("[llm] request", kind, model, "tokens=", safeMaxTokens, kind === "responses" ? `tool=${(payload.tools as any)?.[0]?.type}` : "");
-      const first = await fetchLlmEndpointWithTransientRetry(llmEndpoint(baseUrl, apiType, endpoint, kind), apiKey, endpointPath(kind), payload, diag);
+      const first = await fetchLlmEndpointWithTransientRetry(llmEndpoint(baseUrl, apiType, endpoint, kind), apiKey, endpointPath(kind), payload, diag, 0, signal);
       const res = first.res;
       if (!res.ok) {
         lastErr = formatLlmFailure(res.status, first.errText);
@@ -816,15 +874,6 @@ const TOOL_LABELS: Record<string, string> = {
   create_reminder: "提醒",
 };
 
-function shouldUseFunctionTools(text: string): boolean {
-  const value = String(text || "").replace(/\s+/g, " ").trim();
-  if (!value) return false;
-  if (/提醒|闹钟|到时叫我|记得叫我|分钟后|小时后/.test(value)) return true;
-  if (/几点|现在时间|当前时间|日期|几号|星期几|今天星期/.test(value)) return true;
-  if (/计算|算一下|等于多少|[0-9][0-9\s.+\-*/%^()]{2,}/.test(value)) return true;
-  return false;
-}
-
 function parseToolArguments(raw: unknown): Record<string, any> {
   if (raw && typeof raw === "object") return raw as Record<string, any>;
   const text = String(raw || "").trim();
@@ -922,8 +971,9 @@ async function executeFunctionTool(cfg: ReturnType<typeof resolveProviders>, cal
 async function fetchChatToolStep(
   cfg: ReturnType<typeof resolveProviders>,
   messages: ChatMessage[],
+  signal?: AbortSignal,
 ): Promise<{ message: any; text: string; toolCalls: FunctionToolCall[] }> {
-  const safeMaxTokens = Math.max(cfg.maxTokens || 0, 512);
+  const safeMaxTokens = clampMaxTokens(cfg.maxTokens);
   const diag = publicLlmConfig(cfg.llm.baseUrl, cfg.llm.model, cfg.llm.apiType, cfg.llm.apiKey, cfg.llm.endpoint);
   const variants = payloadVariants("chat", cfg.llm.model, messages, safeMaxTokens, cfg.temperature, false)
     .map((payload) => ({ ...payload, tools: FUNCTION_TOOLS, tool_choice: "auto" }));
@@ -936,6 +986,7 @@ async function fetchChatToolStep(
       variants[index],
       diag,
       15000,
+      signal,
     );
     if (!first.res.ok) {
       lastErr = formatLlmFailure(first.res.status, first.errText);
@@ -952,13 +1003,14 @@ async function fetchChatToolStep(
 async function chatCompletionsWithTools(
   cfg: ReturnType<typeof resolveProviders>,
   messages: ChatMessage[],
+  signal?: AbortSignal,
 ): Promise<{ reply: string; toolActions: Record<string, unknown>[]; toolUsage: string[]; webSearch: Record<string, unknown> | null }> {
   const working: ChatMessage[] = [...messages];
   const toolActions: Record<string, unknown>[] = [];
   const toolUsage: string[] = [];
   let webSearch: Record<string, unknown> | null = null;
   for (let round = 0; round < 4; round++) {
-    const step = await fetchChatToolStep(cfg, working);
+    const step = await fetchChatToolStep(cfg, working, signal);
     if (!step.toolCalls.length) {
       const reply = cleanAssistantReply(step.text, messages);
       if (!reply) throw new Error("模型完成工具调用后没有返回文字");
@@ -987,6 +1039,7 @@ async function chatCompletionsWithTools(
     cfg.temperature,
     cfg.llm.apiType,
     cfg.llm.endpoint,
+    signal,
   );
   return { reply, toolActions, toolUsage, webSearch };
 }
@@ -1036,14 +1089,8 @@ function readStreamChunkWithTimeout(
   });
 }
 
-async function fetchLlmStreamOnce(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+async function fetchLlmStreamOnce(url: string, init: RequestInit, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
+  return fetchWithTimeoutAndSignal(url, init, timeoutMs, signal);
 }
 
 async function readLlmStreamResponse(res: Response, kind: LlmKind, onDelta: (text: string) => void): Promise<string> {
@@ -1114,8 +1161,9 @@ async function streamChatCompletions(
   apiType: string,
   endpoint: string,
   onDelta: (text: string) => void,
+  signal?: AbortSignal,
 ): Promise<string> {
-  const safeMaxTokens = Math.max(maxTokens || 0, 512);
+  const safeMaxTokens = clampMaxTokens(maxTokens);
   const diag = publicLlmConfig(baseUrl, model, apiType, apiKey, endpoint);
   console.log("[llm] config", diag);
   let lastErr = "LLM failed";
@@ -1130,17 +1178,17 @@ async function streamChatCompletions(
         method: "POST",
         headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
         body: JSON.stringify(payload),
-      }, 15000);
+      }, 15000, signal);
       if (!res.ok) {
         let errText = await readError(res);
         if (isTransientAuthError(res.status, errText)) {
           console.log("[llm] transient stream auth error, retry once", { status: res.status, endpointPath: endpointPath(kind), ...diag });
-          await sleep(800);
+          await sleep(800, signal);
           res = await fetchLlmStreamOnce(endpointUrl, {
             method: "POST",
             headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
             body: JSON.stringify(payload),
-          }, 15000);
+          }, 15000, signal);
           if (!res.ok) errText = await readError(res);
         }
         if (!res.ok) {
@@ -1187,6 +1235,7 @@ async function transcribeOnce(
   model: string,
   file: File,
   withLanguage: boolean,
+  signal?: AbortSignal,
 ): Promise<{ text: string; raw: any; status: number; error?: string }> {
   const name = file.name || "speech.wav";
   const form = new FormData();
@@ -1199,6 +1248,7 @@ async function transcribeOnce(
     method: "POST",
     headers: { authorization: `Bearer ${apiKey}` },
     body: form,
+    signal,
   });
 
   const rawText = await res.text();
@@ -1219,6 +1269,7 @@ async function transcribe(
   file: File,
   apiType = "auto",
   endpoint = "",
+  signal?: AbortSignal,
 ): Promise<string> {
   const isCustom = normalizeApiType(apiType, "auto") === "custom";
   if (isCustom && !endpoint.trim()) throw new Error("缺少自定义语音识别接口地址");
@@ -1237,7 +1288,7 @@ async function transcribe(
 
   for (const m of models) {
     for (const withLanguage of [true, false]) {
-      const result = await transcribeOnce(endpointUrl, apiKey, m, file, withLanguage);
+      const result = await transcribeOnce(endpointUrl, apiKey, m, file, withLanguage, signal);
       attempts.push({
         model: m,
         withLanguage,
@@ -1286,8 +1337,9 @@ async function synthesizeMimo(
   model: string,
   voice: string,
   input: string,
+  signal?: AbortSignal,
 ): Promise<Response> {
-  const res = await fetch(`${baseUrl}/chat/completions`, {
+  const res = await fetch(resolveCustomEndpoint(baseUrl, "", "chat/completions"), {
     method: "POST",
     headers: {
       "api-key": apiKey,
@@ -1299,6 +1351,7 @@ async function synthesizeMimo(
       messages: [{ role: "assistant", content: input }],
       audio: { format: "wav", voice: normalizeMimoVoice(voice) },
     }),
+    signal,
   });
 
   if (!res.ok) {
@@ -1325,6 +1378,7 @@ async function synthesizeOpenAiSpeech(
   voice: string,
   input: string,
   endpoint = "",
+  signal?: AbortSignal,
 ): Promise<Response> {
   const res = await fetch(resolveCustomEndpoint(baseUrl, endpoint, "audio/speech"), {
     method: "POST",
@@ -1338,6 +1392,7 @@ async function synthesizeOpenAiSpeech(
       input,
       response_format: "mp3",
     }),
+    signal,
   });
 
   if (!res.ok) {
@@ -1363,11 +1418,12 @@ async function synthesize(
   input: string,
   apiType = "auto",
   endpoint = "",
+  signal?: AbortSignal,
 ): Promise<Response> {
-  if (isMimoTts(baseUrl, model, apiType)) return synthesizeMimo(baseUrl, apiKey, model, voice, input);
+  if (isMimoTts(baseUrl, model, apiType)) return synthesizeMimo(baseUrl, apiKey, model, voice, input, signal);
   const isCustom = normalizeApiType(apiType, "auto") === "custom";
   if (isCustom && !endpoint.trim()) throw new Error("缺少自定义 TTS 接口地址");
-  return synthesizeOpenAiSpeech(baseUrl, apiKey, model, voice, input, isCustom ? endpoint : "");
+  return synthesizeOpenAiSpeech(baseUrl, apiKey, model, voice, input, isCustom ? endpoint : "", signal);
 }
 
 function parseClientConfig(raw: unknown): ClientConfig | undefined {
@@ -1385,78 +1441,12 @@ function directSearchReply(search: any): string {
   return "";
 }
 
-function extractWeatherTiming(query: string): string {
-  return String(query || "").match(/后天|明天|今天|今日/)?.[0] || "";
-}
-
-function isClearlyNotWeatherLocation(rawText: string, location: string): boolean {
-  const raw = String(rawText || "").replace(/\s+/g, " ").trim();
-  const value = String(location || "").trim();
-  const text = `${raw} ${value}`;
-  if (/^(这里|那里|这边|那边|本地|附近|谢谢|多谢|好的|好啦|知道了|明白了|不用了|不用|算了|可以|行吧|行了|为什么|怎么了|是吗|真的|没事|没问题)$/.test(value)) return true;
-  if (/^(我|我们|咱|咱们|你|你们|他|他们|她|她们|它|它们)/.test(value)) return true;
-  if (/(聊天|聊聊|闲聊|说话|讲故事|故事|笑话|解闷|陪我|解释|翻译|总结|代码|图片|照片|语音|音乐|播放|打开|关闭|设置|提醒|闹钟|教我|学习|继续|停止|开始)/.test(text)) return true;
-  if (/(为什么|怎么|如何|能不能|可不可以|要不要|需要|想要|我要|帮我|麻烦|请你)/.test(text)) return true;
-  return false;
-}
-
-function isLikelyWeatherFollowupLocation(rawText: string, location: string): boolean {
-  const raw = String(rawText || "").replace(/\s+/g, " ").trim();
-  const value = String(location || "").trim();
-  if (!raw || raw.length > 30 || value.length < 2) return false;
-  if (isClearlyNotWeatherLocation(rawText, value)) return false;
-  if (!/^[\p{Script=Han}A-Za-z·\-\s]+$/u.test(value)) return false;
-  return true;
-}
-
 function contextualSearchIntent(messages: ChatMessage[]): string {
   const userTexts = (Array.isArray(messages) ? messages : [])
     .filter((message) => message?.role === "user")
     .map((message) => extractTextContent(message.content))
     .filter(Boolean);
-  const current = userTexts.at(-1) || "";
-  if (!current) return "";
-  const previousTexts = userTexts.slice(0, -1);
-  let weatherAnchorIndex = -1;
-  for (let index = previousTexts.length - 1; index >= 0; index -= 1) {
-    if (isWeatherQuery(previousTexts[index])) {
-      weatherAnchorIndex = index;
-      break;
-    }
-  }
-  if (weatherAnchorIndex < 0) return current;
-
-  const currentLocation = extractWeatherLocation(current);
-  const currentTiming = extractWeatherTiming(current);
-  const weatherAnchor = previousTexts[weatherAnchorIndex];
-  let previousTiming = extractWeatherTiming(weatherAnchor);
-  let previousLocation = extractWeatherLocation(weatherAnchor);
-  for (const followup of previousTexts.slice(weatherAnchorIndex + 1)) {
-    const followupLocation = extractWeatherLocation(followup);
-    const followupTiming = extractWeatherTiming(followup);
-    if (isLikelyWeatherFollowupLocation(followup, followupLocation)) {
-      previousLocation = followupLocation;
-      if (followupTiming) previousTiming = followupTiming;
-      continue;
-    }
-    if (followupTiming) {
-      previousTiming = followupTiming;
-      continue;
-    }
-    return current;
-  }
-
-  if (isWeatherQuery(current)) {
-    if (!currentLocation && previousLocation) return `${previousLocation} ${currentTiming || previousTiming} 天气`.replace(/\s+/g, " ").trim();
-    return current;
-  }
-  if (isLikelyWeatherFollowupLocation(current, currentLocation)) {
-    return `${currentLocation} ${currentTiming || previousTiming} 天气`.replace(/\s+/g, " ").trim();
-  }
-  if (currentTiming) {
-    return `${previousLocation ? `${previousLocation} ` : ""}${currentTiming} 天气`.replace(/\s+/g, " ").trim();
-  }
-  return current;
+  return contextualSearchIntentFromTexts(userTexts);
 }
 
 function looksLikeNoWebReply(text: string): boolean {
@@ -1470,6 +1460,7 @@ async function fallbackServerSearchAnswer(
   messages: ChatMessage[],
   userText: string,
   explicitSearch: boolean,
+  signal?: AbortSignal,
 ): Promise<{ reply: string; webSearch: Record<string, unknown> }> {
   const search = await runWebSearch({
     query: userText,
@@ -1505,6 +1496,7 @@ ${formatSearchContext(search)}
     cfg.temperature,
     cfg.llm.apiType,
     cfg.llm.endpoint,
+    signal,
   );
   return { reply, webSearch };
 }
@@ -1540,7 +1532,7 @@ async function prepareChat(body: ChatRequestBody, env: Env): Promise<PreparedCha
   let systemPrompt = cfg.systemPrompt;
   let directReply = "";
   const explicitSearch = isExplicitSearchRequest(intentText) || isExplicitSearchRequest(userText);
-  const weatherIntent = isWeatherQuery(intentText);
+  const weatherIntent = isWeatherLookupRequest(intentText);
   const realtimeIntent = isRealtimeQuery(intentText);
   const autoSearchIntent = shouldAutoSearch(intentText);
   const serverSearchIntent = realtimeIntent || explicitSearch || (Boolean(cfg.webSearchEnabled) && autoSearchIntent);
@@ -1633,7 +1625,7 @@ async function handleChat(req: Request, env: Env): Promise<Response> {
     return json({ ok: true, reply: prepared.directReply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: prepared.webSearch });
   }
   if (prepared.useFunctionTools) {
-    const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages);
+    const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages, req.signal);
     return json({ ok: true, reply: result.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: result.webSearch, toolActions: result.toolActions, toolUsage: result.toolUsage });
   }
   const reply = await chatCompletions(
@@ -1645,9 +1637,10 @@ async function handleChat(req: Request, env: Env): Promise<Response> {
     prepared.cfg.temperature,
     prepared.cfg.llm.apiType,
     prepared.cfg.llm.endpoint,
+    req.signal,
   );
   if (prepared.useResponsesTools && shouldAutoSearch(prepared.intentText) && looksLikeNoWebReply(reply)) {
-    const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch);
+    const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch, req.signal);
     return json({ ok: true, reply: fallback.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: fallback.webSearch });
   }
 
@@ -1669,24 +1662,32 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
   const prepared = await prepareChat(body, env);
   if (prepared instanceof Response) return prepared;
 
+  const upstreamController = new AbortController();
+  let canceled = false;
+  const abortUpstream = () => upstreamController.abort();
+  if (req.signal.aborted) abortUpstream();
+  else req.signal.addEventListener("abort", abortUpstream, { once: true });
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let reply = "";
       let doneWebSearch = prepared.webSearch;
       let doneToolActions: Record<string, unknown>[] = [];
       let doneToolUsage: string[] = [];
+      const enqueue = (event: string, data: unknown) => {
+        if (!canceled && !upstreamController.signal.aborted) controller.enqueue(encodeSse(event, data));
+      };
       try {
-        controller.enqueue(encodeSse("ready", { ok: true }));
+        enqueue("ready", { ok: true });
         if (prepared.directReply) {
           reply = prepared.directReply;
-          controller.enqueue(encodeSse("delta", { text: reply }));
+          enqueue("delta", { text: reply });
         } else if (prepared.useFunctionTools) {
-          const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages);
+          const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages, upstreamController.signal);
           reply = result.reply;
           doneWebSearch = result.webSearch;
           doneToolActions = result.toolActions;
           doneToolUsage = result.toolUsage;
-          controller.enqueue(encodeSse("delta", { text: reply }));
+          enqueue("delta", { text: reply });
         } else if (prepared.useResponsesTools && shouldAutoSearch(prepared.intentText)) {
           reply = await chatCompletions(
             prepared.cfg.llm.baseUrl,
@@ -1697,13 +1698,14 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
             prepared.cfg.temperature,
             prepared.cfg.llm.apiType,
             prepared.cfg.llm.endpoint,
+            upstreamController.signal,
           );
           if (looksLikeNoWebReply(reply)) {
-            const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch);
+            const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch, upstreamController.signal);
             reply = fallback.reply;
             doneWebSearch = fallback.webSearch;
           }
-          controller.enqueue(encodeSse("delta", { text: reply }));
+          enqueue("delta", { text: reply });
         } else if (messagesHaveVision(prepared.finalMessages)) {
           reply = await chatCompletions(
             prepared.cfg.llm.baseUrl,
@@ -1714,8 +1716,9 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
             prepared.cfg.temperature,
             prepared.cfg.llm.apiType,
             prepared.cfg.llm.endpoint,
+            upstreamController.signal,
           );
-          controller.enqueue(encodeSse("delta", { text: reply }));
+          enqueue("delta", { text: reply });
         } else {
           reply = await streamChatCompletions(
             prepared.cfg.llm.baseUrl,
@@ -1728,16 +1731,23 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
             prepared.cfg.llm.endpoint,
             (text) => {
               reply += text;
-              controller.enqueue(encodeSse("delta", { text }));
+              enqueue("delta", { text });
             },
+            upstreamController.signal,
           );
         }
-        controller.enqueue(encodeSse("done", { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: doneWebSearch, toolActions: doneToolActions, toolUsage: doneToolUsage }));
+        enqueue("done", { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: doneWebSearch, toolActions: doneToolActions, toolUsage: doneToolUsage });
       } catch (err: any) {
-        controller.enqueue(encodeSse("error", { error: String(err?.message || err), partial: reply }));
+        if (!canceled && !upstreamController.signal.aborted) enqueue("error", { error: String(err?.message || err), partial: reply });
       } finally {
-        controller.close();
+        req.signal.removeEventListener("abort", abortUpstream);
+        if (!canceled) controller.close();
       }
+    },
+    cancel() {
+      canceled = true;
+      abortUpstream();
+      req.signal.removeEventListener("abort", abortUpstream);
     },
   });
 
@@ -1820,7 +1830,7 @@ async function handleAsr(req: Request, env: Env): Promise<Response> {
   }
 
   try {
-    const text = await transcribe(cfg.stt.baseUrl, cfg.stt.apiKey, cfg.stt.model, file, cfg.stt.apiType, cfg.stt.endpoint);
+    const text = await transcribe(cfg.stt.baseUrl, cfg.stt.apiKey, cfg.stt.model, file, cfg.stt.apiType, cfg.stt.endpoint, req.signal);
     return json({ ok: true, text, model: cfg.stt.model, bytes: file.size });
   } catch (err: any) {
     return json({ ok: false, error: String(err?.message || err) }, 502);
@@ -1853,7 +1863,7 @@ async function handleTts(req: Request, env: Env): Promise<Response> {
   }
 
   try {
-    return await synthesize(cfg.tts.baseUrl, cfg.tts.apiKey, cfg.tts.model, cfg.tts.voice, text.slice(0, 800), cfg.tts.apiType, cfg.tts.endpoint);
+    return await synthesize(cfg.tts.baseUrl, cfg.tts.apiKey, cfg.tts.model, cfg.tts.voice, text.slice(0, 800), cfg.tts.apiType, cfg.tts.endpoint, req.signal);
   } catch (err: any) {
     const message = String(err?.message || err || "").trim();
     return json({
@@ -1864,27 +1874,64 @@ async function handleTts(req: Request, env: Env): Promise<Response> {
   }
 }
 
+function createSilentWav(durationMs = 250): Uint8Array {
+  const sampleRate = 16000;
+  const samples = Math.max(1, Math.round(sampleRate * durationMs / 1000));
+  const dataSize = samples * 2;
+  const bytes = new Uint8Array(44 + dataSize);
+  const view = new DataView(bytes.buffer);
+  const writeAscii = (offset: number, value: string) => {
+    for (let i = 0; i < value.length; i += 1) bytes[offset + i] = value.charCodeAt(i);
+  };
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, dataSize, true);
+  return bytes;
+}
+
+async function testTranscriptionProvider(cfg: ReturnType<typeof resolveProviders>, signal: AbortSignal): Promise<{ text: string; bytes: number }> {
+  if (!cfg.stt.apiKey) throw new Error("缺少语音识别 API Key");
+  if (!cfg.stt.baseUrl) throw new Error("缺少语音识别 Base URL");
+  if (!cfg.stt.model) throw new Error("缺少语音识别 Model");
+  const isCustom = normalizeApiType(cfg.stt.apiType, "auto") === "custom";
+  if (isCustom && !cfg.stt.endpoint) throw new Error("缺少自定义语音识别接口地址");
+  const endpointUrl = resolveCustomEndpoint(cfg.stt.baseUrl, isCustom ? cfg.stt.endpoint : "", "audio/transcriptions");
+  const wav = createSilentWav();
+  const file = new File([wav], "connection-test.wav", { type: "audio/wav" });
+  const tested = await transcribeOnce(endpointUrl, cfg.stt.apiKey, cfg.stt.model, file, false, signal);
+  if (tested.status < 200 || tested.status >= 300) throw new Error(tested.error || `HTTP ${tested.status}`);
+  return { text: tested.text, bytes: wav.byteLength };
+}
+
 async function handleTest(req: Request, env: Env): Promise<Response> {
-  let body: { config?: ClientConfig } = {};
+  let body: { config?: ClientConfig };
   try {
     body = (await req.json()) as { config?: ClientConfig };
   } catch {
-    // empty body ok
+    return badRequest("Invalid JSON body");
   }
 
   const cfg = resolveProviders(env, parseClientConfig(body.config));
   const result: Record<string, unknown> = {
-    ok: true,
+    ok: false,
     llm: { baseUrl: cfg.llm.baseUrl, model: cfg.llm.model, apiType: cfg.llm.apiType, endpoint: cfg.llm.endpoint, hasKey: Boolean(cfg.llm.apiKey) },
     stt: { baseUrl: cfg.stt.baseUrl, model: cfg.stt.model, apiType: cfg.stt.apiType, endpoint: cfg.stt.endpoint, hasKey: Boolean(cfg.stt.apiKey) },
-    tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, endpoint: cfg.tts.endpoint, hasKey: Boolean(cfg.tts.apiKey) },
+    tts: { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, endpoint: cfg.tts.endpoint, hasKey: Boolean(cfg.tts.apiKey), enabled: cfg.ttsEnabled },
   };
-
-  if (!cfg.llm.apiKey) {
-    return json({ ...result, ok: false, error: "未配置 API Key" }, 401);
-  }
+  const failures: string[] = [];
 
   try {
+    if (!cfg.llm.apiKey) throw new Error("缺少大模型 API Key");
     const reply = await chatCompletions(
       cfg.llm.baseUrl,
       cfg.llm.apiKey,
@@ -1893,17 +1940,50 @@ async function handleTest(req: Request, env: Env): Promise<Response> {
         { role: "system", content: "你是测试助手，只回复：连接成功。" },
         { role: "user", content: "ping" },
       ],
-      20,
+      256,
       0,
       cfg.llm.apiType,
       cfg.llm.endpoint,
+      req.signal,
     );
     result.llmTest = { ok: true, reply };
   } catch (err: any) {
-    return json({ ...result, ok: false, llmTest: { ok: false, error: String(err?.message || err) } }, 502);
+    if (req.signal.aborted) throw err;
+    const error = String(err?.message || err);
+    result.llmTest = { ok: false, error };
+    failures.push(`LLM：${error}`);
   }
 
-  return json(result);
+  try {
+    const stt = await testTranscriptionProvider(cfg, req.signal);
+    result.sttTest = { ok: true, ...stt };
+  } catch (err: any) {
+    if (req.signal.aborted) throw err;
+    const error = String(err?.message || err);
+    result.sttTest = { ok: false, error };
+    failures.push(`STT：${error}`);
+  }
+
+  if (!cfg.ttsEnabled) {
+    result.ttsTest = { ok: true, skipped: true, reason: "在线 TTS 已关闭" };
+  } else {
+    try {
+      if (!cfg.tts.apiKey) throw new Error("缺少语音合成 API Key");
+      const audio = await synthesize(cfg.tts.baseUrl, cfg.tts.apiKey, cfg.tts.model, cfg.tts.voice, "连接测试", cfg.tts.apiType, cfg.tts.endpoint, req.signal);
+      const bytes = (await audio.arrayBuffer()).byteLength;
+      if (!bytes) throw new Error("语音合成没有返回音频数据");
+      result.ttsTest = { ok: true, bytes, contentType: audio.headers.get("content-type") || "audio/mpeg" };
+    } catch (err: any) {
+      if (req.signal.aborted) throw err;
+      const error = String(err?.message || err);
+      result.ttsTest = { ok: false, error };
+      failures.push(`TTS：${error}`);
+    }
+  }
+
+  result.ok = failures.length === 0;
+  if (failures.length) result.error = failures.join("；");
+  return json(result, failures.length ? 502 : 200);
 }
 
 // The API proxies to whatever Base URL / endpoint the browser sends, so it must
@@ -1912,10 +1992,11 @@ async function handleTest(req: Request, env: Env): Promise<Response> {
 // the proxy. No CORS headers are emitted anywhere, by design.
 function crossOriginRefusal(request: Request, url: URL): string {
   const origin = request.headers.get("origin");
-  if (!origin || origin === "null") return "";
-  let originHost = "";
-  try { originHost = new URL(origin).host; } catch { return `拒绝请求：无法解析的 Origin "${origin}"。`; }
-  if (originHost !== url.host) return `拒绝跨站请求：Origin "${origin}" 与本服务 "${url.host}" 不同源。`;
+  if (!origin) return "";
+  if (origin === "null") return "拒绝请求：不接受 Origin: null。请从本服务页面发起请求。";
+  let callerOrigin = "";
+  try { callerOrigin = new URL(origin).origin; } catch { return `拒绝请求：无法解析的 Origin "${origin}"。`; }
+  if (callerOrigin !== url.origin) return `拒绝跨站请求：Origin "${origin}" 与本服务 "${url.origin}" 不同源。`;
   return "";
 }
 

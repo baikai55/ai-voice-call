@@ -2118,14 +2118,25 @@ async function testConnection() {
         systemPrompt: draft.systemPrompt,
         maxTokens: draft.maxTokens,
         temperature: draft.temperature,
+        ttsEnabled: draft.ttsEnabled,
       },
     }),
   });
   const data = await res.json().catch(() => ({}));
+  const testSummary = [
+    ["LLM", data.llmTest],
+    ["STT", data.sttTest],
+    ["TTS", data.ttsTest],
+  ].map(([label, test]) => {
+    if (test?.skipped) return `${label} 已跳过`;
+    if (test?.ok) return `${label} 成功`;
+    const detail = String(test?.error || "未完成").slice(0, 160);
+    return `${label} 失败（${detail}）`;
+  }).join("；");
   if (!res.ok || !data.ok) {
-    throw new Error(data.error || data?.llmTest?.error || `HTTP ${res.status}`);
+    throw new Error(testSummary || data.error || `HTTP ${res.status}`);
   }
-  setSettingsStatus(`连接成功：${data.llmTest?.reply || "OK"}（模型 ${data.llm?.model || draft.llm.model}）`);
+  setSettingsStatus(`连接测试完成：${testSummary}`);
 }
 
 function explainFetchError(err) {
@@ -2135,7 +2146,7 @@ function explainFetchError(err) {
     return "等待超时。可能是模型太慢、联网搜索卡住，或本地服务无响应。请重试，或在本地配置里先关掉联网搜索";
   }
   if (/failed to fetch/i.test(msg) || /networkerror/i.test(msg) || /load failed/i.test(msg)) {
-    return "连不上本地服务。请双击一键启动.cmd，确认服务已启动；电脑用 http://127.0.0.1:8787，手机录音请用 https://电脑IP:8788";
+    return "连不上服务。本地使用请确认一键启动.cmd 正在运行；手机录音请打开已部署的 Cloudflare HTTPS 地址";
   }
   return msg;
 }
@@ -2166,13 +2177,13 @@ function micUnsupportedHint() {
   const wechat = isWeChatBrowser();
   const insecure = isInsecureContext();
   if (wechat && insecure) {
-    return "微信内用 HTTP 不能录音。请：1) 右上角···→在浏览器打开 2) 地址改成 https://你的电脑IP:8788";
+    return "微信内用 HTTP 不能录音。请点右上角···→在浏览器打开，并访问已部署的 Cloudflare HTTPS 地址";
   }
   if (wechat) {
     return "微信内置浏览器录音受限。请点右上角···→在浏览器打开后再按住说话";
   }
   if (insecure) {
-    return "当前是 HTTP 局域网地址，浏览器禁止麦克风。请用 https://电脑IP:8788 打开（首次点继续访问）";
+    return "当前 HTTP 地址不能使用麦克风，请改用已部署的 Cloudflare HTTPS 地址";
   }
   return "当前浏览器不支持录音，请用系统浏览器（Chrome/Safari）打开";
 }
@@ -2202,7 +2213,7 @@ function cameraPermissionHint(err) {
   if (name === "NotFoundError") return "未找到可用摄像头";
   if (name === "NotReadableError") return "摄像头被占用，请关闭其他相机或视频应用";
   if (name === "OverconstrainedError") return "当前设备不支持所选摄像头，请尝试切换镜头";
-  if (isInsecureContext()) return "当前地址不能使用摄像头，请改用 https://电脑IP:8788";
+  if (isInsecureContext()) return "当前地址不能使用摄像头，请改用已部署的 Cloudflare HTTPS 地址";
   if (!ensureMediaDevices()) return "当前浏览器不支持摄像头，请使用 Chrome 或 Safari";
   return "无法打开摄像头：" + msg;
 }
@@ -3683,8 +3694,8 @@ async function initDefaults() {
       : "请先点右上角「设置」填写 API");
   } else if (isInsecureContext()) {
     setStatus(isWeChatBrowser()
-      ? "微信HTTP不能录音：···→在浏览器打开，并用 https://电脑IP:8788"
-      : "当前HTTP不能录音，请用 https://电脑IP:8788（手机录音需要HTTPS）");
+      ? "微信 HTTP 不能录音：请在系统浏览器打开已部署的 Cloudflare HTTPS 地址"
+      : "当前 HTTP 地址不能录音，请使用已部署的 Cloudflare HTTPS 地址");
   } else {
     setStatus("点右上角电话可连续通话；也可按住麦克风说话");
   }

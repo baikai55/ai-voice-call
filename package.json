@@ -11,11 +11,12 @@
     "start": "node local-server.mjs",
     "deploy": "wrangler deploy",
     "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs",
     "lan-ip": "node scripts/print-lan-ip.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260722.1",
     "typescript": "^5.8.2",
-    "wrangler": "^4.114.0"
+    "wrangler": "^4.122.0"
   }
 }

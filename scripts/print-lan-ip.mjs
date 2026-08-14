@@ -1,5 +1,6 @@
 import { networkInterfaces } from "node:os";
 const port = process.env.PORT || "8787";
+const host = process.env.HOST || "127.0.0.1";
 const nets = networkInterfaces();
 const ips = [];
 for (const name of Object.keys(nets)) {
@@ -10,23 +11,10 @@ for (const name of Object.keys(nets)) {
     }
   }
 }
-console.log("Open on your phone (same WiFi):");
-if (!ips.length) console.log("- No LAN IPv4 found");
-for (const item of ips) console.log(`- ${item.name}: http://${item.address}:${port}`);
-console.log("");
 console.log(`PC local: http://127.0.0.1:${port}`);
-console.log("Note: text chat works over LAN HTTP; microphone may need HTTPS on some phones.");
-
-// hint for phone mic
-try {
-  const { networkInterfaces } = await import("node:os");
-  const nets = networkInterfaces();
-  console.log("Phone mic (HTTPS):");
-  for (const list of Object.values(nets)) {
-    for (const n of list || []) {
-      if (n && (n.family === "IPv4" || n.family === 4) && !n.internal) {
-        console.log("  https://" + n.address + ":8788");
-      }
-    }
-  }
-} catch {}
+if (!["127.0.0.1", "localhost", "::1"].includes(host)) {
+  console.log("LAN HTTP (HOST is explicitly enabled):");
+  if (!ips.length) console.log("- No LAN IPv4 found");
+  for (const item of ips) console.log(`- ${item.name}: http://${item.address}:${port}`);
+}
+console.log("Phone microphone: use the deployed Cloudflare HTTPS address.");

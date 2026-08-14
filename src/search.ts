@@ -1,3 +1,20 @@
+// 意图判定全部来自 src/intent.mjs，本地服务也引同一份，避免两边分头修改后跑偏。
+import { cleanText, extractWeatherLocation, isWeatherLookupRequest, normalizeSearchQuery } from "./intent.mjs";
+
+export {
+  contextualSearchIntentFromTexts,
+  extractWeatherLocation,
+  extractWeatherTiming,
+  isExplicitSearchRequest,
+  isLikelyWeatherFollowupLocation,
+  isPlausiblePlaceName,
+  isRealtimeQuery,
+  isWeatherLookupRequest,
+  isWeatherQuery,
+  shouldAutoSearch,
+  shouldUseFunctionTools,
+} from "./intent.mjs";
+
 export type SearchItem = {
   title: string;
   snippet: string;
@@ -14,16 +31,40 @@ export type SearchResult = {
 };
 
 function clean(text: string): string {
-  return String(text || "").replace(/\s+/g, " ").trim();
+  return cleanText(text);
 }
 
 const SEARCH_TIMEOUT_MS = 7000;
 
-async function fetchWithTimeout(url: string, init: RequestInit, ms = SEARCH_TIMEOUT_MS): Promise<Response> {
+function assertSafeSearchUrl(rawUrl: string): string {
+  let url: URL;
+  try { url = new URL(rawUrl); } catch { throw new Error("搜索接口地址无效"); }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("搜索接口只允许 http:// 或 https:// 地址");
+  if (url.username || url.password) throw new Error("搜索接口地址不能包含用户名或密码");
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").split("%")[0];
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".home.arpa")) {
+    throw new Error("搜索接口不能指向本机或局域网地址");
+  }
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (ipv4) {
+    const [a, b, c, d] = ipv4.slice(1).map(Number);
+    const blocked = [a, b, c, d].some((part) => part < 0 || part > 255) || a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 0 && (c === 0 || c === 2)) || (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) || (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113);
+    if (blocked) throw new Error("搜索接口不能指向本机、局域网或保留地址");
+  }
+  if (host === "::" || host === "::1" || /^f[cd]/.test(host) || /^fe[89ab]/.test(host) || /^ff/.test(host) || /^2001:db8(?::|$)/.test(host)) {
+    throw new Error("搜索接口不能指向本机、局域网或保留地址");
+  }
+  return url.toString();
+}
+
+async function fetchWithTimeout(rawUrl: string, init: RequestInit, ms = SEARCH_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    return await fetch(assertSafeSearchUrl(rawUrl), { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -34,102 +75,6 @@ function truncate(text: string, max = 180): string {
   return t.length > max ? `${t.slice(0, max)}…` : t;
 }
 
-// Topics that on their own imply a live-data lookup.
-const REALTIME_KEYS = [
-  "天气", "气温", "下雨", "下雪", "台风", "空气质量", "新闻", "头条", "热点", "热搜",
-  "股价", "股票", "行情", "汇率", "油价", "金价", "黄金", "白银", "银价", "比特币", "btc", "eth",
-  "比分", "赛程", "谁赢了", "开奖", "中奖", "航班", "火车", "高铁", "路况", "限行",
-  "放假", "门票", "影讯", "房价", "疫情", "多少钱", "票价",
-  "weather", "news", "stock", "price",
-];
-
-// Words that only imply a lookup when paired with a topic — "今天" on its own
-// also matches "今天我有点累", which must not cost a search round-trip.
-const TIME_HINT_KEYS = ["今天", "今日", "现在", "最新", "实时", "目前", "当前", "刚刚", "最近", "本周", "本月", "今年", "几点", "日期", "today"];
-
-// Personal / conversational turns never auto-search, even phrased as questions.
-// "最近怎么样" reads as a time hint plus "怎么样" below, so the small-talk
-// phrasings of it have to be listed here explicitly.
-const CHITCHAT_RE =
-  /(你好|您好|你是谁|你叫什么|讲个|故事|笑话|陪我|聊天|聊聊|闲聊|解闷|谢谢|再见|辛苦|心情|想你|安慰|鼓励|帮我写|帮我改|翻译|总结|解释|代码|提醒|闹钟|我想|我要|怎么办|你觉得|你认为|你能|你会|好不好|行不行|你怎么样|过得怎么样|最近怎么样)/;
-
-export function shouldAutoSearch(userText: string): boolean {
-  const q = clean(userText);
-  if (!q) return false;
-  if (q.length < 2) return false;
-  const lower = q.toLowerCase();
-  if (isExplicitSearchRequest(q)) return true;
-
-  // An unambiguous live-data topic is enough on its own.
-  if (REALTIME_KEYS.some((k) => lower.includes(k.toLowerCase()))) return true;
-
-  // Everything below is a weak signal, so conversational turns opt out first.
-  if (CHITCHAT_RE.test(q)) return false;
-
-  if (TIME_HINT_KEYS.some((k) => lower.includes(k.toLowerCase())) && /(多少|价格|情况|怎么样|排名|结果|数据|行情|榜)/.test(q)) {
-    return true;
-  }
-
-  // Third-party facts, whether or not they carry a question particle:
-  // "谁得了冠军" yes, "你能帮我吗" no. A bare question particle is not enough
-  // on its own — it has to be asking about something outside this conversation.
-  const asksThirdPartyFact = /(哪里|哪个|哪家|谁|何时|几号|多少钱|排名|在哪|怎么去)/.test(q);
-  if (/[?？]$/.test(q) || /(吗|呢|啥)/.test(q) || asksThirdPartyFact) {
-    if (/^(我|我们|咱|咱们|你|你们)/.test(q)) return false;
-    if (asksThirdPartyFact) return true;
-  }
-  return false;
-}
-
-
-export function isExplicitSearchRequest(userText: string): boolean {
-  const q = clean(userText);
-  return [/搜一下/, /搜索/, /帮我搜/, /查一下/, /查一查/, /帮我查/, /联网/, /网上/, /上网/, /百度/, /谷歌/i, /google/i].some((re) => re.test(q));
-}
-
-function stripSearchCommandWords(text: string): string {
-  let q = clean(text);
-  q = q.replace(/^(请|麻烦|帮我|你帮我|给我|可以帮我)?\s*(联网|上网|网上|百度|谷歌|google)?\s*(搜一下|搜索一下|搜索|查一下|查一查|查询一下|查询|查查|搜搜|看一下|看看)\s*/i, "");
-  q = q.replace(/^(请|麻烦|帮我|你帮我|给我|可以帮我)?\s*(搜|查)\s*/i, "");
-  q = q.replace(/^(一下|一下一下)\s*/, "");
-  return clean(q).replace(/^[，,。.!！?？：:\s]+|[，,。.!！?？：:\s]+$/g, "");
-}
-
-function normalizeSearchQuery(userText: string): string {
-  let q = stripSearchCommandWords(userText).slice(0, 120);
-  if (!q) q = clean(userText).slice(0, 120);
-  q = q.replace(/(今天|今日|明天|后天)的天[。.!！?？]*$/g, "$1的天气");
-  q = q.replace(/(今天|今日|明天|后天)天[。.!！?？]*$/g, "$1天气");
-  if (/天气|气温|下雨|下雪|降雨|降雪|空气质量|台风|雾霾/.test(q)) return `${q} 实时天气 天气预报 气温 降水`;
-  if (/黄金|金价/.test(q)) return `${q} 今日 实时 金价 人民币 国际金价`;
-  if (/白银|银价/.test(q)) return `${q} 今日 实时 银价`;
-  if (/比特币|btc/i.test(q)) return `${q} 今日 实时 价格`;
-  return q;
-}
-export function isWeatherQuery(query: string): boolean {
-  return /天气|气温|下雨|下雪|降雨|降雪|空气质量|台风|雾霾|weather/i.test(String(query || ""));
-}
-
-export function isRealtimeQuery(userText: string): boolean {
-  const q = clean(userText);
-  if (!q) return false;
-  if (isWeatherQuery(q)) return true;
-  return /新闻|头条|热点|热搜|最新|实时|股价|股票行情|行情|价格|汇率|油价|金价|银价|黄金|白银|比特币|btc|eth|比分|赛程|航班|火车|高铁|路况|限行|放假|门票|影讯|开奖|疫情/i.test(q);
-}
-function normalizeWeatherSpeech(text: string): string {
-  return clean(text)
-    .replace(/(今天|今日|明天|后天)的天[。.!！?？]*$/g, "$1的天气")
-    .replace(/(今天|今日|明天|后天)天[。.!！?？]*$/g, "$1天气");
-}
-export function extractWeatherLocation(query: string): string {
-  let q = normalizeWeatherSpeech(stripSearchCommandWords(query));
-  q = q.replace(/(今天|今日|明天|后天|现在|当前|实时|最近|这会儿|此刻)/g, "");
-  q = q.replace(/(的)?(天气预报|天气|气温|温度|下雨吗|会下雨吗|下雨|下雪吗|会下雪吗|下雪|降雨|降雪|空气质量|台风|雾霾|预报)/g, "");
-  q = q.replace(/(怎么样|如何|怎样|多少|几度|有雨吗|冷不冷|热不热)/g, "");
-  q = q.replace(/[，,。.!！?？：:\s]/g, "").replace(/(?:呢|呀|啊|吧|嘛|吗|么)+$/g, "").trim();
-  q = q.replace(/^(嗯|哦|噢|喔|啊|额|呃|那|那么|还有|再查查|再看看|查查|看看|查|搜|搜搜|换成|改成|换|到|去)+/g, "").trim();
-  return q.slice(0, 40);
-}
 function pickWeatherDesc(current: any): string {
   const raw = current?.lang_zh?.[0]?.value || current?.weatherDesc?.[0]?.value || "";
   const key = String(raw).trim().toLowerCase();
@@ -345,7 +290,7 @@ export async function runWebSearch(opts: {
   const baseUrl = (opts.baseUrl || "").trim();
 
   const candidates: Array<() => Promise<SearchResult>> = [];
-  if ((provider === "auto" || provider === "weather") && (isWeatherQuery(rawQuery) || isWeatherQuery(query))) candidates.push(() => searchWeather(rawQuery));
+  if ((provider === "auto" || provider === "weather") && (isWeatherLookupRequest(rawQuery) || isWeatherLookupRequest(query))) candidates.push(() => searchWeather(rawQuery));
 
   if (provider === "tavily" && key) candidates.push(() => searchTavily(query, key));
   if (provider === "serper" && key) candidates.push(() => searchSerper(query, key));

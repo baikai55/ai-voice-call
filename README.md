@@ -28,7 +28,7 @@
 ### 1. 安装
 
 ```powershell
-cd H:\github\ai-voice-call
+cd G:\github\ai-voice-call
 npm install
 ```
 
@@ -49,7 +49,7 @@ npm run dev
 浏览器打开：
 
 - 电脑：`http://127.0.0.1:8787`
-- 手机同一 WiFi：看启动窗口打印的 `http://192.168.x.x:8787`
+- 手机：使用已经部署到 Cloudflare 的 HTTPS 地址
 
 自检：
 
@@ -59,7 +59,7 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
 
 也可以双击 `检查服务.cmd`。
 
-> 说明：手机浏览器录音通常更依赖 HTTPS。如果局域网 HTTP 下麦克风不可用，建议用 Cloudflare HTTPS 地址，或使用项目里的本地证书脚本配置 HTTPS。
+> 说明：本地服务只用于电脑调试，默认仅监听 `127.0.0.1`。手机录音、摄像头和 PWA 请使用 Cloudflare 提供的 HTTPS 地址。
 
 
 ### 手机隐藏浏览器地址栏
@@ -229,7 +229,7 @@ npx wrangler login
 npm run deploy
 ```
 
-部署后仍然在网页「本地配置」里填写 API Key。不要把用户 API Key 配成 Cloudflare Secret；本项目设计为配置和数据都保存在用户浏览器本地。
+命令完成后会打印 `workers.dev` HTTPS 地址，手机请打开这个地址。部署后仍然在网页「本地配置」里填写 API Key。不要把用户 API Key 配成 Cloudflare Secret；本项目设计为配置和数据都保存在用户浏览器本地。
 
 ## 接口
 
@@ -246,15 +246,25 @@ npm run deploy
 
 ### 访问限制
 
-`/api/*` 会把请求转发到你在页面里填的 Base URL / 接口地址，所以它是一个「能访问任意地址」的中转。为避免别的网站在后台调用它，服务端做了两层限制：
+`/api/*` 会把请求转发到你在页面里填的 Base URL / 接口地址。为避免它被当成跨站或内网请求中转，服务端做了以下限制：
 
-- **不再返回任何 CORS 头**，跨站 `Origin` 一律 403。页面和接口同源，正常使用不受影响。
-- **校验 `Host` 头**：只接受 `localhost` / `127.x` / `10.x` / `192.168.x` / `172.16-31.x` / `169.254.x` 以及对应的 IPv6 本地地址，防止把域名解析到 127.0.0.1 的 DNS rebinding。
+- **本地服务默认只监听 `127.0.0.1`**，不会直接暴露给局域网。
+- **不返回任何 CORS 头**，并按完整协议、主机和端口核对 `Origin`；跨站请求和 `Origin: null` 一律返回 403。
+- **校验 `Host` 头**，避免 DNS rebinding 借本地服务转发请求。
+- **校验上游地址和 DNS 解析结果**，默认拒绝本机、局域网、链路本地和保留地址。Cloudflare Worker 也会拒绝明显的私网地址与本地域名。
 
-如果你用内网穿透、隧道或自定义域名访问本地服务，把那个域名加进环境变量 `ALLOWED_HOSTS`（逗号分隔，不含端口）：
+确实需要让本地服务监听局域网或隧道时，必须显式设置 `HOST`；自定义域名还要加入 `ALLOWED_HOSTS`（逗号分隔，不含端口）：
 
 ```powershell
-set ALLOWED_HOSTS=my-tunnel.example.com,nas.local
+$env:HOST = "0.0.0.0"
+$env:ALLOWED_HOSTS = "my-tunnel.example.com,nas.local"
+npm run dev
+```
+
+可信的本地模型地址会被默认的上游私网保护拦截。仅在确认该机器和页面访问者都可信时临时启用：
+
+```powershell
+$env:ALLOW_PRIVATE_UPSTREAMS = "true"
 npm run dev
 ```
 
@@ -263,7 +273,7 @@ npm run dev
 ## 目录
 
 ```text
-H:\github\ai-voice-call  src\index.ts          Worker 后端
+G:\github\ai-voice-call  src\index.ts          Worker 后端
   src\search.ts         联网搜索
   public\index.html     页面
   public\app.js         前端逻辑

@@ -2,17 +2,37 @@ import http from "node:http";
 import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { networkInterfaces } from "node:os";
+
+// 意图判定与 Cloudflare Worker 共用同一份实现（src/intent.mjs），
+// 避免两边分头修改后本地和线上行为不一致。
+import {
+  contextualSearchIntentFromTexts,
+  extractWeatherLocation,
+  isExplicitSearchRequest,
+  isRealtimeQuery,
+  isWeatherLookupRequest,
+  normalizeSearchQuery,
+  shouldAutoSearch,
+  shouldUseFunctionTools,
+} from "./src/intent.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, "public");
 const PORT = Number(process.env.PORT || 8787);
-const HOST = process.env.HOST || "0.0.0.0";
+const HOST = process.env.HOST || "127.0.0.1";
 
 const DEFAULT_SYSTEM_PROMPT = "你是一个中文 AI 助手。默认使用简体中文，回答清楚、自然、有帮助。优先给出可执行建议，少说空话。根据用户语气调整详略；适合语音朗读时使用短句。涉及医疗、药品、投资、法律等高风险内容时，只提供一般信息，提醒不能替代专业人士。若提供了【联网搜索结果】，请优先依据结果回答，不编造实时数据。不要输出思考过程。";
 
 function env(name, fallback = "") { return String(process.env[name] ?? fallback).trim(); }
+function clampMaxTokens(value, fallback = 512) {
+  const parsed = Number(value);
+  const safe = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(1024, Math.max(256, safe));
+}
 function json(res, status, data) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   res.end(JSON.stringify(data));
@@ -69,13 +89,17 @@ function checkLocalRequest(req) {
     return `拒绝请求：Host 头 "${req.headers.host || ""}" 不是本机/局域网地址。如果你在用隧道或自定义域名，请设置环境变量 ALLOWED_HOSTS。`;
   }
   const origin = req.headers.origin;
-  if (origin && origin !== "null") {
-    let originHost = "";
-    // URL.host drops nothing: it keeps the port and, for IPv6, the brackets
-    // ("[::1]:8787"). Run it through the same hostOnly() as the Host header so
-    // both sides are normalized identically.
-    try { originHost = hostOnly(new URL(origin).host); } catch { return `拒绝请求：无法解析的 Origin "${origin}"。`; }
-    if (originHost !== host) return `拒绝跨站请求：Origin "${origin}" 与本服务 "${host}" 不同源。`;
+  if (origin) {
+    if (origin === "null") return "拒绝请求：不接受 Origin: null。请从本服务页面发起请求。";
+    let requestOrigin = "";
+    let callerOrigin = "";
+    try {
+      requestOrigin = new URL(`${req.socket?.encrypted ? "https" : "http"}://${req.headers.host}`).origin;
+      callerOrigin = new URL(origin).origin;
+    } catch {
+      return `拒绝请求：无法解析的 Origin "${origin}"。`;
+    }
+    if (callerOrigin !== requestOrigin) return `拒绝跨站请求：Origin "${origin}" 与本服务 "${requestOrigin}" 不同源。`;
   }
   return "";
 }
@@ -109,11 +133,36 @@ function sendFile(res, filePath) {
 }
 function readBody(req, limit = 25 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
-    const chunks = []; let size = 0;
-    req.on("data", (c) => { size += c.length; if (size > limit) { reject(new Error("body too large")); req.destroy(); return; } chunks.push(c); });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
+    const chunks = []; let size = 0; let settled = false;
+    req.on("data", (c) => {
+      if (settled) return;
+      size += c.length;
+      if (size > limit) {
+        settled = true;
+        const err = new Error("请求体过大");
+        err.status = 413;
+        reject(err);
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks));
+    });
     req.on("error", reject);
   });
+}
+async function readJsonBody(req, limit) {
+  const raw = await readBody(req, limit);
+  try {
+    return JSON.parse(raw.toString("utf8") || "{}");
+  } catch {
+    const err = new Error("请求体不是有效的 JSON");
+    err.status = 400;
+    throw err;
+  }
 }
 function parseMultipart(buffer, contentType) {
   const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType || "");
@@ -191,7 +240,7 @@ function resolveConfig(client = {}) {
     tts: { baseUrl: ttsBase, apiKey: pick(client.tts?.apiKey, client.llm?.apiKey), model: pick(client.tts?.model, env("TTS_MODEL"), "FnLP/MOSS-TTSD-v0.5"), voice: pick(client.tts?.voice, env("TTS_VOICE"), "alloy"), apiType: normalizeApiType(client.tts?.apiType, "auto"), endpoint: pick(client.tts?.endpoint) },
     systemPrompt: pick(client.systemPrompt, env("SYSTEM_PROMPT"), DEFAULT_SYSTEM_PROMPT),
     maxHistoryTurns: Number(client.maxHistoryTurns || env("MAX_HISTORY_TURNS") || 12),
-    maxTokens: Math.max(Number(client.maxTokens || env("LLM_MAX_TOKENS") || 512), 256),
+    maxTokens: clampMaxTokens(client.maxTokens || env("LLM_MAX_TOKENS") || 512),
     temperature: Number((client.temperature ?? env("LLM_TEMPERATURE", "0.7")) || 0.7),
     ttsEnabled: client.ttsEnabled !== false,
     toolCallingEnabled: client.toolCallingEnabled !== false,
@@ -202,24 +251,112 @@ function resolveConfig(client = {}) {
     searchBaseUrl: pick(client.searchBaseUrl, env("SEARCH_BASE_URL")),
   };
 }
-function fetchJson(url, options = {}, timeoutMs = 45000) {
+const ALLOW_PRIVATE_UPSTREAMS = env("ALLOW_PRIVATE_UPSTREAMS").toLowerCase() === "true";
+
+function ipv4FromMappedIpv6(address) {
+  const dotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address)?.[1];
+  if (dotted) return dotted;
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(address);
+  if (!hex) return "";
+  const high = Number.parseInt(hex[1], 16);
+  const low = Number.parseInt(hex[2], 16);
+  return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
+}
+
+function isPrivateOrReservedAddress(address) {
+  const value = String(address || "").toLowerCase().replace(/^\[|\]$/g, "").split("%")[0];
+  const mapped = ipv4FromMappedIpv6(value);
+  if (mapped) return isPrivateOrReservedAddress(mapped);
+  const family = isIP(value);
+  if (family === 4) {
+    const [a, b, c] = value.split(".").map(Number);
+    return a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      (a === 198 && b === 51 && c === 100) ||
+      (a === 203 && b === 0 && c === 113);
+  }
+  if (family === 6) {
+    return value === "::" || value === "::1" || /^f[cd]/.test(value) ||
+      /^fe[89ab]/.test(value) || /^ff/.test(value) || /^2001:db8(?::|$)/.test(value);
+  }
+  return false;
+}
+
+async function resolveSafeUpstream(rawUrl) {
+  let url;
+  try { url = new URL(String(rawUrl || "")); } catch { throw new Error("上游接口地址无效"); }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("上游接口只允许 http:// 或 https:// 地址");
+  if (url.username || url.password) throw new Error("上游接口地址不能包含用户名或密码");
+
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!hostname) throw new Error("上游接口地址缺少主机名");
+  const localName = hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") || hostname.endsWith(".internal") || hostname.endsWith(".home.arpa");
+  let addresses;
+  if (isIP(hostname)) addresses = [{ address: hostname, family: isIP(hostname) }];
+  else {
+    try { addresses = await lookup(hostname, { all: true, verbatim: true }); }
+    catch (err) { throw new Error(`无法解析上游接口主机 ${hostname}: ${err.message || err}`); }
+  }
+  if (!addresses.length) throw new Error(`无法解析上游接口主机 ${hostname}`);
+  if (!ALLOW_PRIVATE_UPSTREAMS && (localName || addresses.some((item) => isPrivateOrReservedAddress(item.address)))) {
+    throw new Error("出于安全原因，供应商接口不能指向本机、局域网或保留地址。可信本地模型可显式设置 ALLOW_PRIVATE_UPSTREAMS=true");
+  }
+  return { url, addresses };
+}
+
+function pinnedLookup(addresses) {
+  return (_hostname, options, callback) => {
+    const opts = typeof options === "object" && options ? options : { family: Number(options) || 0 };
+    const matching = opts.family ? addresses.filter((item) => item.family === opts.family) : addresses;
+    const usable = matching.length ? matching : addresses;
+    if (opts.all) return callback(null, usable);
+    return callback(null, usable[0].address, usable[0].family);
+  };
+}
+
+function makeAbortError(reason = "request aborted") {
+  if (reason instanceof Error) return reason;
+  const err = new Error(String(reason || "request aborted"));
+  err.name = "AbortError";
+  return err;
+}
+
+async function fetchJson(rawUrl, options = {}, timeoutMs = 45000) {
+  const target = await resolveSafeUpstream(rawUrl);
   return new Promise((resolve, reject) => {
     let settled = false;
+    let hardTimer = null;
+    let upstreamReq = null;
+    const signal = options.signal;
+    const onAbort = () => {
+      const err = makeAbortError(signal?.reason);
+      upstreamReq?.destroy(err);
+      done(reject, err);
+    };
     const done = (fn, arg) => {
       if (settled) return;
       settled = true;
       clearTimeout(hardTimer);
+      signal?.removeEventListener("abort", onAbort);
       fn(arg);
     };
-    const u = new URL(url);
+    if (signal?.aborted) return done(reject, makeAbortError(signal.reason));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const u = target.url;
     const lib = u.protocol === "https:" ? https : http;
-    const req = lib.request({
+    upstreamReq = lib.request({
       protocol: u.protocol,
       hostname: u.hostname,
       port: u.port || (u.protocol === "https:" ? 443 : 80),
       path: u.pathname + u.search,
       method: options.method || "GET",
       headers: options.headers || {},
+      lookup: pinnedLookup(target.addresses),
       timeout: timeoutMs,
     }, (res) => {
       const chunks = [];
@@ -233,20 +370,35 @@ function fetchJson(url, options = {}, timeoutMs = 45000) {
       });
       res.on("error", (err) => done(reject, err));
     });
-    const hardTimer = setTimeout(() => {
-      req.destroy();
-      done(reject, new Error("upstream timeout"));
+    hardTimer = setTimeout(() => {
+      const err = new Error("upstream timeout");
+      upstreamReq.destroy(err);
+      done(reject, err);
     }, timeoutMs);
-    req.on("error", (err) => done(reject, err));
-    req.on("timeout", () => {
-      req.destroy();
-      done(reject, new Error("upstream timeout"));
+    upstreamReq.on("error", (err) => done(reject, err));
+    upstreamReq.on("timeout", () => {
+      const err = new Error("upstream timeout");
+      upstreamReq.destroy(err);
+      done(reject, err);
     });
-    if (options.body) req.write(options.body);
-    req.end();
+    if (options.body) upstreamReq.write(options.body);
+    upstreamReq.end();
   });
 }
-function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(makeAbortError(signal.reason));
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(makeAbortError(signal.reason));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 function pickUpstreamErrorMessage(res) {
   const fromJson = String(res?.data?.error?.message || res?.data?.message || "").trim();
   if (fromJson) return fromJson.slice(0, 500);
@@ -270,7 +422,7 @@ async function fetchLlmWithTransientRetry(endpoint, options, timeoutMs, cfg) {
   const msg = pickUpstreamErrorMessage(res);
   if (!res.ok && isTransientAuthError(res.status, msg)) {
     console.log("[llm] transient auth error, retry once", { status: res.status, ...publicLlmConfig(cfg) });
-    await sleep(800);
+    await sleep(800, options.signal);
     res = await fetchJson(endpoint, options, timeoutMs);
   }
   return res;
@@ -434,7 +586,7 @@ function payloadVariants(cfg, messages, kind, stream = false) {
     ? chatPayloadVariants(cfg, messages, stream)
     : [buildResponsesPayload(cfg, messages, stream), buildResponsesPayload(cfg, messages, stream, "web_search_preview")];
 }
-async function chatCompletions(cfg, messages) {
+async function chatCompletions(cfg, messages, signal) {
   const headers = { authorization: `Bearer ${cfg.llm.apiKey}`, "content-type": "application/json" };
   console.log("[llm] config", publicLlmConfig(cfg));
   let lastErr = "LLM failed";
@@ -445,7 +597,7 @@ async function chatCompletions(cfg, messages) {
       const payload = variants[i];
       try {
         console.log("[llm] request", kind, cfg.llm.model, "tokens=", cfg.maxTokens, kind === "responses" ? `tool=${payload.tools?.[0]?.type}` : "");
-        const res = await fetchLlmWithTransientRetry(endpoint, { method: "POST", headers, body: JSON.stringify(payload) }, 35000, cfg);
+        const res = await fetchLlmWithTransientRetry(endpoint, { method: "POST", headers, body: JSON.stringify(payload), signal }, 35000, cfg);
         if (!res.ok) {
           lastErr = formatLlmFailure(res.status, pickUpstreamErrorMessage(res));
           console.log("[llm] fail", kind, res.status, lastErr);
@@ -545,14 +697,6 @@ const TOOL_LABELS = {
   calculate: "计算器",
   create_reminder: "提醒",
 };
-function shouldUseFunctionTools(text) {
-  const value = cleanSearchText(text);
-  if (!value) return false;
-  if (/提醒|闹钟|到时叫我|记得叫我|分钟后|小时后/.test(value)) return true;
-  if (/几点|现在时间|当前时间|日期|几号|星期几|今天星期/.test(value)) return true;
-  if (/计算|算一下|等于多少|[0-9][0-9\s.+\-*/%^()]{2,}/.test(value)) return true;
-  return false;
-}
 function parseToolArguments(raw) {
   if (raw && typeof raw === "object") return raw;
   const text = String(raw || "").trim();
@@ -635,13 +779,13 @@ async function executeFunctionTool(cfg, call) {
   }
   return { content: { ok: false, error: `未知工具: ${name}` } };
 }
-async function fetchChatToolStep(cfg, messages) {
+async function fetchChatToolStep(cfg, messages, signal) {
   const headers = { authorization: `Bearer ${cfg.llm.apiKey}`, "content-type": "application/json" };
   const endpoint = llmEndpoint(cfg, "chat");
   const variants = chatPayloadVariants(cfg, messages, false).map((payload) => ({ ...payload, tools: FUNCTION_TOOLS, tool_choice: "auto" }));
   let lastErr = "LLM tool call failed";
   for (let index = 0; index < variants.length; index++) {
-    const res = await fetchLlmWithTransientRetry(endpoint, { method: "POST", headers, body: JSON.stringify(variants[index]) }, 15000, cfg);
+    const res = await fetchLlmWithTransientRetry(endpoint, { method: "POST", headers, body: JSON.stringify(variants[index]), signal }, 15000, cfg);
     if (!res.ok) {
       lastErr = formatLlmFailure(res.status, pickUpstreamErrorMessage(res));
       if (index < variants.length - 1 && (res.status === 400 || isNoUserQueryError(lastErr))) continue;
@@ -652,13 +796,13 @@ async function fetchChatToolStep(cfg, messages) {
   }
   throw new Error(lastErr);
 }
-async function chatCompletionsWithTools(cfg, messages) {
+async function chatCompletionsWithTools(cfg, messages, signal) {
   const working = [...messages];
   const toolActions = [];
   const toolUsage = [];
   let webSearch = null;
   for (let round = 0; round < 4; round++) {
-    const step = await fetchChatToolStep(cfg, working);
+    const step = await fetchChatToolStep(cfg, working, signal);
     if (!step.toolCalls.length) {
       const reply = cleanAssistantReply(step.text, messages);
       if (!reply) throw new Error("模型完成工具调用后没有返回文字");
@@ -678,7 +822,7 @@ async function chatCompletionsWithTools(cfg, messages) {
       working.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result.content) });
     }
   }
-  const reply = await chatCompletions(cfg, working);
+  const reply = await chatCompletions(cfg, working, signal);
   return { reply, toolActions, toolUsage, webSearch };
 }
 function extractResponseText(data) {
@@ -834,16 +978,75 @@ async function readLlmStreamResponse(res, kind, onDelta) {
   }
   return reply.trim();
 }
-async function fetchLlmStreamOnce(endpoint, options, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(endpoint, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+async function fetchLlmStreamOnce(rawUrl, options, timeoutMs) {
+  const target = await resolveSafeUpstream(rawUrl);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    let upstreamReq = null;
+    const signal = options.signal;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      const err = makeAbortError(signal?.reason);
+      upstreamReq?.destroy(err);
+      if (!settled) {
+        settled = true;
+        cleanup();
+        reject(err);
+      }
+    };
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const u = target.url;
+    const lib = u.protocol === "https:" ? https : http;
+    upstreamReq = lib.request({
+      protocol: u.protocol,
+      hostname: u.hostname,
+      port: u.port || (u.protocol === "https:" ? 443 : 80),
+      path: u.pathname + u.search,
+      method: options.method || "GET",
+      headers: options.headers || {},
+      lookup: pinnedLookup(target.addresses),
+      timeout: timeoutMs,
+    }, (upstreamRes) => {
+      clearTimeout(timer);
+      const headers = new Headers();
+      for (const [name, value] of Object.entries(upstreamRes.headers)) {
+        for (const item of Array.isArray(value) ? value : [value]) if (item != null) headers.append(name, String(item));
+      }
+      const emptyBody = upstreamRes.statusCode === 204 || upstreamRes.statusCode === 304;
+      const response = new Response(emptyBody ? null : Readable.toWeb(upstreamRes), {
+        status: upstreamRes.statusCode || 502,
+        statusText: upstreamRes.statusMessage || "",
+        headers,
+      });
+      settled = true;
+      upstreamRes.once("close", cleanup);
+      resolve(response);
+    });
+    timer = setTimeout(() => {
+      const err = new Error("upstream timeout");
+      upstreamReq.destroy(err);
+      if (!settled) {
+        settled = true;
+        cleanup();
+        reject(err);
+      }
+    }, timeoutMs);
+    upstreamReq.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    });
+    if (options.body) upstreamReq.write(options.body);
+    upstreamReq.end();
+  });
 }
-async function streamChatCompletions(cfg, messages, onDelta) {
+async function streamChatCompletions(cfg, messages, onDelta, signal) {
   const headers = { authorization: `Bearer ${cfg.llm.apiKey}`, "content-type": "application/json" };
   console.log("[llm] config", publicLlmConfig(cfg));
   let lastErr = "LLM failed";
@@ -854,13 +1057,13 @@ async function streamChatCompletions(cfg, messages, onDelta) {
       const payload = variants[i];
       try {
         console.log("[llm] stream", kind, cfg.llm.model, "tokens=", cfg.maxTokens);
-        let res = await fetchLlmStreamOnce(endpoint, { method: "POST", headers, body: JSON.stringify(payload) }, 15000);
+        let res = await fetchLlmStreamOnce(endpoint, { method: "POST", headers, body: JSON.stringify(payload), signal }, 15000);
         if (!res.ok) {
           let errText = await readFetchError(res);
           if (isTransientAuthError(res.status, errText)) {
             console.log("[llm] transient stream auth error, retry once", { status: res.status, ...publicLlmConfig(cfg) });
-            await sleep(800);
-            res = await fetchLlmStreamOnce(endpoint, { method: "POST", headers, body: JSON.stringify(payload) }, 15000);
+            await sleep(800, signal);
+            res = await fetchLlmStreamOnce(endpoint, { method: "POST", headers, body: JSON.stringify(payload), signal }, 15000);
             if (!res.ok) errText = await readFetchError(res);
           }
           if (!res.ok) {
@@ -893,62 +1096,6 @@ function truncateSearchText(text, max = 180) {
   const t = cleanSearchText(text);
   return t.length > max ? t.slice(0, max) + "…" : t;
 }
-// Topics that on their own imply a live-data lookup.
-const REALTIME_KEYS = [
-  "天气", "气温", "下雨", "下雪", "台风", "空气质量", "新闻", "头条", "热点", "热搜",
-  "股价", "股票", "行情", "汇率", "油价", "金价", "黄金", "白银", "银价", "比特币", "btc", "eth",
-  "比分", "赛程", "谁赢了", "开奖", "中奖", "航班", "火车", "高铁", "路况", "限行",
-  "放假", "门票", "影讯", "房价", "疫情", "多少钱", "票价",
-  "weather", "news", "stock", "price",
-];
-
-// Words that only imply a lookup when paired with a topic — "今天" on its own
-// also matches "今天我有点累", which must not cost a search round-trip.
-const TIME_HINT_KEYS = ["今天", "今日", "现在", "最新", "实时", "目前", "当前", "刚刚", "最近", "本周", "本月", "今年", "几点", "日期", "today"];
-
-// Personal / conversational turns never auto-search, even phrased as questions.
-// "最近怎么样" reads as a time hint plus "怎么样" below, so the small-talk
-// phrasings of it have to be listed here explicitly.
-const CHITCHAT_RE =
-  /(你好|您好|你是谁|你叫什么|讲个|故事|笑话|陪我|聊天|聊聊|闲聊|解闷|谢谢|再见|辛苦|心情|想你|安慰|鼓励|帮我写|帮我改|翻译|总结|解释|代码|提醒|闹钟|我想|我要|怎么办|你觉得|你认为|你能|你会|好不好|行不行|你怎么样|过得怎么样|最近怎么样)/;
-
-function shouldAutoSearch(q) {
-  const s = cleanSearchText(q);
-  if (s.length < 2) return false;
-  const lower = s.toLowerCase();
-  if (isExplicitSearchRequest(s)) return true;
-
-  // An unambiguous live-data topic is enough on its own.
-  if (REALTIME_KEYS.some((k) => lower.includes(k.toLowerCase()))) return true;
-
-  // Everything below is a weak signal, so conversational turns opt out first.
-  if (CHITCHAT_RE.test(s)) return false;
-
-  if (TIME_HINT_KEYS.some((k) => lower.includes(k.toLowerCase())) && /(多少|价格|情况|怎么样|排名|结果|数据|行情|榜)/.test(s)) {
-    return true;
-  }
-
-  // Third-party facts, whether or not they carry a question particle:
-  // "谁得了冠军" yes, "你能帮我吗" no. A bare question particle is not enough
-  // on its own — it has to be asking about something outside this conversation.
-  const asksThirdPartyFact = /(哪里|哪个|哪家|谁|何时|几号|多少钱|排名|在哪|怎么去)/.test(s);
-  if (/[?？]$/.test(s) || /(吗|呢|啥)/.test(s) || asksThirdPartyFact) {
-    if (/^(我|我们|咱|咱们|你|你们)/.test(s)) return false;
-    if (asksThirdPartyFact) return true;
-  }
-  return false;
-}
-function stripSearchCommandWords(text) {
-  let q = cleanSearchText(text);
-  q = q.replace(/^(请|麻烦|帮我|你帮我|给我|可以帮我)?\s*(联网|上网|网上|百度|谷歌|google)?\s*(搜一下|搜索一下|搜索|查一下|查一查|查询一下|查询|查查|搜搜|看一下|看看)\s*/i, "");
-  q = q.replace(/^(请|麻烦|帮我|你帮我|给我|可以帮我)?\s*(搜|查)\s*/i, "");
-  q = q.replace(/^(一下|一下一下)\s*/, "");
-  return cleanSearchText(q).replace(/^[，,。.!！?？：:\s]+|[，,。.!！?？：:\s]+$/g, "");
-}
-function isExplicitSearchRequest(q) {
-  const s = cleanSearchText(q);
-  return [/搜一下/, /搜索/, /帮我搜/, /查一下/, /查一查/, /帮我查/, /联网/, /网上/, /上网/, /百度/, /谷歌/i, /google/i].some((re) => re.test(s));
-}
 function directSearchReply(search) {
   if (!search?.ok || !search.items?.length) return "";
   if (search.provider === "weather") {
@@ -958,110 +1105,12 @@ function directSearchReply(search) {
   }
   return "";
 }
-function normalizeSearchQuery(query) {
-  let q = stripSearchCommandWords(query).slice(0, 120);
-  if (!q) q = cleanSearchText(query).slice(0, 120);
-  // 兼容语音识别把“天气”漏成“天”的情况：例如“北京今天的天。”
-  q = q.replace(/(今天|今日|明天|后天)的天[。.!！?？]*$/g, "$1的天气");
-  q = q.replace(/(今天|今日|明天|后天)天[。.!！?？]*$/g, "$1天气");
-  if (/天气|气温|下雨|下雪|降雨|降雪|空气质量|台风|雾霾/.test(q)) return `${q} 实时天气 天气预报 气温 降水`;
-  if (/黄金|金价/.test(q)) return `${q} 今日 实时 金价 人民币 国际金价`;
-  if (/白银|银价/.test(q)) return `${q} 今日 实时 银价`;
-  if (/比特币|btc/i.test(q)) return `${q} 今日 实时 价格`;
-  return q;
-}
-function isWeatherQuery(query) {
-  return /天气|气温|下雨|下雪|降雨|降雪|空气质量|台风|雾霾|weather/i.test(String(query || ""));
-}
-function isRealtimeQuery(userText) {
-  const q = cleanSearchText(userText);
-  if (!q) return false;
-  if (isWeatherQuery(q)) return true;
-  return /新闻|头条|热点|热搜|最新|实时|股价|股票行情|行情|价格|汇率|油价|金价|银价|黄金|白银|比特币|btc|eth|比分|赛程|航班|火车|高铁|路况|限行|放假|门票|影讯|开奖|疫情/i.test(q);
-}
-function normalizeWeatherSpeech(text) {
-  return cleanSearchText(text)
-    .replace(/(今天|今日|明天|后天)的天[。.!！?？]*$/g, "$1的天气")
-    .replace(/(今天|今日|明天|后天)天[。.!！?？]*$/g, "$1天气");
-}
-function extractWeatherLocation(query) {
-  let q = normalizeWeatherSpeech(stripSearchCommandWords(query));
-  q = q.replace(/(今天|今日|明天|后天|现在|当前|实时|最近|这会儿|此刻)/g, "");
-  q = q.replace(/(的)?(天气预报|天气|气温|温度|下雨吗|会下雨吗|下雨|下雪吗|会下雪吗|下雪|降雨|降雪|空气质量|台风|雾霾|预报)/g, "");
-  q = q.replace(/(怎么样|如何|怎样|多少|几度|有雨吗|冷不冷|热不热)/g, "");
-  q = q.replace(/[，,。.!！?？：:\s]/g, "").replace(/(?:呢|呀|啊|吧|嘛|吗|么)+$/g, "").trim();
-  q = q.replace(/^(嗯|哦|噢|喔|啊|额|呃|那|那么|还有|再查查|再看看|查查|看看|查|搜|搜搜|换成|改成|换|到|去)+/g, "").trim();
-  return q.slice(0, 40);
-}
-function extractWeatherTiming(query) {
-  return String(query || "").match(/后天|明天|今天|今日/)?.[0] || "";
-}
-function isClearlyNotWeatherLocation(rawText, location) {
-  const raw = cleanSearchText(rawText);
-  const value = String(location || "").trim();
-  const text = `${raw} ${value}`;
-  if (/^(这里|那里|这边|那边|本地|附近|谢谢|多谢|好的|好啦|知道了|明白了|不用了|不用|算了|可以|行吧|行了|为什么|怎么了|是吗|真的|没事|没问题)$/.test(value)) return true;
-  if (/^(我|我们|咱|咱们|你|你们|他|他们|她|她们|它|它们)/.test(value)) return true;
-  if (/(聊天|聊聊|闲聊|说话|讲故事|故事|笑话|解闷|陪我|解释|翻译|总结|代码|图片|照片|语音|音乐|播放|打开|关闭|设置|提醒|闹钟|教我|学习|继续|停止|开始)/.test(text)) return true;
-  if (/(为什么|怎么|如何|能不能|可不可以|要不要|需要|想要|我要|帮我|麻烦|请你)/.test(text)) return true;
-  return false;
-}
-function isLikelyWeatherFollowupLocation(rawText, location) {
-  const raw = cleanSearchText(rawText);
-  const value = String(location || "").trim();
-  if (!raw || raw.length > 30 || value.length < 2) return false;
-  if (isClearlyNotWeatherLocation(rawText, value)) return false;
-  if (!/^[\p{Script=Han}A-Za-z·\-\s]+$/u.test(value)) return false;
-  return true;
-}
 function contextualSearchIntent(messages) {
   const userTexts = (Array.isArray(messages) ? messages : [])
     .filter((message) => message?.role === "user")
     .map((message) => extractTextContent(message.content))
     .filter(Boolean);
-  const current = userTexts.at(-1) || "";
-  if (!current) return "";
-  const previousTexts = userTexts.slice(0, -1);
-  let weatherAnchorIndex = -1;
-  for (let index = previousTexts.length - 1; index >= 0; index -= 1) {
-    if (isWeatherQuery(previousTexts[index])) {
-      weatherAnchorIndex = index;
-      break;
-    }
-  }
-  if (weatherAnchorIndex < 0) return current;
-
-  const currentLocation = extractWeatherLocation(current);
-  const currentTiming = extractWeatherTiming(current);
-  const weatherAnchor = previousTexts[weatherAnchorIndex];
-  let previousTiming = extractWeatherTiming(weatherAnchor);
-  let previousLocation = extractWeatherLocation(weatherAnchor);
-  for (const followup of previousTexts.slice(weatherAnchorIndex + 1)) {
-    const followupLocation = extractWeatherLocation(followup);
-    const followupTiming = extractWeatherTiming(followup);
-    if (isLikelyWeatherFollowupLocation(followup, followupLocation)) {
-      previousLocation = followupLocation;
-      if (followupTiming) previousTiming = followupTiming;
-      continue;
-    }
-    if (followupTiming) {
-      previousTiming = followupTiming;
-      continue;
-    }
-    return current;
-  }
-
-  if (isWeatherQuery(current)) {
-    if (!currentLocation && previousLocation) return `${previousLocation} ${currentTiming || previousTiming} 天气`.replace(/\s+/g, " ").trim();
-    return current;
-  }
-  if (isLikelyWeatherFollowupLocation(current, currentLocation)) {
-    return `${currentLocation} ${currentTiming || previousTiming} 天气`.replace(/\s+/g, " ").trim();
-  }
-  if (currentTiming) {
-    return `${previousLocation ? `${previousLocation} ` : ""}${currentTiming} 天气`.replace(/\s+/g, " ").trim();
-  }
-  return current;
+  return contextualSearchIntentFromTexts(userTexts);
 }
 function pickWeatherDesc(current) {
   const raw = current?.lang_zh?.[0]?.value || current?.weatherDesc?.[0]?.value || "";
@@ -1180,7 +1229,7 @@ async function runWebSearch({ query, provider = "auto", apiKey = "", baseUrl = "
   const p = String(provider || "auto").toLowerCase();
   const key = String(apiKey || "").trim();
   const candidates = [];
-  if ((p === "auto" || p === "weather") && (isWeatherQuery(rawQuery) || isWeatherQuery(q))) candidates.push(() => searchWeather(rawQuery));
+  if ((p === "auto" || p === "weather") && (isWeatherLookupRequest(rawQuery) || isWeatherLookupRequest(q))) candidates.push(() => searchWeather(rawQuery));
   if (p === "tavily" && key) candidates.push(() => searchTavily(q, key));
   if (p === "serper" && key) candidates.push(() => searchSerper(q, key));
   if (p === "searxng") candidates.push(() => searchSearx(q, baseUrl || "https://searx.be"));
@@ -1236,7 +1285,7 @@ function looksLikeNoWebReply(text) {
   if (!s) return false;
   return /(不能|无法|没有|未能).{0,10}(联网|上网|搜索|实时|查询|访问互联网)|没有.{0,10}(实时|联网|最新).{0,10}(数据|信息|能力)|不确定.{0,16}(天气|价格|新闻|当前|现在|实时|最新)|无法.{0,16}(获取|查询|访问).{0,16}(天气|实时|最新|网络|互联网)|作为(一个)?(AI|人工智能).{0,20}(不能|无法).{0,10}(联网|访问互联网|获取实时)/i.test(s);
 }
-async function fallbackServerSearchAnswer(cfg, messages, userText, explicitSearch) {
+async function fallbackServerSearchAnswer(cfg, messages, userText, explicitSearch, signal) {
   const search = await runWebSearch({ query: userText, provider: cfg.searchProvider, apiKey: cfg.searchApiKey, baseUrl: cfg.searchBaseUrl });
   console.log("[search:fallback]", search.provider, "ok=", search.ok, "count=", search.items?.length || 0, search.error || "");
   const webSearch = { used: true, explicit: explicitSearch, provider: `fallback-${search.provider}`, ok: search.ok, count: search.items.length, error: search.error || "", titles: search.items.slice(0, 3).map((x) => x.title) };
@@ -1248,10 +1297,11 @@ ${formatSearchContext(search)}
 
 重要：上面就是服务端已经获取到的联网结果。请直接基于这些结果回答。不能再说“我不能联网”“没有实时联网”“无法获取实时数据”。`;
   const finalMessages = sanitizeMessages(messages, systemPrompt, cfg.maxHistoryTurns);
-  const reply = await chatCompletions(cfg, finalMessages);
+  const reply = await chatCompletions(cfg, finalMessages, signal);
   return { reply, webSearch };
 }
-async function prepareChat(body) {
+async function prepareChat(body, signal) {
+  if (signal?.aborted) throw makeAbortError(signal.reason);
   const cfg = resolveConfig(body.config || {});
   if (!cfg.llm.apiKey) { const e = new Error("缺少 API Key：请在本地配置填写"); e.status = 401; throw e; }
   let messages = Array.isArray(body.messages) ? body.messages : [];
@@ -1263,7 +1313,7 @@ async function prepareChat(body) {
   let systemPrompt = cfg.systemPrompt;
   let directReply = "";
   const explicitSearch = isExplicitSearchRequest(intentText) || isExplicitSearchRequest(userText);
-  const weatherIntent = isWeatherQuery(intentText);
+  const weatherIntent = isWeatherLookupRequest(intentText);
   const realtimeIntent = isRealtimeQuery(intentText);
   const autoSearchIntent = shouldAutoSearch(intentText);
   const serverSearchIntent = realtimeIntent || explicitSearch || (cfg.webSearchEnabled && autoSearchIntent);
@@ -1312,29 +1362,31 @@ async function prepareChat(body) {
       }
     }
   }
+  if (signal?.aborted) throw makeAbortError(signal.reason);
   const finalMessages = sanitizeMessages(messages, systemPrompt, cfg.maxHistoryTurns);
   return { cfg, messages, userText, intentText, explicitSearch, useResponsesTools, useFunctionTools, finalMessages, webSearch, directReply };
 }
-async function handleChat(body) {
-  const prepared = await prepareChat(body);
+async function handleChat(body, signal) {
+  const prepared = await prepareChat(body, signal);
   if (prepared.directReply) return { ok: true, reply: prepared.directReply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: prepared.webSearch };
   if (prepared.useFunctionTools) {
-    const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages);
+    const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages, signal);
     return { ok: true, reply: result.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: result.webSearch, toolActions: result.toolActions, toolUsage: result.toolUsage };
   }
-  const reply = await chatCompletions(prepared.cfg, prepared.finalMessages);
+  const reply = await chatCompletions(prepared.cfg, prepared.finalMessages, signal);
   if (prepared.useResponsesTools && shouldAutoSearch(prepared.intentText) && looksLikeNoWebReply(reply)) {
-    const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch);
+    const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch, signal);
     return { ok: true, reply: fallback.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: fallback.webSearch };
   }
   return { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: prepared.webSearch };
 }
 function writeSse(res, event, data) {
+  if (res.destroyed || res.writableEnded) return;
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
-async function handleChatStream(body, res) {
-  const prepared = await prepareChat(body);
+async function handleChatStream(body, res, signal) {
+  const prepared = await prepareChat(body, signal);
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-store, no-transform",
@@ -1351,38 +1403,38 @@ async function handleChatStream(body, res) {
       reply = prepared.directReply;
       writeSse(res, "delta", { text: reply });
     } else if (prepared.useFunctionTools) {
-      const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages);
+      const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages, signal);
       reply = result.reply;
       doneWebSearch = result.webSearch;
       doneToolActions = result.toolActions;
       doneToolUsage = result.toolUsage;
       writeSse(res, "delta", { text: reply });
     } else if (prepared.useResponsesTools && shouldAutoSearch(prepared.intentText)) {
-      reply = await chatCompletions(prepared.cfg, prepared.finalMessages);
+      reply = await chatCompletions(prepared.cfg, prepared.finalMessages, signal);
       if (looksLikeNoWebReply(reply)) {
-        const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch);
+        const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch, signal);
         reply = fallback.reply;
         doneWebSearch = fallback.webSearch;
       }
       writeSse(res, "delta", { text: reply });
     } else if (messagesHaveVision(prepared.finalMessages)) {
-      reply = await chatCompletions(prepared.cfg, prepared.finalMessages);
+      reply = await chatCompletions(prepared.cfg, prepared.finalMessages, signal);
       writeSse(res, "delta", { text: reply });
     } else {
-      reply = await streamChatCompletions(prepared.cfg, prepared.finalMessages, (text) => writeSse(res, "delta", { text }));
+      reply = await streamChatCompletions(prepared.cfg, prepared.finalMessages, (text) => writeSse(res, "delta", { text }), signal);
     }
     writeSse(res, "done", { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: doneWebSearch, toolActions: doneToolActions, toolUsage: doneToolUsage });
   } catch (err) {
-    writeSse(res, "error", { error: String(err.message || err), partial: err.partial || reply || "" });
+    if (!signal?.aborted) writeSse(res, "error", { error: String(err.message || err), partial: err.partial || reply || "" });
   } finally {
-    res.end();
+    if (!res.destroyed && !res.writableEnded) res.end();
   }
 }
 function pickTranscript(data) {
   for (const c of [data?.text, data?.result, data?.transcript, data?.data?.text]) if (typeof c === "string" && c.trim()) return c.trim();
   return "";
 }
-async function transcribe(cfg, file) {
+async function transcribe(cfg, file, signal) {
   const isCustom = normalizeApiType(cfg.stt.apiType, "auto") === "custom";
   if (isCustom && !cfg.stt.endpoint) throw new Error("缺少自定义语音识别接口地址");
   const endpoint = resolveCustomEndpoint(cfg.stt.baseUrl, isCustom ? cfg.stt.endpoint : "", "audio/transcriptions");
@@ -1395,12 +1447,15 @@ async function transcribe(cfg, file) {
       const mid = Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${model}\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n` + (withLang ? `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nzh\r\n` : "") + `--${boundary}--\r\n`, "utf8");
       const body = Buffer.concat([pre, file.buffer, mid]);
       try {
-        const res = await fetchJson(endpoint, { method: "POST", headers: { authorization: `Bearer ${cfg.stt.apiKey}`, "content-type": `multipart/form-data; boundary=${boundary}`, "content-length": String(body.length) }, body }, 60000);
+        const res = await fetchJson(endpoint, { method: "POST", headers: { authorization: `Bearer ${cfg.stt.apiKey}`, "content-type": `multipart/form-data; boundary=${boundary}`, "content-length": String(body.length) }, body, signal }, 60000);
         if (!res.ok) { lastErr = pickUpstreamErrorMessage(res); continue; }
         const textOut = pickTranscript(res.data);
         if (textOut) return { text: textOut, model };
         lastErr = "语音识别没有返回文字";
-      } catch (err) { lastErr = String(err.message || err); }
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        lastErr = String(err.message || err);
+      }
     }
   }
   throw new Error(lastErr);
@@ -1422,7 +1477,7 @@ function base64ToBuffer(data) {
   if (!raw) return null;
   return Buffer.from(raw, "base64");
 }
-async function synthesizeMimo(cfg, inputText) {
+async function synthesizeMimo(cfg, inputText, signal) {
   const payload = JSON.stringify({
     model: cfg.tts.model,
     messages: [{ role: "assistant", content: String(inputText || "").slice(0, 800) }],
@@ -1437,6 +1492,7 @@ async function synthesizeMimo(cfg, inputText) {
       "content-length": String(Buffer.byteLength(payload)),
     },
     body: payload,
+    signal,
   }, 60000);
   if (!res.ok) throw new Error(`小米 MiMo TTS: ${pickUpstreamErrorMessage(res)}`);
   const audioData = res.data?.choices?.[0]?.message?.audio?.data || res.data?.audio?.data || res.data?.data;
@@ -1444,7 +1500,7 @@ async function synthesizeMimo(cfg, inputText) {
   if (!buffer?.length) throw new Error("小米 MiMo TTS 没有返回音频数据");
   return { buffer, contentType: "audio/wav" };
 }
-async function synthesizeOpenAiSpeech(cfg, inputText) {
+async function synthesizeOpenAiSpeech(cfg, inputText, signal) {
   const isCustom = normalizeApiType(cfg.tts.apiType, "auto") === "custom";
   if (isCustom && !cfg.tts.endpoint) throw new Error("缺少自定义 TTS 接口地址");
   const endpoint = resolveCustomEndpoint(cfg.tts.baseUrl, isCustom ? cfg.tts.endpoint : "", "audio/speech");
@@ -1462,13 +1518,116 @@ async function synthesizeOpenAiSpeech(cfg, inputText) {
       "content-length": String(Buffer.byteLength(payload)),
     },
     body: payload,
+    signal,
   }, 60000);
   if (!res.ok) throw new Error(pickUpstreamErrorMessage(res));
   return { buffer: res.buffer, contentType: res.headers?.["content-type"] || "audio/mpeg" };
 }
-async function synthesize(cfg, inputText) {
-  if (isMimoTts(cfg)) return synthesizeMimo(cfg, inputText);
-  return synthesizeOpenAiSpeech(cfg, inputText);
+async function synthesize(cfg, inputText, signal) {
+  if (isMimoTts(cfg)) return synthesizeMimo(cfg, inputText, signal);
+  return synthesizeOpenAiSpeech(cfg, inputText, signal);
+}
+function createSilentWav(durationMs = 250) {
+  const sampleRate = 16000;
+  const samples = Math.max(1, Math.round(sampleRate * durationMs / 1000));
+  const dataSize = samples * 2;
+  const wav = Buffer.alloc(44 + dataSize);
+  wav.write("RIFF", 0, "ascii");
+  wav.writeUInt32LE(36 + dataSize, 4);
+  wav.write("WAVE", 8, "ascii");
+  wav.write("fmt ", 12, "ascii");
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(sampleRate * 2, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36, "ascii");
+  wav.writeUInt32LE(dataSize, 40);
+  return wav;
+}
+async function testTranscription(cfg, signal) {
+  if (!cfg.stt.apiKey) throw new Error("缺少语音识别 API Key");
+  if (!cfg.stt.baseUrl) throw new Error("缺少语音识别 Base URL");
+  if (!cfg.stt.model) throw new Error("缺少语音识别 Model");
+  const isCustom = normalizeApiType(cfg.stt.apiType, "auto") === "custom";
+  if (isCustom && !cfg.stt.endpoint) throw new Error("缺少自定义语音识别接口地址");
+  const endpoint = resolveCustomEndpoint(cfg.stt.baseUrl, isCustom ? cfg.stt.endpoint : "", "audio/transcriptions");
+  const boundary = "----voicecalltest" + Date.now();
+  const wav = createSilentWav();
+  const pre = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="connection-test.wav"\r\nContent-Type: audio/wav\r\n\r\n`, "utf8");
+  const tail = Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${cfg.stt.model}\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n--${boundary}--\r\n`, "utf8");
+  const body = Buffer.concat([pre, wav, tail]);
+  const result = await fetchJson(endpoint, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${cfg.stt.apiKey}`,
+      "content-type": `multipart/form-data; boundary=${boundary}`,
+      "content-length": String(body.length),
+    },
+    body,
+    signal,
+  }, 30000);
+  if (!result.ok) throw new Error(pickUpstreamErrorMessage(result));
+  return { text: pickTranscript(result.data), bytes: wav.length };
+}
+async function testProviders(cfg, signal) {
+  const result = {
+    ok: false,
+    llm: { baseUrl: cfg.llm.baseUrl, model: cfg.llm.model, apiType: cfg.llm.apiType, endpoint: cfg.llm.endpoint, hasKey: Boolean(cfg.llm.apiKey) },
+    stt: { baseUrl: cfg.stt.baseUrl, model: cfg.stt.model, apiType: cfg.stt.apiType, endpoint: cfg.stt.endpoint, hasKey: Boolean(cfg.stt.apiKey) },
+    tts: { ...publicTtsConfig(cfg), enabled: cfg.ttsEnabled },
+    llmTest: { ok: false },
+    sttTest: { ok: false },
+    ttsTest: { ok: false },
+  };
+  const failures = [];
+
+  try {
+    if (!cfg.llm.apiKey) throw new Error("缺少大模型 API Key");
+    const reply = await chatCompletions(
+      { ...cfg, maxTokens: 256 },
+      [{ role: "system", content: "你是测试助手，只回复：连接成功。" }, { role: "user", content: "ping" }],
+      signal,
+    );
+    result.llmTest = { ok: true, reply };
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    const error = String(err.message || err);
+    result.llmTest = { ok: false, error };
+    failures.push(`LLM：${error}`);
+  }
+
+  try {
+    const stt = await testTranscription(cfg, signal);
+    result.sttTest = { ok: true, text: stt.text, bytes: stt.bytes };
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    const error = String(err.message || err);
+    result.sttTest = { ok: false, error };
+    failures.push(`STT：${error}`);
+  }
+
+  if (!cfg.ttsEnabled) {
+    result.ttsTest = { ok: true, skipped: true, reason: "在线 TTS 已关闭" };
+  } else {
+    try {
+      if (!cfg.tts.apiKey) throw new Error("缺少语音合成 API Key");
+      const audio = await synthesize(cfg, "连接测试", signal);
+      if (!audio.buffer?.length) throw new Error("语音合成没有返回音频数据");
+      result.ttsTest = { ok: true, bytes: audio.buffer.length, contentType: audio.contentType };
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      const error = String(err.message || err);
+      result.ttsTest = { ok: false, error };
+      failures.push(`TTS：${error}`);
+    }
+  }
+
+  result.ok = failures.length === 0;
+  if (failures.length) result.error = failures.join("；");
+  return result;
 }
 function publicTtsConfig(cfg) {
   return { baseUrl: cfg.tts.baseUrl, model: cfg.tts.model, voice: cfg.tts.voice, apiType: cfg.tts.apiType, endpoint: cfg.tts.endpoint, hasKey: Boolean(cfg.tts.apiKey) };
@@ -1477,31 +1636,22 @@ function formatTtsError(err) {
   const msg = String(err?.message || err || "").trim();
   return msg ? `TTS 请求失败：${msg}` : "TTS 请求失败";
 }
-function printLan() {
-  const nets = networkInterfaces();
-  console.log("Open on phone (same WiFi):");
-  for (const name of Object.keys(nets)) {
-    for (const net of nets[name] || []) {
-      const family = String(net.family);
-      if ((family === "IPv4" || family === "4") && !net.internal) console.log(`- ${name}: http://${net.address}:${PORT}`);
-    }
-  }
-  console.log(`PC local: http://127.0.0.1:${PORT}`);
-}
 
-function printLanHttps(port) {
-  const nets = networkInterfaces();
-  const ips = [];
-  for (const list of Object.values(nets)) {
-    for (const n of list || []) {
-      if (n && (n.family === "IPv4" || n.family === 4) && !n.internal) ips.push(n.address);
-    }
-  }
-  if (!ips.length) {
-    console.log("  https://127.0.0.1:" + port);
-    return;
-  }
-  for (const ip of ips) console.log("  https://" + ip + ":" + port);
+function watchClientDisconnect(req, res) {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) controller.abort(makeAbortError("client disconnected"));
+  };
+  const onClose = () => { if (!res.writableEnded) abort(); };
+  req.once("aborted", abort);
+  res.once("close", onClose);
+  return {
+    signal: controller.signal,
+    cleanup() {
+      req.removeListener("aborted", abort);
+      res.removeListener("close", onClose);
+    },
+  };
 }
 
 const requestHandler = async (req, res) => {
@@ -1519,74 +1669,99 @@ const requestHandler = async (req, res) => {
     if (pathname === "/api/health") return json(res, 200, { ok: true, service: "ai-voice-call-local", time: new Date().toISOString(), secure: Boolean(req.socket && req.socket.encrypted) });
     if (pathname === "/api/defaults" && req.method === "GET") return json(res, 200, { ok: true, defaults: { llm: { baseUrl: "https://api.siliconflow.cn/v1", model: "Qwen/Qwen3.5-4B", apiType: "auto", endpoint: "" }, stt: { baseUrl: "https://api.siliconflow.cn/v1", model: "FunAudioLLM/SenseVoiceSmall", apiType: "auto", endpoint: "" }, tts: { baseUrl: "https://api.siliconflow.cn/v1", model: "FnLP/MOSS-TTSD-v0.5", voice: "alloy", apiType: "auto", endpoint: "" }, systemPromptPreset: "general", systemPrompt: DEFAULT_SYSTEM_PROMPT, maxHistoryTurns: 12, maxTokens: 512, temperature: 0.7, ttsEnabled: true, browserTtsFallback: true, autoSpeak: true, toolCallingEnabled: true, webSearchEnabled: true, searchProvider: "auto" } });
     if (pathname === "/api/chat/stream" && req.method === "POST") {
-      const raw = await readBody(req);
-      const body = JSON.parse(raw.toString("utf8") || "{}");
-      const started = Date.now();
-      console.log("[chat:stream] in", (body.messages || []).length, "msgs, search=", body.config?.webSearchEnabled);
+      const client = watchClientDisconnect(req, res);
       try {
-        await handleChatStream(body, res);
+        const body = await readJsonBody(req);
+        const started = Date.now();
+        console.log("[chat:stream] in", (body.messages || []).length, "msgs, search=", body.config?.webSearchEnabled);
+        await handleChatStream(body, res, client.signal);
         console.log("[chat:stream] out in", Date.now() - started, "ms");
         return;
       } catch (err) {
-        console.log("[chat:stream] fail in", Date.now() - started, "ms:", err.message || err);
+        console.log("[chat:stream] fail:", err.message || err);
+        if (client.signal.aborted) return;
         if (!res.headersSent) return json(res, err.status || 500, { ok: false, error: String(err.message || err) });
         try { writeSse(res, "error", { error: String(err.message || err) }); res.end(); } catch {}
         return;
+      } finally {
+        client.cleanup();
       }
     }
     if (pathname === "/api/chat" && req.method === "POST") {
-      const raw = await readBody(req);
-      const body = JSON.parse(raw.toString("utf8") || "{}");
-      const started = Date.now();
-      console.log("[chat] in", (body.messages || []).length, "msgs, search=", body.config?.webSearchEnabled);
+      const client = watchClientDisconnect(req, res);
       try {
-        const out = await handleChat(body);
+        const body = await readJsonBody(req);
+        const started = Date.now();
+        console.log("[chat] in", (body.messages || []).length, "msgs, search=", body.config?.webSearchEnabled);
+        const out = await handleChat(body, client.signal);
         console.log("[chat] out ok in", Date.now() - started, "ms");
         return json(res, 200, out);
       } catch (err) {
-        console.log("[chat] out fail in", Date.now() - started, "ms:", err.message || err);
+        console.log("[chat] out fail:", err.message || err);
+        if (client.signal.aborted) return;
         throw err;
+      } finally {
+        client.cleanup();
       }
     }
     if (pathname === "/api/test" && req.method === "POST") {
-      const raw = await readBody(req); const body = JSON.parse(raw.toString("utf8") || "{}"); const cfg = resolveConfig(body.config || {});
-      if (!cfg.llm.apiKey) return json(res, 401, { ok: false, error: "未配置 API Key" });
-      const reply = await chatCompletions(cfg, [{ role: "system", content: "你是测试助手，只回复：连接成功。" }, { role: "user", content: "ping" }]);
-      return json(res, 200, { ok: true, llmTest: { ok: true, reply }, llm: { model: cfg.llm.model, baseUrl: cfg.llm.baseUrl, apiType: cfg.llm.apiType, endpoint: cfg.llm.endpoint, hasKey: true } });
+      const client = watchClientDisconnect(req, res);
+      try {
+        const body = await readJsonBody(req);
+        const result = await testProviders(resolveConfig(body.config || {}), client.signal);
+        return json(res, result.ok ? 200 : 502, result);
+      } finally {
+        client.cleanup();
+      }
     }
     if (pathname === "/api/search" && req.method === "POST") {
-      const raw = await readBody(req); const body = JSON.parse(raw.toString("utf8") || "{}"); const q = String(body.query || body.q || "").trim();
+      const body = await readJsonBody(req); const q = String(body.query || body.q || "").trim();
       if (!q) return json(res, 400, { ok: false, error: "missing query" });
       return json(res, 200, await runWebSearch({ query: q, provider: body.provider || body.searchProvider || "auto", apiKey: body.apiKey || "", baseUrl: body.baseUrl || "" }));
     }
     if (pathname === "/api/asr" && req.method === "POST") {
-      const raw = await readBody(req); const parsed = parseMultipart(raw, req.headers["content-type"]);
-      if (!parsed.file) return json(res, 400, { ok: false, error: "missing audio file" });
-      let clientConfig = {};
-      const headerCfg = req.headers["x-client-config"];
-      if (headerCfg) { try { const s = String(headerCfg); clientConfig = s.trim().startsWith("{") ? JSON.parse(s) : JSON.parse(Buffer.from(s, "base64").toString("utf8")); } catch {} }
-      else if (parsed.fields.config) { try { clientConfig = JSON.parse(parsed.fields.config); } catch {} }
-      const cfg = resolveConfig(clientConfig);
-      if (!cfg.stt.apiKey) return json(res, 401, { ok: false, error: "缺少语音识别 API Key" });
-      const result = await transcribe(cfg, parsed.file);
-      return json(res, 200, { ok: true, text: result.text, model: result.model, bytes: parsed.file.buffer.length });
+      const client = watchClientDisconnect(req, res);
+      try {
+        const raw = await readBody(req); const parsed = parseMultipart(raw, req.headers["content-type"]);
+        if (!parsed.file) return json(res, 400, { ok: false, error: "missing audio file" });
+        let clientConfig = {};
+        const headerCfg = req.headers["x-client-config"];
+        try {
+          if (headerCfg) { const s = String(headerCfg); clientConfig = s.trim().startsWith("{") ? JSON.parse(s) : JSON.parse(Buffer.from(s, "base64").toString("utf8")); }
+          else if (parsed.fields.config) clientConfig = JSON.parse(parsed.fields.config);
+        } catch {
+          return json(res, 400, { ok: false, error: "config 不是有效的 JSON" });
+        }
+        const cfg = resolveConfig(clientConfig);
+        if (!cfg.stt.apiKey) return json(res, 401, { ok: false, error: "缺少语音识别 API Key" });
+        const result = await transcribe(cfg, parsed.file, client.signal);
+        return json(res, 200, { ok: true, text: result.text, model: result.model, bytes: parsed.file.buffer.length });
+      } finally {
+        client.cleanup();
+      }
     }
     if (pathname === "/api/tts" && req.method === "POST") {
-      const raw = await readBody(req); const body = JSON.parse(raw.toString("utf8") || "{}"); const cfg = resolveConfig(body.config || {});
-      const textInput = String(body.text || "").trim();
-      if (!textInput) return json(res, 400, { ok: false, error: "缺少要合成的文字" });
-      if (cfg.ttsEnabled === false) return json(res, 400, { ok: false, error: "在线 TTS 已关闭" });
-      if (!cfg.tts.baseUrl) return json(res, 400, { ok: false, error: "缺少 TTS Base URL", tts: publicTtsConfig(cfg) });
-      if (!cfg.tts.model) return json(res, 400, { ok: false, error: "缺少 TTS Model", tts: publicTtsConfig(cfg) });
-      if (!cfg.tts.apiKey) return json(res, 401, { ok: false, error: "缺少 TTS API Key", tts: publicTtsConfig(cfg) });
+      const client = watchClientDisconnect(req, res);
       try {
-        const audio = await synthesize(cfg, textInput);
-        res.writeHead(200, { "content-type": audio.contentType || "audio/mpeg", "cache-control": "no-store" });
-        return res.end(audio.buffer);
-      } catch (err) {
-        const error = formatTtsError(err);
-        console.log("[tts] fail", publicTtsConfig(cfg), err?.message || err);
-        return json(res, 502, { ok: false, error, tts: publicTtsConfig(cfg) });
+        const body = await readJsonBody(req); const cfg = resolveConfig(body.config || {});
+        const textInput = String(body.text || "").trim();
+        if (!textInput) return json(res, 400, { ok: false, error: "缺少要合成的文字" });
+        if (cfg.ttsEnabled === false) return json(res, 400, { ok: false, error: "在线 TTS 已关闭" });
+        if (!cfg.tts.baseUrl) return json(res, 400, { ok: false, error: "缺少 TTS Base URL", tts: publicTtsConfig(cfg) });
+        if (!cfg.tts.model) return json(res, 400, { ok: false, error: "缺少 TTS Model", tts: publicTtsConfig(cfg) });
+        if (!cfg.tts.apiKey) return json(res, 401, { ok: false, error: "缺少 TTS API Key", tts: publicTtsConfig(cfg) });
+        try {
+          const audio = await synthesize(cfg, textInput, client.signal);
+          res.writeHead(200, { "content-type": audio.contentType || "audio/mpeg", "cache-control": "no-store" });
+          return res.end(audio.buffer);
+        } catch (err) {
+          if (client.signal.aborted) return;
+          const error = formatTtsError(err);
+          console.log("[tts] fail", publicTtsConfig(cfg), err?.message || err);
+          return json(res, 502, { ok: false, error, tts: publicTtsConfig(cfg) });
+        }
+      } finally {
+        client.cleanup();
       }
     }
     let reqPath = decodeURIComponent(pathname); if (reqPath === "/") reqPath = "/index.html";
@@ -1595,55 +1770,22 @@ const requestHandler = async (req, res) => {
     if (!filePath.startsWith(PUBLIC_DIR)) return text(res, 403, "forbidden");
     return sendFile(res, filePath);
   } catch (err) {
+    if (res.destroyed || res.writableEnded) return;
     return json(res, err.status || 500, { ok: false, error: String(err.message || err) });
   }
 }
-
-function loadLocalCerts() {
-  const keyPath = path.join(__dirname, ".certs", "key.pem");
-  const certPath = path.join(__dirname, ".certs", "cert.pem");
-  if (!fs.existsSync(keyPath) || !fs.existsSync(certPath)) return null;
-  try {
-    return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
-  } catch {
-    return null;
-  }
-}
-
-const HTTPS_PORT = Number(process.env.HTTPS_PORT || 8788);
 const httpServer = http.createServer(requestHandler);
-const certs = loadLocalCerts();
-let httpsServer = null;
-if (certs) httpsServer = https.createServer(certs, requestHandler);
 
 httpServer.listen(PORT, HOST, () => {
   console.log("========================================");
   console.log(" AI语音通话 LOCAL server is running");
   console.log("========================================");
-  printLan();
-  console.log("");
-  console.log("PC (可录音):     http://127.0.0.1:" + PORT);
-  if (httpsServer) {
-    console.log("手机请优先用 HTTPS（麦克风需要安全环境）:");
-    printLanHttps(HTTPS_PORT);
-    console.log("首次打开若提示不安全，点“继续访问/高级”。");
-    console.log("微信里请点右上角 ... -> 在浏览器打开");
-  } else {
-    console.log("未找到 .certs 证书，手机端 HTTP 通常无法录音。");
-  }
+  console.log("PC: http://127.0.0.1:" + PORT);
+  if (HOST !== "127.0.0.1" && HOST !== "localhost" && HOST !== "::1") console.log("提示：当前监听 " + HOST + "，服务可能对局域网开放。");
+  console.log("手机端请使用已部署的 Cloudflare HTTPS 地址。");
   console.log("");
   console.log("Keep this window open. Press Ctrl+C to stop.");
 });
-
-if (httpsServer) {
-  httpsServer.listen(HTTPS_PORT, HOST, () => {
-    console.log("HTTPS listening on " + HTTPS_PORT);
-  });
-  httpsServer.on("error", (err) => {
-    console.error("HTTPS failed:", err.message);
-    if (err.code === "EADDRINUSE") console.error("HTTPS port " + HTTPS_PORT + " in use");
-  });
-}
 
 httpServer.on("error", (err) => {
   console.error("Server failed:", err.message);
