@@ -5,7 +5,7 @@
  * - Never log API keys
  */
 
-import { createWebSearchSession, normalizeWebSearchQuery, runWebSearch } from "./web-search.mjs";
+import { createWebSearchSession, isWebSearchDisabledRequest, isWebSearchRefusal, normalizeWebSearchQuery, runWebSearch } from "./web-search.mjs";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -814,7 +814,7 @@ const FUNCTION_TOOLS: Array<Record<string, unknown>> = [
     type: "function",
     function: {
       name: "web_search",
-      description: "搜索互联网中的最新信息。适合新闻、价格、政策、比赛、交通、产品资料等需要实时或可核实来源的问题。",
+      description: "搜索互联网。用户明确要求查找/搜索，或问题涉及天气、新闻、价格、政策、比赛、交通等实时或需核实的信息时，必须调用此工具；不要直接声称无法联网。",
       parameters: {
         type: "object",
         properties: { query: { type: "string", description: "简洁、完整的搜索关键词" } },
@@ -994,11 +994,20 @@ async function fetchChatToolStep(
   cfg: ReturnType<typeof resolveProviders>,
   messages: ChatMessage[],
   signal?: AbortSignal,
+  forceWebSearch = false,
 ): Promise<{ message: any; text: string; toolCalls: FunctionToolCall[] }> {
   const safeMaxTokens = clampMaxTokens(cfg.maxTokens);
   const diag = publicLlmConfig(cfg.llm.baseUrl, cfg.llm.model, cfg.llm.apiType, cfg.llm.apiKey, cfg.llm.endpoint);
+  const tools = functionToolsFor(cfg);
+  const toolChoice = forceWebSearch
+    ? { type: "function", function: { name: "web_search" } }
+    : "auto";
   const variants = payloadVariants("chat", cfg.llm.model, messages, safeMaxTokens, cfg.temperature, false)
-    .map((payload) => ({ ...payload, tools: functionToolsFor(cfg), tool_choice: "auto" }));
+    .map((payload) => ({
+      ...payload,
+      tools: forceWebSearch ? tools.filter((tool: any) => tool?.function?.name === "web_search") : tools,
+      tool_choice: toolChoice,
+    }));
   let lastErr = "LLM tool call failed";
   for (let index = 0; index < variants.length; index++) {
     const first = await fetchLlmEndpointWithTransientRetry(
@@ -1032,13 +1041,35 @@ async function chatCompletionsWithTools(
   const toolUsage: string[] = [];
   const executionContext: ToolExecutionContext = { searchSession: createWebSearchSession() };
   let webSearch: Record<string, unknown> | null = null;
+  let forcedWebSearch = false;
+  let refusalReply = "";
+  const lastUserText = [...messages].reverse().find((message) => message.role === "user");
+  const searchDisabledByUser = isWebSearchDisabledRequest(extractTextContent(lastUserText?.content));
   for (let round = 0; round < 4; round++) {
-    const step = await fetchChatToolStep(cfg, working, signal);
+    let step: Awaited<ReturnType<typeof fetchChatToolStep>>;
+    try {
+      step = await fetchChatToolStep(cfg, working, signal, forcedWebSearch);
+    } catch (err: any) {
+      if (forcedWebSearch && refusalReply && !signal?.aborted) {
+        return { reply: refusalReply, toolActions, toolUsage, webSearch };
+      }
+      throw err;
+    }
     if (!step.toolCalls.length) {
       const reply = cleanAssistantReply(step.text, messages);
-      if (!reply) throw new Error("模型完成工具调用后没有返回文字");
+      if (!reply) {
+        if (forcedWebSearch && refusalReply) return { reply: refusalReply, toolActions, toolUsage, webSearch };
+        throw new Error("模型完成工具调用后没有返回文字");
+      }
+      if (round === 0 && !searchDisabledByUser && cfg.webSearchEnabled && isWebSearchRefusal(reply)) {
+        refusalReply = reply;
+        forcedWebSearch = true;
+        continue;
+      }
       return { reply, toolActions, toolUsage, webSearch };
     }
+    forcedWebSearch = false;
+    refusalReply = "";
     working.push({ role: "assistant", content: step.message.content || "", tool_calls: step.toolCalls });
     for (const call of step.toolCalls) {
       let result: ToolExecution;
@@ -1495,7 +1526,10 @@ function prepareChat(body: ChatRequestBody, env: Env): PreparedChat | Response {
   const useFunctionTools = !hasVision && cfg.toolCallingEnabled && preferredLlmKind(cfg.llm.apiType) === "chat";
   if (useFunctionTools) {
     const now = currentTimeResult(cfg.timeZone);
-    systemPrompt = `${systemPrompt}\n\n当前用户时区：${now.timeZone}。当前日期时间：${now.local}（${now.iso}）。需要搜索、计算、时间或提醒时，请优先调用提供的函数工具，不要假装已经执行工具。`;
+    const searchInstruction = cfg.webSearchEnabled
+      ? "你具备 web_search。用户明确要求查找/搜索，或回答依赖实时、最新、天气等外部信息时，必须先调用 web_search；query 由你根据用户问题生成。不要声称自己无法联网。"
+      : "联网搜索未启用，不要假装已经执行搜索。";
+    systemPrompt = `${systemPrompt}\n\n当前用户时区：${now.timeZone}。当前日期时间：${now.local}（${now.iso}）。${searchInstruction}需要计算、时间或提醒时调用对应函数工具，不要假装已经执行工具。`;
   }
   return {
     cfg,

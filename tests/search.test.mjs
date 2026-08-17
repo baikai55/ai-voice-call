@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createWebSearchSession, normalizeWebSearchQuery, runWebSearch } from "../src/web-search.mjs";
+import { createWebSearchSession, isWebSearchDisabledRequest, isWebSearchRefusal, normalizeWebSearchQuery, runWebSearch } from "../src/web-search.mjs";
 
 function sseResult(text) {
   const payload = { jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text }] } };
@@ -16,6 +16,20 @@ test("web_search query only applies Unicode, whitespace, and length normalizatio
   assert.equal(normalizeWebSearchQuery("ＡＢＣ btc 金价"), "ABC btc 金价");
   assert.doesNotMatch(normalizeWebSearchQuery("香港天气"), /实时天气|天气预报|气温|降水/);
   assert.equal(normalizeWebSearchQuery("x".repeat(200)).length, 160);
+});
+
+test("web_search recognizes model refusals without classifying user topics", () => {
+  assert.equal(isWebSearchRefusal("抱歉，我暂时无法直接获取实时天气信息哦。"), true);
+  assert.equal(isWebSearchRefusal("我不能联网搜索最新消息。"), true);
+  assert.equal(isWebSearchRefusal("杭州今天最高温度 31 度。"), false);
+  assert.equal(isWebSearchRefusal("你好呀，今天想聊什么？"), false);
+  assert.equal(isWebSearchRefusal("这个离线应用无法获取实时数据，因为它没有网络连接。"), false);
+  assert.equal(isWebSearchDisabledRequest("不要联网，直接回答"), true);
+  assert.equal(isWebSearchDisabledRequest("不需要联网"), true);
+  assert.equal(isWebSearchDisabledRequest("不必搜索"), true);
+  assert.equal(isWebSearchDisabledRequest("请勿联网"), true);
+  assert.equal(isWebSearchDisabledRequest("离线回答"), true);
+  assert.equal(isWebSearchDisabledRequest("帮我联网查一下"), false);
 });
 
 test("web_search sends the Exa MCP tool call and parses SSE in original order", async () => {

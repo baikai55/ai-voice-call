@@ -85,6 +85,22 @@ async function startMockProvider() {
         res.once("close", closed);
         return;
       }
+      if (payload.model === "mock-chat-no-web") {
+        const forcedSearch = payload.tool_choice?.function?.name === "web_search";
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { content: forcedSearch ? "强制搜索重试完成" : "抱歉，我暂时无法直接获取实时天气信息。" } }] }));
+        return;
+      }
+      if (payload.model === "mock-chat-no-web-unsupported") {
+        if (payload.tool_choice?.function?.name === "web_search") {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "named tool_choice unsupported" } }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { content: "抱歉，我无法联网查询实时信息。" } }] }));
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content: "连接成功" } }] }));
       return;
@@ -222,6 +238,68 @@ test("local server security, provider tests, token bounds, and cancellation", as
     assert.equal(response.status, 200);
     assert.equal(data.ok, true);
     assert.equal(provider.calls.chatPayloads.at(-1).max_tokens, 256);
+  });
+
+  await t.test("a model web access refusal retries once with forced web_search", async () => {
+    const before = provider.calls.chatPayloads.length;
+    const { response, data } = await postJson(`${testApp.baseUrl}/api/chat`, {
+      message: "帮我查一下今天杭州的天气",
+      config: providerConfig(provider.baseUrl, {
+        llm: { baseUrl: provider.baseUrl, apiKey: "test-llm-key", model: "mock-chat-no-web", apiType: "openai-chat" },
+        toolCallingEnabled: true,
+        webSearchEnabled: true,
+        ttsEnabled: false,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(data.reply, "强制搜索重试完成");
+    const payloads = provider.calls.chatPayloads.slice(before);
+    assert.equal(payloads.length, 2);
+    assert.equal(payloads[0].tool_choice, "auto");
+    assert.deepEqual(payloads[1].tool_choice, { type: "function", function: { name: "web_search" } });
+    assert.deepEqual(payloads[1].tools.map((tool) => tool.function.name), ["web_search"]);
+  });
+
+  await t.test("ordinary replies and explicit no-search requests are not forced", async () => {
+    const ordinaryBefore = provider.calls.chatPayloads.length;
+    const ordinary = await postJson(`${testApp.baseUrl}/api/chat`, {
+      message: "你好",
+      config: providerConfig(provider.baseUrl, { toolCallingEnabled: true, webSearchEnabled: true, ttsEnabled: false }),
+    });
+    assert.equal(ordinary.data.reply, "连接成功");
+    assert.equal(provider.calls.chatPayloads.slice(ordinaryBefore).length, 1);
+
+    const disabledBefore = provider.calls.chatPayloads.length;
+    const disabled = await postJson(`${testApp.baseUrl}/api/chat`, {
+      message: "不要联网，解释一下离线模型为什么拿不到实时信息",
+      config: providerConfig(provider.baseUrl, {
+        llm: { baseUrl: provider.baseUrl, apiKey: "test-llm-key", model: "mock-chat-no-web", apiType: "openai-chat" },
+        toolCallingEnabled: true,
+        webSearchEnabled: true,
+        ttsEnabled: false,
+      }),
+    });
+    assert.match(disabled.data.reply, /无法直接获取实时天气信息/);
+    assert.equal(provider.calls.chatPayloads.slice(disabledBefore).length, 1);
+  });
+
+  await t.test("unsupported forced tool_choice falls back to the original refusal", async () => {
+    const before = provider.calls.chatPayloads.length;
+    const { response, data } = await postJson(`${testApp.baseUrl}/api/chat`, {
+      message: "帮我搜索最新消息",
+      config: providerConfig(provider.baseUrl, {
+        llm: { baseUrl: provider.baseUrl, apiKey: "test-llm-key", model: "mock-chat-no-web-unsupported", apiType: "openai-chat" },
+        toolCallingEnabled: true,
+        webSearchEnabled: true,
+        ttsEnabled: false,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.match(data.reply, /无法联网查询实时信息/);
+    const payloads = provider.calls.chatPayloads.slice(before);
+    assert.equal(payloads[0].tool_choice, "auto");
+    assert.ok(payloads.slice(1).every((payload) => payload.tool_choice?.function?.name === "web_search"));
+    assert.ok(payloads.length <= 3);
   });
 
   await t.test("Responses omits native web_search when search is disabled", async () => {

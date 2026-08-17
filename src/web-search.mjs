@@ -15,6 +15,21 @@ export function normalizeWebSearchQuery(value) {
     .slice(0, 160);
 }
 
+/** @param {unknown} value */
+export function isWebSearchRefusal(value) {
+  const text = cleanText(value);
+  if (!text) return false;
+  return /(?:^|[。！？!?]\s*)(?:(?:很?抱歉[，,\s]*)?(?:我|本助手|当前助手)|很?抱歉[，,\s]*)(?:目前|当前|暂时)?(?:无法|不能|未能|没有办法).{0,16}(?:联网|上网|访问互联网|访问网络|搜索网络|获取实时|查询实时|获取最新|查询最新|获取|查询|访问|搜索).{0,24}(?:实时|最新|当前|天气|新闻|价格|信息|数据)?/i.test(text)
+    || /(?:^|[.!?]\s*)(?:sorry[,\s]*)?(?:i|this assistant)(?:'m| am)?\s+(?:cannot|can't|am unable to).{0,40}(?:browse|search|access).{0,24}(?:web|internet|real-time|latest)/i.test(text);
+}
+
+/** @param {unknown} value */
+export function isWebSearchDisabledRequest(value) {
+  const text = cleanText(value);
+  return /(?:不要|别|不用|无需|不需要|不必|请勿|禁止).{0,8}(?:联网|上网|搜索|查询|查找|搜|查)|(?:联网|上网|搜索|查询).{0,8}(?:不要|别|不用|无需|不需要|不必)|(?:离线|不联网)(?:回答|回复|解释)?/i.test(text)
+    || /\b(?:do not|don't|without)\b.{0,16}(?:browse|search|internet|web)|\boffline\b/i.test(text);
+}
+
 function cleanText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
