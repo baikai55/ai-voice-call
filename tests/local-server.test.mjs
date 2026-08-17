@@ -56,7 +56,7 @@ async function startApp(extraEnv = {}) {
 }
 
 async function startMockProvider() {
-  const calls = { llm: 0, stt: 0, tts: 0, chatPayloads: [] };
+  const calls = { llm: 0, stt: 0, tts: 0, chatPayloads: [], responsePayloads: [] };
   const sockets = new Set();
   let closeStream;
   const upstreamClosed = new Promise((resolve) => { closeStream = resolve; });
@@ -87,6 +87,19 @@ async function startMockProvider() {
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ choices: [{ message: { content: "连接成功" } }] }));
+      return;
+    }
+    if (url.pathname === "/v1/responses") {
+      calls.llm += 1;
+      const payload = JSON.parse(body.toString("utf8") || "{}");
+      calls.responsePayloads.push(payload);
+      if (payload.tools) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "unsupported web search tool" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ output_text: "连接成功" }));
       return;
     }
     if (url.pathname === "/v1/audio/transcriptions") {
@@ -211,6 +224,39 @@ test("local server security, provider tests, token bounds, and cancellation", as
     assert.equal(provider.calls.chatPayloads.at(-1).max_tokens, 256);
   });
 
+  await t.test("Responses omits native web_search when search is disabled", async () => {
+    const before = provider.calls.responsePayloads.length;
+    const { response, data } = await postJson(`${testApp.baseUrl}/api/chat`, {
+      message: "你好",
+      config: providerConfig(provider.baseUrl, {
+        llm: { baseUrl: provider.baseUrl, apiKey: "test-llm-key", model: "mock-responses", apiType: "openai-responses" },
+        webSearchEnabled: false,
+        ttsEnabled: false,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(data.reply, "连接成功");
+    const payloads = provider.calls.responsePayloads.slice(before);
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].tools, undefined);
+  });
+
+  await t.test("Responses falls back from both native tool names to a request without tools", async () => {
+    const before = provider.calls.responsePayloads.length;
+    const { response, data } = await postJson(`${testApp.baseUrl}/api/chat`, {
+      message: "你好",
+      config: providerConfig(provider.baseUrl, {
+        llm: { baseUrl: provider.baseUrl, apiKey: "test-llm-key", model: "mock-responses", apiType: "openai-responses" },
+        webSearchEnabled: true,
+        ttsEnabled: false,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(data.reply, "连接成功");
+    const payloads = provider.calls.responsePayloads.slice(before);
+    assert.deepEqual(payloads.map((payload) => payload.tools?.[0]?.type || "none"), ["web_search", "web_search_preview", "none"]);
+  });
+
   await t.test("weather observations stay in normal conversation", async () => {
     const before = provider.calls.llm;
     const message = "哎，今天天气下雨了，感觉潮潮的。";
@@ -226,16 +272,22 @@ test("local server security, provider tests, token bounds, and cancellation", as
     assert.doesNotMatch(data.reply, /可靠实时天气|哎了感觉潮潮的/);
   });
 
-  await t.test("an actual weather question without a city asks for one", async () => {
+  await t.test("weather questions are handled by the model instead of a dedicated weather endpoint", async () => {
     const before = provider.calls.llm;
+    const beforePayloads = provider.calls.chatPayloads.length;
     const { response, data } = await postJson(`${testApp.baseUrl}/api/chat`, {
       message: "今天天气怎么样？",
-      config: providerConfig(provider.baseUrl, { webSearchEnabled: true, ttsEnabled: false }),
+      config: providerConfig(provider.baseUrl, { webSearchEnabled: true, toolCallingEnabled: true, ttsEnabled: false }),
     });
     assert.equal(response.status, 200);
     assert.equal(data.ok, true);
-    assert.match(data.reply, /哪个城市/);
-    assert.equal(provider.calls.llm, before);
+    assert.equal(data.reply, "连接成功");
+    assert.equal(provider.calls.llm, before + 1);
+    const toolPayload = provider.calls.chatPayloads.slice(beforePayloads).find((payload) => Array.isArray(payload.tools));
+    assert.ok(toolPayload, JSON.stringify(provider.calls.chatPayloads.slice(beforePayloads)));
+    const toolNames = toolPayload.tools.map((tool) => tool.function.name);
+    assert.ok(toolNames.includes("web_search"));
+    assert.ok(!toolNames.includes("get_weather"));
   });
 
   await t.test("weather descriptions are not treated as a follow-up city", async () => {

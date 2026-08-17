@@ -5,7 +5,7 @@
  * - Never log API keys
  */
 
-import { contextualSearchIntentFromTexts, extractWeatherLocation, formatSearchContext, isExplicitSearchRequest, isRealtimeQuery, isWeatherLookupRequest, runWebSearch, shouldAutoSearch, shouldUseFunctionTools } from "./search";
+import { createWebSearchSession, normalizeWebSearchQuery, runWebSearch } from "./web-search.mjs";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -23,8 +23,6 @@ export interface Env {
   LLM_TEMPERATURE?: string;
   SYSTEM_PROMPT?: string;
   WEB_SEARCH_ENABLED?: string;
-  SEARCH_PROVIDER?: string;
-  SEARCH_BASE_URL?: string;
 }
 
 type Role = "system" | "user" | "assistant" | "tool";
@@ -69,9 +67,6 @@ interface ClientConfig {
   toolCallingEnabled?: boolean;
   timeZone?: string;
   webSearchEnabled?: boolean;
-  searchProvider?: string; // auto | bing-rss | duckduckgo | searxng | tavily | serper
-  searchApiKey?: string;
-  searchBaseUrl?: string;
 }
 
 interface ChatRequestBody {
@@ -223,14 +218,28 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-async function fetchWithTimeoutAndSignal(url: string, init: RequestInit, timeoutMs = 0, signal?: AbortSignal): Promise<Response> {
+async function fetchWithTimeoutAndSignal(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 0,
+  signal?: AbortSignal,
+  bufferBody = false,
+): Promise<Response> {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   if (signal?.aborted) controller.abort();
   else signal?.addEventListener("abort", onAbort, { once: true });
   const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    if (!bufferBody) return response;
+    const body = await response.arrayBuffer();
+    const emptyBody = response.status === 204 || response.status === 304;
+    return new Response(emptyBody ? null : body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   } finally {
     if (timer) clearTimeout(timer);
     signal?.removeEventListener("abort", onAbort);
@@ -269,7 +278,7 @@ async function fetchLlmEndpointWithTransientRetry(
         "content-type": "application/json",
       },
       body: JSON.stringify(payload),
-    }, timeoutMs, signal);
+    }, timeoutMs, signal, true);
   };
 
   let res = await doFetch();
@@ -373,7 +382,6 @@ function publicConfig(env: Env) {
       toolCallingEnabled: true,
       webSearchEnabled: asBool(env.WEB_SEARCH_ENABLED, true),
       systemPromptPreset: "general",
-      searchProvider: env.SEARCH_PROVIDER || "auto",
     },
   };
 }
@@ -427,9 +435,6 @@ function resolveProviders(env: Env, config?: ClientConfig) {
     toolCallingEnabled: config?.toolCallingEnabled !== false,
     timeZone: (config?.timeZone || "Asia/Hong_Kong").trim(),
     webSearchEnabled: config?.webSearchEnabled ?? asBool(env.WEB_SEARCH_ENABLED, true),
-    searchProvider: (config?.searchProvider || env.SEARCH_PROVIDER || "auto").trim(),
-    searchApiKey: (config?.searchApiKey || "").trim(),
-    searchBaseUrl: (config?.searchBaseUrl || env.SEARCH_BASE_URL || "").trim(),
   };
 }
 
@@ -663,7 +668,7 @@ function buildResponsesPayload(
   safeMaxTokens: number,
   temperature: number,
   stream = false,
-  toolType = "web_search",
+  toolType: string | null = "web_search",
 ): Record<string, unknown> {
   const { instructions, input } = splitSystemMessages(messages);
   const payload: Record<string, unknown> = {
@@ -672,9 +677,11 @@ function buildResponsesPayload(
     temperature,
     max_output_tokens: safeMaxTokens,
     stream,
-    tools: [{ type: toolType }],
-    tool_choice: "auto",
   };
+  if (toolType) {
+    payload.tools = [{ type: toolType }];
+    payload.tool_choice = "auto";
+  }
   if (instructions) payload.instructions = instructions;
   return payload;
 }
@@ -686,11 +693,15 @@ function payloadVariants(
   safeMaxTokens: number,
   temperature: number,
   stream = false,
+  webSearchEnabled = true,
 ): Record<string, unknown>[] {
-  if (kind === "responses") return [
-    buildResponsesPayload(model, messages, safeMaxTokens, temperature, stream),
-    buildResponsesPayload(model, messages, safeMaxTokens, temperature, stream, "web_search_preview"),
-  ];
+  if (kind === "responses") return webSearchEnabled
+    ? [
+      buildResponsesPayload(model, messages, safeMaxTokens, temperature, stream),
+      buildResponsesPayload(model, messages, safeMaxTokens, temperature, stream, "web_search_preview"),
+      buildResponsesPayload(model, messages, safeMaxTokens, temperature, stream, null),
+    ]
+    : [buildResponsesPayload(model, messages, safeMaxTokens, temperature, stream, null)];
   return [
     buildChatPayload(model, messages, safeMaxTokens, temperature, stream, {
       // SiliconFlow / Qwen3 knobs (ignored by gateways that don't support them)
@@ -756,6 +767,7 @@ async function chatCompletions(
   apiType = "auto",
   endpoint = "",
   signal?: AbortSignal,
+  webSearchEnabled = true,
 ): Promise<string> {
   const safeMaxTokens = clampMaxTokens(maxTokens);
   const diag = publicLlmConfig(baseUrl, model, apiType, apiKey, endpoint);
@@ -763,7 +775,7 @@ async function chatCompletions(
   let lastErr = "LLM failed";
 
   for (const kind of llmKinds(apiType, messages)) {
-    const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, false);
+    const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, false, webSearchEnabled);
     for (let i = 0; i < variants.length; i++) {
       const payload = variants[i];
       console.log("[llm] request", kind, model, "tokens=", safeMaxTokens, kind === "responses" ? `tool=${(payload.tools as any)?.[0]?.type}` : "");
@@ -813,21 +825,6 @@ const FUNCTION_TOOLS: Array<Record<string, unknown>> = [
   {
     type: "function",
     function: {
-      name: "get_weather",
-      description: "查询某个城市或地区的当前天气与短期预报。",
-      parameters: {
-        type: "object",
-        properties: {
-          location: { type: "string", description: "城市或地区，例如香港、深圳、北京市朝阳区" },
-          date: { type: "string", description: "可选，今天、明天、后天或具体日期" },
-        },
-        required: ["location"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "get_current_time",
       description: "查询当前日期、时间、星期和时区。",
       parameters: {
@@ -868,7 +865,6 @@ const FUNCTION_TOOLS: Array<Record<string, unknown>> = [
 
 const TOOL_LABELS: Record<string, string> = {
   web_search: "联网搜索",
-  get_weather: "天气",
   get_current_time: "时间",
   calculate: "计算器",
   create_reminder: "提醒",
@@ -928,27 +924,53 @@ type ToolExecution = {
   action?: Record<string, unknown>;
 };
 
-async function executeFunctionTool(cfg: ReturnType<typeof resolveProviders>, call: FunctionToolCall): Promise<ToolExecution> {
+function functionToolsFor(cfg: ReturnType<typeof resolveProviders>): Array<Record<string, unknown>> {
+  if (cfg.webSearchEnabled) return FUNCTION_TOOLS;
+  return FUNCTION_TOOLS.filter((tool: any) => tool?.function?.name !== "web_search");
+}
+
+function mergeWebSearchUsage(current: Record<string, any> | null, next: Record<string, any>): Record<string, unknown> {
+  const query = String(next.query || "");
+  const previousQueries = Array.isArray(current?.queries) ? current.queries : [];
+  if (query && previousQueries.includes(query)) return current as Record<string, unknown>;
+  const providers = Array.from(new Set([...(current ? [current.provider] : []), next.provider].filter(Boolean)));
+  const titles = Array.from(new Set([...(current?.titles || []), ...(next.titles || [])])).slice(0, 6);
+  return {
+    used: true,
+    explicit: Boolean(current?.explicit || next.explicit),
+    provider: providers.join("+") || "exa",
+    ok: Boolean(current?.ok || next.ok),
+    count: Number(current?.count || 0) + Number(next.count || 0),
+    error: [current?.error, next.error].filter(Boolean).join("; "),
+    titles,
+    queries: [...previousQueries, ...(query ? [query] : [])],
+  };
+}
+
+type ToolExecutionContext = {
+  searchSession: ReturnType<typeof createWebSearchSession>;
+};
+
+async function executeFunctionTool(
+  cfg: ReturnType<typeof resolveProviders>,
+  call: FunctionToolCall,
+  signal?: AbortSignal,
+  context?: ToolExecutionContext,
+): Promise<ToolExecution> {
   const name = call.function.name;
   const args = parseToolArguments(call.function.arguments);
   if (name === "web_search") {
     if (!cfg.webSearchEnabled) return { content: { ok: false, error: "用户已关闭联网搜索" } };
-    const query = String(args.query || "").trim().slice(0, 160);
-    const search = await runWebSearch({ query, provider: cfg.searchProvider, apiKey: cfg.searchApiKey, baseUrl: cfg.searchBaseUrl });
-    return {
+    const query = normalizeWebSearchQuery(args.query);
+    if (!query) return { content: { ok: false, error: "搜索词不能为空" } };
+    const search = context
+      ? await context.searchSession.execute({ query, signal })
+      : await runWebSearch({ query, signal });
+    const result = {
       content: { ok: search.ok, provider: search.provider, query: search.query, items: search.items.slice(0, 6), error: search.error || "" },
-      webSearch: { used: true, explicit: true, provider: search.provider, ok: search.ok, count: search.items.length, error: search.error || "", titles: search.items.slice(0, 3).map((item) => item.title) },
+      webSearch: { used: true, explicit: true, provider: search.provider, query: search.query, ok: search.ok, count: search.items.length, error: search.error || "", titles: search.items.slice(0, 3).map((item: { title: string }) => item.title) },
     };
-  }
-  if (name === "get_weather") {
-    if (!cfg.webSearchEnabled) return { content: { ok: false, error: "用户已关闭联网搜索" } };
-    const location = String(args.location || "").trim().slice(0, 80);
-    const date = String(args.date || "").trim().slice(0, 40);
-    const search = await runWebSearch({ query: `${location} ${date} 天气`.trim(), provider: "weather", apiKey: cfg.searchApiKey, baseUrl: cfg.searchBaseUrl });
-    return {
-      content: { ok: search.ok, location, date, items: search.items.slice(0, 4), error: search.error || "" },
-      webSearch: { used: true, explicit: true, provider: search.provider, ok: search.ok, count: search.items.length, error: search.error || "", titles: search.items.slice(0, 3).map((item) => item.title) },
-    };
+    return result;
   }
   if (name === "get_current_time") return { content: { ok: true, ...currentTimeResult(args.time_zone || cfg.timeZone) } };
   if (name === "calculate") return { content: { ok: true, ...safeCalculateExpression(args.expression) } };
@@ -976,7 +998,7 @@ async function fetchChatToolStep(
   const safeMaxTokens = clampMaxTokens(cfg.maxTokens);
   const diag = publicLlmConfig(cfg.llm.baseUrl, cfg.llm.model, cfg.llm.apiType, cfg.llm.apiKey, cfg.llm.endpoint);
   const variants = payloadVariants("chat", cfg.llm.model, messages, safeMaxTokens, cfg.temperature, false)
-    .map((payload) => ({ ...payload, tools: FUNCTION_TOOLS, tool_choice: "auto" }));
+    .map((payload) => ({ ...payload, tools: functionToolsFor(cfg), tool_choice: "auto" }));
   let lastErr = "LLM tool call failed";
   for (let index = 0; index < variants.length; index++) {
     const first = await fetchLlmEndpointWithTransientRetry(
@@ -1008,6 +1030,7 @@ async function chatCompletionsWithTools(
   const working: ChatMessage[] = [...messages];
   const toolActions: Record<string, unknown>[] = [];
   const toolUsage: string[] = [];
+  const executionContext: ToolExecutionContext = { searchSession: createWebSearchSession() };
   let webSearch: Record<string, unknown> | null = null;
   for (let round = 0; round < 4; round++) {
     const step = await fetchChatToolStep(cfg, working, signal);
@@ -1020,13 +1043,14 @@ async function chatCompletionsWithTools(
     for (const call of step.toolCalls) {
       let result: ToolExecution;
       try {
-        result = await executeFunctionTool(cfg, call);
+        result = await executeFunctionTool(cfg, call, signal, executionContext);
       } catch (err: any) {
+        if (signal?.aborted || err?.name === "AbortError") throw err;
         result = { content: { ok: false, error: String(err?.message || err) } };
       }
       toolUsage.push(TOOL_LABELS[call.function.name] || call.function.name);
       if (result.action) toolActions.push(result.action);
-      if (result.webSearch) webSearch = result.webSearch;
+      if (result.webSearch) webSearch = mergeWebSearchUsage(webSearch, result.webSearch);
       working.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result.content) });
     }
   }
@@ -1040,6 +1064,7 @@ async function chatCompletionsWithTools(
     cfg.llm.apiType,
     cfg.llm.endpoint,
     signal,
+    false,
   );
   return { reply, toolActions, toolUsage, webSearch };
 }
@@ -1093,7 +1118,12 @@ async function fetchLlmStreamOnce(url: string, init: RequestInit, timeoutMs: num
   return fetchWithTimeoutAndSignal(url, init, timeoutMs, signal);
 }
 
-async function readLlmStreamResponse(res: Response, kind: LlmKind, onDelta: (text: string) => void): Promise<string> {
+async function readLlmStreamResponse(
+  res: Response,
+  kind: LlmKind,
+  onDelta: (text: string) => void,
+  signal?: AbortSignal,
+): Promise<string> {
   if (!res.body) {
     const data = (await res.json().catch(() => null)) as any;
     const text = extractLlmText(data, kind);
@@ -1101,6 +1131,12 @@ async function readLlmStreamResponse(res: Response, kind: LlmKind, onDelta: (tex
     return text;
   }
   const reader = res.body.getReader();
+  const cancelReader = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  if (signal?.aborted) {
+    cancelReader();
+    throw new DOMException("Aborted", "AbortError");
+  }
+  signal?.addEventListener("abort", cancelReader, { once: true });
   const decoder = new TextDecoder();
   let buffer = "";
   let raw = "";
@@ -1126,29 +1162,34 @@ async function readLlmStreamResponse(res: Response, kind: LlmKind, onDelta: (tex
       applyDelta(dataText);
     }
   };
-  while (true) {
-    const { done, value } = await readStreamChunkWithTimeout(reader, reply ? 20000 : 15000);
-    if (done) break;
-    const chunk = decoder.decode(value, { stream: true });
-    raw = (raw + chunk).slice(-1024 * 1024);
-    buffer += chunk.replace(/\r\n/g, "\n");
-    let idx: number;
-    while ((idx = buffer.indexOf("\n\n")) >= 0) {
-      const block = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 2);
-      handleBlock(block);
+  try {
+    while (true) {
+      const { done, value } = await readStreamChunkWithTimeout(reader, reply ? 20000 : 15000);
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      raw = (raw + chunk).slice(-1024 * 1024);
+      buffer += chunk.replace(/\r\n/g, "\n");
+      let idx: number;
+      while ((idx = buffer.indexOf("\n\n")) >= 0) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        handleBlock(block);
+      }
     }
+    const tail = decoder.decode();
+    if (tail) buffer += tail;
+    if (buffer.trim()) handleBlock(buffer);
+    if (!reply && raw.trim()) {
+      try {
+        const data = JSON.parse(raw.trim()) as any;
+        applyDelta(extractLlmText(data, kind));
+      } catch {}
+    }
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    return reply.trim();
+  } finally {
+    signal?.removeEventListener("abort", cancelReader);
   }
-  const tail = decoder.decode();
-  if (tail) buffer += tail;
-  if (buffer.trim()) handleBlock(buffer);
-  if (!reply && raw.trim()) {
-    try {
-      const data = JSON.parse(raw.trim()) as any;
-      applyDelta(extractLlmText(data, kind));
-    } catch {}
-  }
-  return reply.trim();
 }
 
 async function streamChatCompletions(
@@ -1162,6 +1203,7 @@ async function streamChatCompletions(
   endpoint: string,
   onDelta: (text: string) => void,
   signal?: AbortSignal,
+  webSearchEnabled = true,
 ): Promise<string> {
   const safeMaxTokens = clampMaxTokens(maxTokens);
   const diag = publicLlmConfig(baseUrl, model, apiType, apiKey, endpoint);
@@ -1169,7 +1211,7 @@ async function streamChatCompletions(
   let lastErr = "LLM failed";
 
   for (const kind of llmKinds(apiType, messages)) {
-    const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, true);
+    const variants = payloadVariants(kind, model, messages, safeMaxTokens, temperature, true, webSearchEnabled);
     for (let i = 0; i < variants.length; i++) {
       const payload = variants[i];
       const endpointUrl = llmEndpoint(baseUrl, apiType, endpoint, kind);
@@ -1199,7 +1241,7 @@ async function streamChatCompletions(
         }
       }
       try {
-        const text = cleanAssistantReply(await readLlmStreamResponse(res, kind, onDelta), messages);
+        const text = cleanAssistantReply(await readLlmStreamResponse(res, kind, onDelta, signal), messages);
         if (text) return text;
       } catch (err: any) {
         if (err?.partial) err.partial = cleanAssistantReply(err.partial, messages);
@@ -1431,90 +1473,13 @@ function parseClientConfig(raw: unknown): ClientConfig | undefined {
   return raw as ClientConfig;
 }
 
-function directSearchReply(search: any): string {
-  if (!search?.ok || !Array.isArray(search.items) || !search.items.length) return "";
-  if (search.provider === "weather") {
-    const place = String(search.query || "").trim();
-    const first = search.items[0];
-    return `${place || "天气"}查到了：${first.snippet}`;
-  }
-  return "";
-}
-
-function contextualSearchIntent(messages: ChatMessage[]): string {
-  const userTexts = (Array.isArray(messages) ? messages : [])
-    .filter((message) => message?.role === "user")
-    .map((message) => extractTextContent(message.content))
-    .filter(Boolean);
-  return contextualSearchIntentFromTexts(userTexts);
-}
-
-function looksLikeNoWebReply(text: string): boolean {
-  const s = String(text || "").replace(/\s+/g, " ").trim();
-  if (!s) return false;
-  return /(不能|无法|没有|未能).{0,10}(联网|上网|搜索|实时|查询|访问互联网)|没有.{0,10}(实时|联网|最新).{0,10}(数据|信息|能力)|不确定.{0,16}(天气|价格|新闻|当前|现在|实时|最新)|无法.{0,16}(获取|查询|访问).{0,16}(天气|实时|最新|网络|互联网)|作为(一个)?(AI|人工智能).{0,20}(不能|无法).{0,10}(联网|访问互联网|获取实时)/i.test(s);
-}
-
-async function fallbackServerSearchAnswer(
-  cfg: ReturnType<typeof resolveProviders>,
-  messages: ChatMessage[],
-  userText: string,
-  explicitSearch: boolean,
-  signal?: AbortSignal,
-): Promise<{ reply: string; webSearch: Record<string, unknown> }> {
-  const search = await runWebSearch({
-    query: userText,
-    provider: cfg.searchProvider,
-    apiKey: cfg.searchApiKey,
-    baseUrl: cfg.searchBaseUrl,
-  });
-  console.log("[search:fallback]", search.provider, "ok=", search.ok, "count=", search.items?.length || 0, search.error || "");
-  const webSearch = {
-    used: true,
-    explicit: explicitSearch,
-    provider: `fallback-${search.provider}`,
-    ok: search.ok,
-    count: search.items.length,
-    error: search.error || "",
-    titles: search.items.slice(0, 3).map((x: { title: string }) => x.title),
-  };
-  const directReply = directSearchReply(search);
-  if (directReply) return { reply: directReply, webSearch };
-
-  const systemPrompt = `${cfg.systemPrompt}
-
-${formatSearchContext(search)}
-
-重要：上面就是服务端已经获取到的联网结果。请直接基于这些结果回答。不能再说“我不能联网”“没有实时联网”“无法获取实时数据”。`;
-  const finalMessages = sanitizeMessages(messages, systemPrompt, cfg.maxHistoryTurns);
-  const reply = await chatCompletions(
-    cfg.llm.baseUrl,
-    cfg.llm.apiKey,
-    cfg.llm.model,
-    finalMessages,
-    cfg.maxTokens,
-    cfg.temperature,
-    cfg.llm.apiType,
-    cfg.llm.endpoint,
-    signal,
-  );
-  return { reply, webSearch };
-}
-
 type PreparedChat = {
   cfg: ReturnType<typeof resolveProviders>;
-  messages: ChatMessage[];
-  userText: string;
-  intentText: string;
-  explicitSearch: boolean;
-  useResponsesTools: boolean;
   useFunctionTools: boolean;
   finalMessages: ChatMessage[];
-  webSearch: Record<string, unknown> | null;
-  directReply: string;
 };
 
-async function prepareChat(body: ChatRequestBody, env: Env): Promise<PreparedChat | Response> {
+function prepareChat(body: ChatRequestBody, env: Env): PreparedChat | Response {
   const clientCfg = parseClientConfig(body.config);
   const cfg = resolveProviders(env, clientCfg);
   if (!cfg.llm.apiKey) return badRequest("缺少 API Key：请在页面「本地配置」里填写", 401);
@@ -1525,89 +1490,17 @@ async function prepareChat(body: ChatRequestBody, env: Env): Promise<PreparedCha
   if (single) messages = [...messages, { role: "user", content: single }];
   if (!messages.some((m) => m.role === "user" && extractTextContent(m.content))) return badRequest("请输入消息");
 
-  const lastUser = [...messages].reverse().find((m) => m.role === "user" && extractTextContent(m.content));
-  const userText = extractTextContent(lastUser?.content);
-  const intentText = contextualSearchIntent(messages);
-
   let systemPrompt = cfg.systemPrompt;
-  let directReply = "";
-  const explicitSearch = isExplicitSearchRequest(intentText) || isExplicitSearchRequest(userText);
-  const weatherIntent = isWeatherLookupRequest(intentText);
-  const realtimeIntent = isRealtimeQuery(intentText);
-  const autoSearchIntent = shouldAutoSearch(intentText);
-  const serverSearchIntent = realtimeIntent || explicitSearch || (Boolean(cfg.webSearchEnabled) && autoSearchIntent);
   const hasVision = messagesHaveVision(messages);
-  const useResponsesTools = !hasVision && !serverSearchIntent && preferredLlmKind(cfg.llm.apiType) === "responses";
-  const useFunctionTools = !serverSearchIntent && cfg.toolCallingEnabled && preferredLlmKind(cfg.llm.apiType) === "chat" && shouldUseFunctionTools(intentText);
+  const useFunctionTools = !hasVision && cfg.toolCallingEnabled && preferredLlmKind(cfg.llm.apiType) === "chat";
   if (useFunctionTools) {
     const now = currentTimeResult(cfg.timeZone);
-    systemPrompt = `${systemPrompt}\n\n当前用户时区：${now.timeZone}。当前日期时间：${now.local}（${now.iso}）。需要计算、时间或提醒时，请优先调用提供的函数工具，不要假装已经执行工具。`;
+    systemPrompt = `${systemPrompt}\n\n当前用户时区：${now.timeZone}。当前日期时间：${now.local}（${now.iso}）。需要搜索、计算、时间或提醒时，请优先调用提供的函数工具，不要假装已经执行工具。`;
   }
-  let webSearch: Record<string, unknown> | null = useResponsesTools
-    ? { used: true, explicit: explicitSearch, provider: "responses-tools", ok: true, count: 0, error: "", titles: [] }
-    : null;
-  const weatherLocation = weatherIntent ? extractWeatherLocation(intentText) : "";
-  if (weatherIntent && !weatherLocation) {
-    directReply = cfg.webSearchEnabled
-      ? "你想查哪个城市的天气？请告诉我城市，例如“杭州天气”。"
-      : "你想查哪个城市的天气？另外，“启用联网搜索”当前已关闭；打开后我才能查询实时天气，我不会猜温度或降雨概率。";
-    webSearch = { used: false, explicit: explicitSearch, provider: "weather", ok: false, count: 0, error: "missing location", titles: [] };
-  } else if ((realtimeIntent || explicitSearch) && !cfg.webSearchEnabled) {
-    directReply = weatherIntent
-      ? "联网搜索当前已关闭，我不能可靠查询实时天气，也不会猜温度或降雨概率。请先打开“启用联网搜索”。"
-      : "联网搜索当前已关闭，我不能可靠查询实时数据，也不会凭空编造。请先打开“启用联网搜索”。";
-    webSearch = { used: false, explicit: explicitSearch, provider: "disabled", ok: false, count: 0, error: "web search disabled", titles: [] };
-  }
-  const wantSearch = !directReply && !useResponsesTools && !useFunctionTools && Boolean(cfg.webSearchEnabled) && (realtimeIntent || explicitSearch || autoSearchIntent);
-
-  if (wantSearch) {
-    try {
-      const search = await runWebSearch({
-        query: intentText,
-        provider: weatherIntent ? "weather" : cfg.searchProvider,
-        apiKey: cfg.searchApiKey,
-        baseUrl: cfg.searchBaseUrl,
-      });
-      webSearch = {
-        used: true,
-        explicit: explicitSearch,
-        provider: search.provider,
-        ok: search.ok,
-        count: search.items.length,
-        error: search.error || "",
-        titles: search.items.slice(0, 3).map((x: { title: string }) => x.title),
-      };
-      directReply = directSearchReply(search);
-      if (!directReply && !search.ok && (realtimeIntent || explicitSearch)) {
-        directReply = weatherIntent
-          ? `我暂时没查到${weatherLocation || "该城市"}的可靠实时天气，不能给你编温度或降雨概率。请稍后重试。`
-          : "我暂时没查到可靠的实时信息，不会凭空编造数据。请稍后重试。";
-      } else if (!directReply) {
-        systemPrompt = `${cfg.systemPrompt}\n\n${formatSearchContext(search)}\n\n重要：上面就是服务端已经获取到的联网结果。不能再说“我不能联网”“无法直接联网”“联网搜索没开放”，也不能补充搜索结果里没有的实时数字。`;
-      }
-    } catch (err: any) {
-      webSearch = { used: true, explicit: explicitSearch, provider: "timeout", ok: false, count: 0, error: String(err?.message || err), titles: [] };
-      if (realtimeIntent || explicitSearch) {
-        directReply = weatherIntent
-          ? `我暂时没查到${weatherLocation || "该城市"}的可靠实时天气，不能给你编温度或降雨概率。请稍后重试。`
-          : "我暂时没查到可靠的实时信息，不会凭空编造数据。请稍后重试。";
-      } else {
-        systemPrompt = `${cfg.systemPrompt}\n\n【联网搜索】暂时不可用。请简要回答并明确说明无法核实；不要编造实时数据。`;
-      }
-    }
-  }
-
   return {
     cfg,
-    messages,
-    userText,
-    intentText,
-    explicitSearch,
-    useResponsesTools,
     useFunctionTools,
     finalMessages: sanitizeMessages(messages, systemPrompt, cfg.maxHistoryTurns),
-    webSearch,
-    directReply,
   };
 }
 
@@ -1619,11 +1512,8 @@ async function handleChat(req: Request, env: Env): Promise<Response> {
     return badRequest("Invalid JSON body");
   }
 
-  const prepared = await prepareChat(body, env);
+  const prepared = prepareChat(body, env);
   if (prepared instanceof Response) return prepared;
-  if (prepared.directReply) {
-    return json({ ok: true, reply: prepared.directReply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: prepared.webSearch });
-  }
   if (prepared.useFunctionTools) {
     const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages, req.signal);
     return json({ ok: true, reply: result.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: result.webSearch, toolActions: result.toolActions, toolUsage: result.toolUsage });
@@ -1638,13 +1528,9 @@ async function handleChat(req: Request, env: Env): Promise<Response> {
     prepared.cfg.llm.apiType,
     prepared.cfg.llm.endpoint,
     req.signal,
+    Boolean(prepared.cfg.webSearchEnabled),
   );
-  if (prepared.useResponsesTools && shouldAutoSearch(prepared.intentText) && looksLikeNoWebReply(reply)) {
-    const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch, req.signal);
-    return json({ ok: true, reply: fallback.reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: fallback.webSearch });
-  }
-
-  return json({ ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: prepared.webSearch });
+  return json({ ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: null });
 }
 
 function encodeSse(event: string, data: unknown): Uint8Array {
@@ -1659,7 +1545,7 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
     return badRequest("Invalid JSON body");
   }
 
-  const prepared = await prepareChat(body, env);
+  const prepared = prepareChat(body, env);
   if (prepared instanceof Response) return prepared;
 
   const upstreamController = new AbortController();
@@ -1670,7 +1556,7 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let reply = "";
-      let doneWebSearch = prepared.webSearch;
+      let doneWebSearch: Record<string, unknown> | null = null;
       let doneToolActions: Record<string, unknown>[] = [];
       let doneToolUsage: string[] = [];
       const enqueue = (event: string, data: unknown) => {
@@ -1678,33 +1564,12 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
       };
       try {
         enqueue("ready", { ok: true });
-        if (prepared.directReply) {
-          reply = prepared.directReply;
-          enqueue("delta", { text: reply });
-        } else if (prepared.useFunctionTools) {
+        if (prepared.useFunctionTools) {
           const result = await chatCompletionsWithTools(prepared.cfg, prepared.finalMessages, upstreamController.signal);
           reply = result.reply;
           doneWebSearch = result.webSearch;
           doneToolActions = result.toolActions;
           doneToolUsage = result.toolUsage;
-          enqueue("delta", { text: reply });
-        } else if (prepared.useResponsesTools && shouldAutoSearch(prepared.intentText)) {
-          reply = await chatCompletions(
-            prepared.cfg.llm.baseUrl,
-            prepared.cfg.llm.apiKey,
-            prepared.cfg.llm.model,
-            prepared.finalMessages,
-            prepared.cfg.maxTokens,
-            prepared.cfg.temperature,
-            prepared.cfg.llm.apiType,
-            prepared.cfg.llm.endpoint,
-            upstreamController.signal,
-          );
-          if (looksLikeNoWebReply(reply)) {
-            const fallback = await fallbackServerSearchAnswer(prepared.cfg, prepared.messages, prepared.intentText, prepared.explicitSearch, upstreamController.signal);
-            reply = fallback.reply;
-            doneWebSearch = fallback.webSearch;
-          }
           enqueue("delta", { text: reply });
         } else if (messagesHaveVision(prepared.finalMessages)) {
           reply = await chatCompletions(
@@ -1717,6 +1582,7 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
             prepared.cfg.llm.apiType,
             prepared.cfg.llm.endpoint,
             upstreamController.signal,
+            Boolean(prepared.cfg.webSearchEnabled),
           );
           enqueue("delta", { text: reply });
         } else {
@@ -1734,6 +1600,7 @@ async function handleChatStream(req: Request, env: Env): Promise<Response> {
               enqueue("delta", { text });
             },
             upstreamController.signal,
+            Boolean(prepared.cfg.webSearchEnabled),
           );
         }
         enqueue("done", { ok: true, reply, model: prepared.cfg.llm.model, ttsEnabled: prepared.cfg.ttsEnabled, webSearch: doneWebSearch, toolActions: doneToolActions, toolUsage: doneToolUsage });
@@ -1945,6 +1812,7 @@ async function handleTest(req: Request, env: Env): Promise<Response> {
       cfg.llm.apiType,
       cfg.llm.endpoint,
       req.signal,
+      Boolean(cfg.webSearchEnabled),
     );
     result.llmTest = { ok: true, reply };
   } catch (err: any) {
@@ -2047,9 +1915,7 @@ export default {
         if (!query) return badRequest("missing query");
         const search = await runWebSearch({
           query,
-          provider: body.provider || cfg.searchProvider,
-          apiKey: body.apiKey || cfg.searchApiKey,
-          baseUrl: body.baseUrl || cfg.searchBaseUrl,
+          signal: request.signal,
         });
         return json(search);
       }

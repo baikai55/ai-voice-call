@@ -42,8 +42,5 @@
   "browserTtsFallback": true,
   "autoSpeak": true,
   "toolCallingEnabled": true,
-  "webSearchEnabled": true,
-  "searchProvider": "auto",
-  "searchApiKey": "",
-  "searchBaseUrl": ""
+  "webSearchEnabled": true
 }

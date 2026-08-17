@@ -475,47 +475,23 @@
             <div class="card-head">
               <div>
                 <h3>联网搜索</h3>
-                <p>只在天气、新闻、价格等强实时问题自动搜索；普通聊天和知识问答不搜</p>
+                <p>需要实时信息时，由模型调用通用 web_search</p>
               </div>
             </div>
             <div class="switch-list">
               <label class="switch-row">
                 <span>
                   <strong>启用函数工具调用 Tools</strong>
-                  <small>由模型选择搜索、天气、时间、计算器或本地提醒；关闭后沿用普通聊天</small>
+                  <small>由模型选择搜索、时间、计算器或本地提醒；关闭后沿用普通聊天</small>
                 </span>
                 <input id="toolCallingEnabled" type="checkbox" class="switch-input" />
               </label>
               <label class="switch-row">
                 <span>
                   <strong>启用联网搜索</strong>
-                  <small>开关和提供方会立即生效；想强制联网时，可以直接说“搜一下/帮我查一下”</small>
+                  <small>Chat 接口使用 Exa Web Search；Responses 接口使用模型原生搜索</small>
                 </span>
                 <input id="webSearchEnabled" type="checkbox" class="switch-input" />
-              </label>
-            </div>
-            <div class="field-grid">
-              <label class="field">
-                <span class="field-label">搜索提供方</span>
-                <select id="searchProvider">
-                  <option value="auto">自动（优先必应）</option>
-                  <option value="bing-rss">Bing 必应免费</option>
-                  <option value="duckduckgo">DuckDuckGo 免费</option>
-                  <option value="searxng">SearXNG</option>
-                  <option value="tavily">Tavily（需Key）</option>
-                  <option value="serper">Serper（需Key）</option>
-                </select>
-              </label>
-              <label class="field full">
-                <span class="field-label">搜索 API Key（可选）</span>
-                <div class="secret-input">
-                  <input id="searchApiKey" type="password" placeholder="建议填 Serper 或 Tavily；不填则使用轻量免费搜索" autocomplete="off" />
-                  <button type="button" class="eye-btn" data-eye-for="searchApiKey" aria-label="显示或隐藏密钥" title="显示/隐藏">👁</button>
-                </div>
-              </label>
-              <label class="field full">
-                <span class="field-label">SearXNG 地址（可选）</span>
-                <input id="searchBaseUrl" placeholder="例如 https://searx.be；仅选择 SearXNG 或自动兜底时使用" />
               </label>
             </div>
           </article>

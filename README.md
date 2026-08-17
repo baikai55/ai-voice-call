@@ -97,7 +97,7 @@ Invoke-RestMethod http://127.0.0.1:8787/api/health
 
 选择 `Qwen/Qwen3.5-4B` 时，页面会显示 `Tools / 视觉 / 256K` 能力提示。点输入框左侧回形针或直接粘贴图片即可添加视觉输入；图片会压缩到最长边 1600px，并按 OpenAI 兼容的 `image_url` + `detail: low` 格式发送。语音通话中还可以打开摄像头，按“识别”截取当前画面，或直接说“看看这个是什么”；摄像头帧会压缩成最长边 1280px 的 JPEG 后按相同格式发送。`Qwen/Qwen3-8B` 会显示不支持视觉并阻止图片与摄像头识别；自定义模型是否支持图片由实际供应商决定。
 
-开启「联网 -> 函数工具调用 Tools」后，天气、新闻、价格、时间、计算和提醒类问题会给模型提供 5 个 `function` 工具。后端按标准 `tool_calls -> 执行函数 -> role: tool + tool_call_id -> 最终回答` 循环执行；普通聊天仍保持原来的流式输出。工具调用轮次需要等待函数结果，因此最终回答会在工具执行完成后一次写入流。
+开启「联网 -> 函数工具调用 Tools」后，Chat Completions 模型会获得搜索、时间、计算和提醒 4 个 `function` 工具。模型调用 `web_search` 时，后端把模型生成的 query 直接交给匿名 Exa MCP 的 `web_search_exa`，再按标准 `tool_calls -> 执行函数 -> role: tool + tool_call_id -> 最终回答` 回填。每次回答最多执行两个不同查询，重复 query 直接复用结果。OpenAI Responses 模型则继续使用上游原生 `web_search`。
 
 提醒会保存在当前浏览器 `localStorage`，页面打开时每 15 秒检查一次；浏览器允许通知时会显示系统通知，否则会在聊天页面显示并朗读。它不是云端推送，关闭浏览器后不能保证准时触发。
 
@@ -135,9 +135,8 @@ LLM / STT / TTS 模型使用下拉框选择。展开下拉框后可以输入任�
 | 自动朗读 `autoSpeak` | `true` | 语音聊天默认开启 |
 | TTS `ttsEnabled` | `true` | 优先使用服务端 TTS |
 | 浏览器朗读兜底 | `true` | TTS 接口失败时仍可朗读 |
-| 函数工具调用 | `true` | 搜索、天气、时间、计算器、本地提醒 |
-| 联网搜索 | `true` | 实时问题自动搜索 |
-| 搜索提供方 | `auto` | 不填 Key 也可先用免费搜索 |
+| 函数工具调用 | `true` | 搜索、时间、计算器、本地提醒 |
+| 联网搜索 | `true` | Chat 使用 Exa MCP，Responses 使用上游原生搜索 |
 
 `maxTokens` 不建议默认设太大。这个应用偏语音/聊天，512 通常足够；过大会增加延迟、成本和朗读时长。
 
@@ -214,10 +213,7 @@ LLM / STT / TTS 模型使用下拉框选择。展开下拉框后可以输入任�
   "browserTtsFallback": true,
   "autoSpeak": true,
   "toolCallingEnabled": true,
-  "webSearchEnabled": true,
-  "searchProvider": "auto",
-  "searchApiKey": "",
-  "searchBaseUrl": ""
+  "webSearchEnabled": true
 }
 ```
 
@@ -274,7 +270,7 @@ npm run dev
 
 ```text
 G:\github\ai-voice-call  src\index.ts          Worker 后端
-  src\search.ts         联网搜索
+  src\web-search.mjs    Worker / 本地服务共享的 Exa Web Search
   public\index.html     页面
   public\app.js         前端逻辑
   public\db.js          IndexedDB 存储
@@ -290,6 +286,6 @@ G:\github\ai-voice-call  src\index.ts          Worker 后端
 
 1. 不要把 API Key 发给任何人，不要提交真实 Key。
 2. 导出的“完整配置”等同于密码本，别发到网上或群里。
-3. 免费模型和免费搜索可能限流或不稳定。
+3. 免费模型和匿名 Exa Web Search 可能限流或不稳定。
 4. TTS 模型名以平台实际可用为准；不行就先开「浏览器朗读」。
 5. 如果 Key 暴露过，请去模型平台轮换 Key。

@@ -225,9 +225,6 @@ const DEFAULTS = {
   autoSpeak: true,
   toolCallingEnabled: true,
   webSearchEnabled: true,
-  searchProvider: "auto",
-  searchApiKey: "",
-  searchBaseUrl: "",
 };
 
 const el = {
@@ -338,9 +335,6 @@ const el = {
     autoSpeak: document.getElementById("autoSpeak"),
     toolCallingEnabled: document.getElementById("toolCallingEnabled"),
     webSearchEnabled: document.getElementById("webSearchEnabled"),
-    searchProvider: document.getElementById("searchProvider"),
-    searchApiKey: document.getElementById("searchApiKey"),
-    searchBaseUrl: document.getElementById("searchBaseUrl"),
   },
 };
 
@@ -594,6 +588,9 @@ function normalizeConfig(next) {
   out.llm.model = normalizeModelId(out.llm.model) || DEFAULTS.llm.model;
   out.stt.model = normalizeModelId(out.stt.model) || DEFAULTS.stt.model;
   out.tts.model = normalizeModelId(out.tts.model) || DEFAULTS.tts.model;
+  delete out.searchProvider;
+  delete out.searchApiKey;
+  delete out.searchBaseUrl;
   out.customModels = normalizeCustomModels(out.customModels);
   out.systemPromptPreset = inferPromptPreset(out.systemPrompt, out.systemPromptPreset || "general");
   out.maxHistoryTurns = clampNumber(out.maxHistoryTurns, 12, 2, 30);
@@ -1360,6 +1357,7 @@ async function requestChatStreamWithFallback(requestMessages, row, signal = null
   let toolActions = [];
   let toolUsage = [];
   let sawDelta = false;
+  let sawReady = false;
   const controller = new AbortController();
   const chatTimer = setTimeout(() => controller.abort(), 120000);
   let outputTimer = setTimeout(() => controller.abort(), 18000);
@@ -1390,6 +1388,11 @@ async function requestChatStreamWithFallback(requestMessages, row, signal = null
       if (!dataText || dataText === "[DONE]") return;
       let data = {};
       try { data = JSON.parse(dataText); } catch { data = { text: dataText }; }
+      if (eventName === "ready") {
+        sawReady = true;
+        clearOutputTimer();
+        return;
+      }
       if (eventName === "delta") {
         const text = String(data.text || "");
         if (text) {
@@ -1443,7 +1446,7 @@ async function requestChatStreamWithFallback(requestMessages, row, signal = null
       err.partial = cleanClientAssistantReply(err.partial || reply || "", requestMessages);
       throw err;
     }
-    if (sawDelta || err.partial) {
+    if (sawReady || sawDelta || err.partial) {
       err.partial = cleanClientAssistantReply(err.partial || reply || "", requestMessages);
       throw err;
     }
@@ -1542,9 +1545,6 @@ function readLiveSearchSettings() {
   return {
     toolCallingEnabled: useForm && f.toolCallingEnabled ? f.toolCallingEnabled.checked : config.toolCallingEnabled !== false,
     webSearchEnabled: useForm && f.webSearchEnabled ? f.webSearchEnabled.checked : config.webSearchEnabled !== false,
-    searchProvider: useForm && f.searchProvider ? (f.searchProvider.value || "auto") : (config.searchProvider || "auto"),
-    searchApiKey: useForm && f.searchApiKey ? f.searchApiKey.value.trim() : (config.searchApiKey || ""),
-    searchBaseUrl: useForm && f.searchBaseUrl ? f.searchBaseUrl.value.trim() : (config.searchBaseUrl || ""),
   };
 }
 
@@ -1588,9 +1588,6 @@ function apiConfigPayload() {
     toolCallingEnabled: runtimeConfig.toolCallingEnabled !== false,
     timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Hong_Kong",
     webSearchEnabled: Boolean(liveSearch.webSearchEnabled),
-    searchProvider: liveSearch.searchProvider || "auto",
-    searchApiKey: liveSearch.searchApiKey || "",
-    searchBaseUrl: liveSearch.searchBaseUrl || "",
   };
 }
 
@@ -1953,9 +1950,6 @@ function fillSettingsForm() {
   if (f.toolCallingEnabled) f.toolCallingEnabled.checked = config.toolCallingEnabled !== false;
   syncVoiceToggle();
   if (f.webSearchEnabled) f.webSearchEnabled.checked = config.webSearchEnabled !== false;
-  if (f.searchProvider) f.searchProvider.value = config.searchProvider || "auto";
-  if (f.searchApiKey) f.searchApiKey.value = config.searchApiKey || "";
-  if (f.searchBaseUrl) f.searchBaseUrl.value = config.searchBaseUrl || "";
   syncLlmCapabilityHint(config.llm.model);
   settingsFormInitialized = true;
 }
@@ -1996,9 +1990,6 @@ function readSettingsForm() {
     autoSpeak: f.autoSpeak.checked,
     toolCallingEnabled: f.toolCallingEnabled ? f.toolCallingEnabled.checked : true,
     webSearchEnabled: f.webSearchEnabled ? f.webSearchEnabled.checked : true,
-    searchProvider: f.searchProvider ? (f.searchProvider.value || "auto") : "auto",
-    searchApiKey: f.searchApiKey ? f.searchApiKey.value.trim() : "",
-    searchBaseUrl: f.searchBaseUrl ? f.searchBaseUrl.value.trim() : "",
   });
 }
 
@@ -2047,14 +2038,12 @@ async function exportConfig(includeKeys = true) {
     data.llm = { ...(data.llm || {}), apiKey: "" };
     data.stt = { ...(data.stt || {}), apiKey: "" };
     data.tts = { ...(data.tts || {}), apiKey: "" };
-    data.searchApiKey = "";
   }
   const hasKey = Boolean(
     (data.apiProviders || []).some((item) => item?.apiKey) ||
     data.llm?.apiKey ||
     data.stt?.apiKey ||
-    data.tts?.apiKey ||
-    data.searchApiKey
+    data.tts?.apiKey
   );
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
   const a = document.createElement("a");
@@ -3683,7 +3672,6 @@ async function initDefaults() {
         ttsEnabled: serverDefaults.ttsEnabled,
         browserTtsFallback: serverDefaults.browserTtsFallback,
         webSearchEnabled: serverDefaults.webSearchEnabled,
-        searchProvider: serverDefaults.searchProvider,
       });
     }
   } catch {}
@@ -3944,12 +3932,12 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest("[data-model-picker]")) closeAllModelMenus();
 });
 
-["toolCallingEnabled", "webSearchEnabled", "searchProvider", "searchApiKey", "searchBaseUrl"].forEach((key) => {
+["toolCallingEnabled", "webSearchEnabled"].forEach((key) => {
   const input = el.fields?.[key];
   if (!input) return;
   const eventName = input.tagName === "SELECT" || input.type === "checkbox" ? "change" : "input";
   input.addEventListener(eventName, () => {
-    applyLiveSearchSettings({ persist: key === "toolCallingEnabled" || key === "webSearchEnabled" || key === "searchProvider", quiet: false });
+    applyLiveSearchSettings({ persist: true, quiet: false });
   });
 });
 
@@ -4043,7 +4031,6 @@ el.btnReset.addEventListener("click", () => {
     autoSpeak: DEFAULTS.autoSpeak,
     toolCallingEnabled: serverDefaults?.toolCallingEnabled ?? DEFAULTS.toolCallingEnabled,
     webSearchEnabled: serverDefaults?.webSearchEnabled ?? DEFAULTS.webSearchEnabled,
-    searchProvider: serverDefaults?.searchProvider || DEFAULTS.searchProvider,
   });
   fillSettingsForm();
   setSettingsStatus("已恢复默认（保留当前供应商列表和 Key）");
